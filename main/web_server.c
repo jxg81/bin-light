@@ -14,15 +14,22 @@
 
 static const char *TAG = "web_server";
 
-// Sized against the worst case for the home page, which is the largest of the
-// three: ~4.9KB of static markup plus the loop-expanded parts - 5 timezone
-// options, 7 weekday options, 3 colour rules (each with a 4-option colour
-// select and a 4-option frequency select), and up to WASTE_API_MAX_TYPE_RULES
-// (8) colour-mapping rows at ~390 bytes each. That tops out around 11KB, so a
-// council reporting the full 8 event types still fits. Each handler logs an
-// error if it hits the ceiling anyway, because safe_append() truncates
-// silently and a truncated page drops form fields - which then read back as
-// "absent"/unchecked on the next save.
+// Sized against the home page, the largest of the three. Measured by
+// compiling root_get_handler() on the host against stubs and dumping the
+// bytes it emits:
+//
+//   factory-fresh, nothing configured   7145
+//   realistic setup (3 event types)     8679
+//   worst case (8 event types, i.e.
+//     WASTE_API_MAX_TYPE_RULES, with
+//     long type names and address)     10877
+//
+// 12288 leaves ~1.4KB over the worst case. Note the fresh-device page alone
+// is 7145 bytes: the previous 7200 would have truncated on any real
+// configuration. Each handler also logs an error if it ever hits the ceiling,
+// because safe_append() truncates *silently* and a truncated page drops form
+// fields - which then read back as "absent"/unchecked on the next save,
+// quietly destroying config.
 #define HTML_BUF_SIZE   12288
 #define SAVE_BODY_MAX   1024
 #define FIELD_BUF_SIZE  16

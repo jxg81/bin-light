@@ -944,13 +944,31 @@ rather than always showing a full table.
   why `append_type_mapping_form()` was split into
   `append_type_mapping_anchor()` + `append_type_mapping_rows()`, and why
   `append_color_select()` gained a `_for()` variant taking a form id.
-- **`HTML_BUF_SIZE` raised 7200 → 12288.** The reorganised home page's worst
-  case (8 colour-mapping rows, i.e. `WASTE_API_MAX_TYPE_RULES`) is ~11KB.
-  `safe_append()` truncates silently, and a truncated page **drops form
-  fields**, which then read back as absent/unchecked on the next Save — a
-  config-destroying failure that looks like nothing at all. Both
+- **`HTML_BUF_SIZE` raised 7200 → 12288.** Sizes were *measured*, not
+  estimated, by compiling `root_get_handler()` on the host against stubs and
+  dumping the bytes it emits (see "Rendering the UI off-device" below):
+  7145 bytes factory-fresh, 8679 for a realistic setup, **10877** worst case
+  (8 colour-mapping rows, i.e. `WASTE_API_MAX_TYPE_RULES`). The fresh-device
+  figure is the alarming one — the old 7200 buffer had 55 bytes of headroom on
+  an *unconfigured* device and would have truncated on any real
+  configuration. `safe_append()` truncates silently, and a truncated page
+  **drops form fields**, which then read back as absent/unchecked on the next
+  Save — a config-destroying failure that looks like nothing at all. Both
   `root_get_handler()` and `api_test_get_handler()` now log an error if they
   hit the ceiling, so this can never fail silently again.
+
+**Rendering the UI off-device**: `web_server.c`'s handlers can be compiled and
+run on the host, which is how the above was measured and how the layout was
+checked before flashing. The trick is that the handlers are `static`, so a
+harness `#include`s the whole translation unit and supplies (a) thin stub
+headers for `esp_err.h` / `esp_log.h` / `esp_http_server.h` — the httpd
+functions used are all trivially stubbable, with `httpd_resp_send()` writing
+to a file instead of a socket — and (b) definitions for the handful of
+`schedule_*` / `settings_*` / `waste_api_*` symbols it calls. Then set up a
+`schedule_t` and `waste_api_config_t`, call `root_get_handler()`, and open the
+result in a browser. Worth rebuilding if the UI is touched again: it renders
+the firmware's real markup rather than a hand-written approximation, and it
+catches buffer truncation before the device does.
 - **Also landed here** (§3.8's cheap half, independent of its resolver
   rework): the button is renamed to **"Display Next Collection (30 seconds)"**
   and `TEST_PREVIEW_DURATION_MS` dropped from 2 minutes to 30 seconds.
