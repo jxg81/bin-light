@@ -57,10 +57,20 @@ priority for implementation, and the acceptance criteria for the API feature:
 | # | Council | Backend | Status | Detail |
 |---|---|---|---|---|
 | 1 | **Maribyrnong** (home) | Impact Apps | ✅ implemented | §3.3 |
-| 2 | **Merri-bek** | bespoke (ArcGIS + council API) | researched, verified live | §3.13.3 |
-| 3 | **Knox** | bespoke (2 JSON calls) | researched, verified live | §3.13.4 |
-| 4 | **Whitehorse** | bespoke (Weave GIS) | researched, verified live | §3.13.4 |
-| 5 | **Monash** | OpenCities / MyArea | researched, verified live | §3.13.4 |
+| 2 | **Merri-bek** | bespoke (ArcGIS + council API) | re-verified 2026-07-25, **notes corrected** | §3.13.3 |
+| 3 | **Knox** | bespoke (2 JSON calls) | re-verified 2026-07-25, unchanged | §3.13.4 |
+| 4 | **Whitehorse** | bespoke (Weave GIS) | re-verified 2026-07-25, unchanged | §3.13.4 |
+| 5 | **Monash** | OpenCities / MyArea | researched; **not re-testable from the build sandbox** | §3.13.4 |
+
+**Re-verification note (2026-07-25)**: before implementing the backends, all
+four bespoke endpoints were re-probed. Knox and Whitehorse returned exactly the
+recorded shapes. **Merri-bek did not** — its required `cpage` parameter had
+changed value, its parameter names were recorded wrongly, and its date format
+was recorded wrongly; see §3.13.3, which now carries the corrected, verified
+facts. Monash cannot be re-tested from here (IP reputation, §3.13.4) and so
+remains on the original residential-connection evidence. The lesson holds:
+recorded API research decays, and each backend should be re-probed immediately
+before it is implemented rather than trusted from the page.
 
 All five are confirmed reachable and parseable on-device; none needs to fall
 back to the manual schedule for want of a working backend. Four of the five
@@ -1357,9 +1367,56 @@ fields only one backend uses, this is the point at which config should become
 NVS key per backend), decided as part of the §3.3 rework that already has to
 make `waste_api.h` backend-neutral.
 
+**RE-VERIFIED 2026-07-25 — the notes above were partly wrong, and following
+them would have produced a backend that did not work.** Corrections, all
+confirmed against live calls:
+
+- **`cpage` is a mandatory query parameter, and its value changed.** It is now
+  **`183782`**, not `86612`. Omit it (or send the old value) and the endpoint
+  either 500s or returns every field `null` with `"noService":"no service"` —
+  which reads exactly like an unserviced address rather than a malformed
+  request. This is the same trap `ocsvclang` sets on Monash.
+- **The parameter names are the *form field* names, not the ArcGIS field
+  names**: `xPoint`, `yPoint`, `wasteDay`, `wasteRateCode`, `recycleRateCode`,
+  `fogoRateCode`, `glassRateCode`, `zone`, `glassWeekNumber`, `address`,
+  `cpage`. Sending `Waste_Rate_Code` etc. verbatim from step 1 does not work.
+- **No coordinate transform is needed — but not for the reason recorded.** The
+  council's own JS *does* reproject the point from EPSG:3857 to EPSG:28355
+  (UTM zone 55S) via proj4 before sending, so "forwarded as-is" was wrong. But
+  the coordinates turn out to be **ignored by the endpoint entirely**: probed
+  with the correct UTM values, with `0,0`, and with `999999,999999`, all three
+  return byte-identical schedules. So the device can send `xPoint=0&yPoint=0`
+  and skip the projection maths completely. Verified, not assumed — this was
+  worth checking precisely because implementing a UTM forward projection
+  on-device is the kind of thing that quietly doubles a backend's size.
+- **The date format is `D-M-YYYY`, NOT zero-padded** — the arrays contain
+  `"5-1-2026"` and `"12-1-2026"` side by side. Recorded above (and in §3.13.4's
+  four-formats summary) as "DD-MM-YYYY numeric zero-padded", which would have
+  broken a fixed-offset parser. The `*Next` summary strings use a *different*
+  format again: `"Next collection is on 27 July 2026"` — full month name, day
+  not padded.
+- **Response is 4397 bytes**, confirming the 8192-byte buffer note below.
+- **The page moved.** The calendar now lives at `/waste-calendar26/`
+  (`/bin-collection-calendar` 302s to it), and its year is baked into both the
+  URL and the `cpage` id — so **this backend should be expected to need a
+  parameter update roughly annually**, which sharpens the maintenance-risk note
+  below from theoretical to scheduled.
+- The four rate codes, day, zone and glass week for the sample address are
+  `101 / 142 / 160 / 170`, `Monday`, `B`, `3`; the live response gives
+  `wasteNext`/`fogoNext` 27 July 2026, `recycleNext` 27 July 2026 and
+  `glassNext` 3 August 2026, plus full `allBinDays`/`allRecycleDays`/
+  `allFogoDays`/`allGlassDays` arrays running to the end of the year.
+
+**Practical consequence for the abstraction**: Merri-bek's opaque id must carry
+8 fields (4 rate codes, day, zone, glass week, address) — the coordinates drop
+out. That is still far more than Knox's `"69454"`, so the "id is an opaque
+variable-length string" requirement stands; it just needs ~120 bytes, not a
+coordinate pair.
+
 **Maintenance risk, stated plainly**: this is a single council's own CMS
-endpoint — one of its query parameters is `cpage=86612`, a bare content-page
-id — with no versioning and no stability guarantee. It can break on any site
+endpoint — one of its query parameters is `cpage=183782`, a bare content-page
+id that has already changed once — with no versioning and no stability
+guarantee. It can break on any site
 redesign, and unlike the two shared platforms, a break here helps exactly one
 user and has no upstream community watching it. That's the accepted cost of
 this exception; §3.6's manual / fallback schedule remains the safety net if it
@@ -1498,12 +1555,15 @@ because it inverts §3.13's headline finding for *this* project:
 - **Every one of the five target councils is now confirmed reachable and
   parseable on-device.** No council in the deployment set needs to fall back
   to the manual schedule for lack of a working backend.
-- Date formats vary and mostly need English month names — **four distinct
-  formats** across four backends: `"05 August 2026"` (Knox, full month),
-  `"29 Jul 2026"` (Whitehorse, abbreviated month), `"DD-MM-YYYY"` (Merri-bek,
-  numeric zero-padded), `"Fri 31/7/2026"` (Monash, weekday + **non**-padded
-  D/M/YYYY). One shared date-parsing helper with a month-name table and
-  tolerant of missing zero-padding — not four ad-hoc parsers.
+- Date formats vary and mostly need English month names — **five distinct
+  formats** across four backends: `"05 August 2026"` (Knox, full month,
+  zero-padded day), `"29 Jul 2026"` (Whitehorse, abbreviated month),
+  `"5-1-2026"` (Merri-bek arrays, numeric **non**-padded D-M-YYYY — corrected
+  from "DD-MM-YYYY zero-padded", see §3.13.3), `"27 July 2026"` (Merri-bek
+  `*Next` summary strings, full month, non-padded day) and `"Fri 31/7/2026"`
+  (Monash, weekday + non-padded D/M/YYYY). One shared date-parsing helper with
+  a month-name table, tolerant of missing zero-padding and of leading prose —
+  not five ad-hoc parsers.
 - Opaque address ids are **not** a consistent type: `"69454"` (Knox),
   `"4645521"` (Whitehorse), a 36-char GUID (Monash), and a bundle of ~10
   fields (Merri-bek). The abstraction must treat the id as an opaque
