@@ -1,0 +1,39 @@
+menu "Bin Light Configuration"
+
+    config BINLIGHT_WIFI_SSID
+        string "Wi-Fi SSID"
+        default ""
+        help
+            Set this via `idf.py menuconfig`. Deliberately left empty here so
+            no real credential is ever committed - your value is stored in
+            sdkconfig, which is gitignored.
+
+    config BINLIGHT_WIFI_PASSWORD
+        string "Wi-Fi Password"
+        default ""
+        help
+            Set this via `idf.py menuconfig`. Deliberately left empty here so
+            no real credential is ever committed - your value is stored in
+            sdkconfig, which is gitignored. Compiled-in credentials go away
+            entirely once AutoAP provisioning lands (SPEC.md 3.4).
+
+    config BINLIGHT_WIFI_MAXIMUM_RETRY
+        int "Wi-Fi connect attempts to wait for at boot before continuing offline"
+        default 10
+
+    config BINLIGHT_SNTP_SERVER
+        string "SNTP server hostname"
+        default "pool.ntp.org"
+
+    config BINLIGHT_TZ_STRING
+        string "POSIX TZ string"
+        default "AEST-10AEDT,M10.1.0/2,M4.1.0/3"
+        help
+            Melbourne, Australia: AEDT starts first Sunday of October,
+            ends first Sunday of April.
+
+    config BINLIGHT_LED_GPIO
+        int "WS2812 data GPIO"
+        default 0
+
+endmenu
