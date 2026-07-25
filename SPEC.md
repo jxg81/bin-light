@@ -56,21 +56,26 @@ priority for implementation, and the acceptance criteria for the API feature:
 
 | # | Council | Backend | Status | Detail |
 |---|---|---|---|---|
-| 1 | **Maribyrnong** (home) | Impact Apps | ✅ implemented | §3.3 |
-| 2 | **Merri-bek** | bespoke (ArcGIS + council API) | re-verified 2026-07-25, **notes corrected** | §3.13.3 |
-| 3 | **Knox** | bespoke (2 JSON calls) | re-verified 2026-07-25, unchanged | §3.13.4 |
-| 4 | **Whitehorse** | bespoke (Weave GIS) | re-verified 2026-07-25, unchanged | §3.13.4 |
-| 5 | **Monash** | OpenCities / MyArea | researched; **not re-testable from the build sandbox** | §3.13.4 |
+| 1 | **Maribyrnong** (home) | Impact Apps | ✅ implemented, verified on hardware | §3.3 |
+| 2 | **Merri-bek** | bespoke (ArcGIS + council API) | ✅ **implemented** — parser verified against live payload | §3.13.3 |
+| 3 | **Knox** | bespoke (2 JSON calls) | ✅ **implemented** — parser verified against live payload | §3.13.4 |
+| 4 | **Whitehorse** | bespoke (Weave GIS) | ✅ **implemented** — parser verified against live payload | §3.13.4 |
+| 5 | **Monash** | OpenCities / MyArea | ✅ **implemented** — parser verified against live payload | §3.13.4 |
+
+All five backends are written and their parsers pass against real captured
+payloads (test/host/fixtures/, fetched live 2026-07-25 from the owner's
+machine — see `test_backends.c`). What remains for the working group is
+**on-device verification**: each council set up through the real `/api-setup`
+flow on real hardware. See "backend abstraction — as built" in §3.13.5.
 
 **Re-verification note (2026-07-25)**: before implementing the backends, all
 four bespoke endpoints were re-probed. Knox and Whitehorse returned exactly the
 recorded shapes. **Merri-bek did not** — its required `cpage` parameter had
 changed value, its parameter names were recorded wrongly, and its date format
 was recorded wrongly; see §3.13.3, which now carries the corrected, verified
-facts. Monash cannot be re-tested from here (IP reputation, §3.13.4) and so
-remains on the original residential-connection evidence. The lesson holds:
-recorded API research decays, and each backend should be re-probed immediately
-before it is implemented rather than trusted from the page.
+facts. The lesson holds: recorded API research decays, and each backend should
+be re-probed immediately before it is implemented rather than trusted from the
+page.
 
 All five are confirmed reachable and parseable on-device; none needs to fall
 back to the manual schedule for want of a working backend. Four of the five
@@ -1466,18 +1471,26 @@ therefore fatal for mbedTLS on an ESP32 — **was wrong**, and is kept here
 rather than deleted because it's a trap worth not re-entering.
 
 The same `curl` from the owner's home connection returns **HTTP 200** (a 302
-to `/Home`, then 200). So Akamai is filtering on **IP reputation**, not on the
-TLS handshake: a datacenter/cloud IP gets denied, a residential one doesn't.
-Since the device will only ever run on a home network, this specific block does
-not apply to it. The reference project's use of `curl_cffi` is therefore not
-evidence of fingerprint blocking here — it may exist for other councils on
-that shared client.
+to `/Home`, then 200). ~~So Akamai is filtering on **IP reputation**, not on
+the TLS handshake.~~ **The second diagnosis was also wrong — corrected
+2026-07-25, on the owner's own machine and network path**: plain `curl` (its
+honest default User-Agent) got 200, while the *same* `curl` sending a spoofed
+Chrome User-Agent got 403. Same IP, same TLS stack, same moment — the only
+variable was the UA. So Akamai here is flagging **User-Agent/TLS-fingerprint
+inconsistency** (a client claiming to be Chrome while shaking hands like
+curl), not datacenter IPs and not the handshake alone. The earlier sandbox
+403s were almost certainly this too: those probes cycled *browser* UAs. The
+consequence for the device is the happy one: `esp_http_client` sends its own
+honest UA over its own mbedTLS handshake — a consistent, unremarkable client —
+so **no UA games, ever**, is both sufficient and necessary. The code carries
+this warning where the Monash URLs are built.
 
-*Lesson for future backend research*: a 403 from this sandbox is not evidence
-that a council API is unusable — it must be re-tested from a residential
-connection before drawing any conclusion. Testing here is still worthwhile
-(it caught real payload sizes and encoding issues for every other backend),
-but "blocked" specifically needs residential confirmation.
+*Lesson for future backend research*: a 403 needs the *actual variable*
+isolated before any conclusion is recorded — this one produced two confident
+wrong diagnoses (TLS fingerprint, then IP reputation) before a controlled
+same-network A/B (honest vs spoofed UA) found the real trigger. And never
+spoof a browser UA from a non-browser TLS stack; it converts an accept into a
+block.
 
 **Confirmed working end to end from a residential connection.**
 
@@ -1647,6 +1660,52 @@ five working-group councils first, shared-platform breadth last:
    lat/lon UX question. Largest coverage win, but zero value to the working
    group.
 
+**Backend abstraction — as built (2026-07-25).** All four bespoke backends
+(Knox, Whitehorse, Merri-bek, Monash) landed in one pass, in
+[waste_api.c](main/waste_api.c), against endpoints re-verified the same day.
+The shape that made this cheap:
+
+- **One normalised vocabulary.** Every backend maps its streams onto Impact
+  Apps' `event_type` names — `waste` / `recycle` / `organic` / `glass`
+  (Knox `rubbish_date`→waste, `green_date`→organic; Whitehorse
+  `nextGOBS`→organic; Merri-bek `fogoNext`→organic; Monash CSS tokens
+  `general-waste`/`recycling`/`green-waste`). Everything downstream — type
+  rules, the default-ignore for weekly `waste`, the name-keyed colour table,
+  the sticky cache, the resolver, both UIs — is completely backend-agnostic;
+  a backend is *only* a fetch-and-normalise function plus a search function.
+- **`fetch_events_for_config()` is the single dispatch point** for both the
+  poll and the diagnostics/auto-map fetch (`waste_api_fetch_upcoming()` now
+  takes the config, not subdomain+id). `waste_api_search_address()` is the
+  matching dispatch for setup.
+- **Config is v3** (`waste_api_v3`): adds a `backend` discriminator
+  (persisted as the `council_backend_t` value — append-only, never renumber)
+  and a 127-char opaque `address_id` for the bespoke backends. **A v2 blob is
+  migrated, not discarded** — the flashed device's Maribyrnong setup survives.
+  Merri-bek's "id" packs its 7 lookup fields plus the address, '|'-separated;
+  nothing outside the Merri-bek functions knows or cares.
+- **No colour data exists in any bespoke backend**, so events are coloured at
+  the source from the Victorian-lid defaults (including the tuned yellow) and
+  remain remappable via type rules like any other event.
+- **Whitehorse's `collectionDay` feeds the recurring waste-weekday signal**
+  (same mechanism as Impact Apps' recurring rule). **Knox's is deliberately
+  not used**: its payload has two weekday strings ("Weekly …"/"Fortnightly …")
+  and which one is general waste is ambiguous — but every Knox stream arrives
+  as a dated event anyway, so nothing is lost.
+- **`EVENTS_BUF_SIZE` 4096 → 8192** for Merri-bek's measured 4397-byte
+  response.
+- **Setup flow branches by backend** (§3.13.5's design realised): dropdown →
+  Impact Apps continues into the locality/street/property wizard; a bespoke
+  council gets a single search box → pick-a-match → save. Search results are
+  capped at 12 (`SETUP_SEARCH_MAX`) because each Merri-bek result link
+  carries its ~110-byte packed id URL-encoded.
+- **Parsers are tested against real captured payloads**, not synthetic ones:
+  `test/host/fixtures/` holds each endpoint's live response from 2026-07-25,
+  and `test_backends.c` compiles the real `waste_api.c` (with the real cJSON
+  from the managed component) against an HTTP stub that serves those bytes in
+  512-byte chunks. 26 assertions cover both steps of all four backends, the
+  tie-ordering, the type-rule default, malformed-id handling, and the v2→v3
+  config migration. `test_dates.c` covers the shared date scanner separately.
+
 **As built** (deviates from the design above in two deliberate ways):
 
 - **Only councils with a working backend are listed.** The design imagined all
@@ -1713,6 +1772,8 @@ three different things that are easy to conflate.
 | §3.8 button rename + 30s duration | ✅ | ❌ **not yet flashed** | ❌ |
 | §3.3 next-collection rework (sticky cache, unified resolver) | ✅ | ❌ **not yet flashed** | ⚠️ 28 host tests pass; no device time |
 | §3.13.5 council dropdown (39 Impact Apps LGAs) | ✅ | ❌ **not yet flashed** | ⚠️ table tests pass; 39/39 probed live |
+| §3.13.3/3.13.4 all four bespoke backends (Knox, Whitehorse, Merri-bek, Monash) | ✅ | ❌ **not yet flashed** | ⚠️ parsers pass against real captured payloads; nothing on-device yet |
+| waste_api config v2→v3 migration | ✅ | ❌ **not yet flashed** | ⚠️ host-tested; watch the first boot's log |
 | DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |
@@ -1831,7 +1892,38 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: flash and verify, then the council backends
+### ▶ Agreed next step: flash, then verify the working group on-device
+
+**Everything §1.2 requires is now written**: all five councils' backends, the
+council dropdown that selects them, the sticky-cache resolver they feed, and
+the setup flows for both backend families. The owner's directive stands:
+*the five working-group councils are the definition of done; everything else
+is nice-to-have.* What remains is on-device verification, which no host test
+can substitute for:
+
+1. **Flash** (this also carries the still-unflashed §3.11 UI and §3.3 work
+   below). Watch the first boot for `migrated waste API config v2 -> v3` —
+   the existing Maribyrnong setup must survive, not reset.
+2. **Maribyrnong** keeps working (regression check: the poll logs
+   `next=known`).
+3. **Each of the other four councils**, one at a time, via
+   `/api-setup` → VIC dropdown → address search → save. For each: the
+   auto-built colour mapping looks right, `/api-test` shows the real upcoming
+   dates, and "Display Next Collection" lights the right colours. The four
+   test addresses used to verify the parsers are in
+   [test/host/test_backends.c](test/host/test_backends.c); real deployments
+   will use the real households' addresses.
+4. **Watch Monash specifically** — its 403 behaviour is UA-fingerprint
+   consistency (see §3.13.4); `esp_http_client`'s honest UA is expected to
+   pass, but this is the one backend whose device-side network behaviour
+   differs most from curl's.
+5. Then return devices to the family deployments at leisure. Merri-bek's
+   `cpage` (§3.13.3) is the known annual-maintenance item.
+
+The older per-step verification list from the previous next-step note follows,
+still applicable to the same flash:
+
+#### (carried forward) flash-and-verify details for §3.11 + §3.3
 
 **Two substantial changes are written and unflashed**, so the device is well
 behind the tree:
@@ -1868,11 +1960,11 @@ Worth a specific eye on, since none of it has run on the device:
   earlier than it used to. Worth re-checking those dates if the manual
   fallback is in use.
 
-After that, the ordering remains as §3.13 sets out: backend abstraction (Knox
-first) → Whitehorse → Merri-bek → Monash → LGA dropdown → Impact Apps list →
-South Australia. The §3.3 rework that used to head this list is done, and it
-was the prerequisite: the backends now only have to fill the sticky cache, not
-reimplement any resolution logic.
+After the working group is verified on-device, what's left is (in the owner's
+priority order, all nice-to-have): §3.12 physical buttons, §3.4 AutoAP (the
+distribution blocker for handing devices out), §3.5 OTA, and the two shared
+platforms already researched in §3.13 (Impact Apps list is done; SA remains,
+gated on its lat/lon UX question).
 
 ### Open questions not yet resolved
 
@@ -2085,8 +2177,10 @@ per §3.7); `waste_api_config_t` went v1 → v2 (adding the per-type mapping
 rules, per §3.3). Every reset so far has happened mid-iteration, before any
 real deployed/long-term data existed — none have hit a "production" device.
 
-**Not yet build-verified**: §3.7/§3.8/§3.10 (second LED, Test button, boot
-self-test) are code-complete but `idf.py build` hasn't been run in this
-environment (no toolchain access here) — needs a real build, flash, and
-on-hardware check before considering them done, same caveat as §3.9's mDNS
-work.
+`waste_api_config_t` **v2 → v3** (backend discriminator + opaque `address_id`,
+per §3.13.5's abstraction) broke the pattern deliberately: it **migrates**
+rather than resets, because by then a real configured device existed. The v2
+layout is kept in `waste_api.c` solely for that one-time load; the migration
+is host-tested in `test_backends.c`. This is the template for future config
+changes now that devices are deployed: migrate, or self-heal (bug 16), never
+casually reset.

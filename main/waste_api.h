@@ -3,11 +3,16 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "esp_err.h"
+#include "councils.h"
 #include "schedule.h"
 
 #define WASTE_API_SUBDOMAIN_MAX_LEN 63
 #define WASTE_API_LABEL_MAX_LEN     63
 #define WASTE_API_MAX_TYPE_RULES    8
+// Sized for the worst backend: Merri-bek's "id" is really 7 config values
+// plus the full address, packed '|'-separated (see waste_api.c). Knox is 5
+// digits, Whitehorse 7, Monash a 36-char GUID.
+#define WASTE_API_ADDRESS_ID_MAX_LEN 127
 
 // How one API event_type (e.g. "organic", "recycle", "waste") should be
 // treated. Discovered and configured via the web UI's "Test API" page, which
@@ -22,17 +27,28 @@ typedef struct {
     schedule_color_t  color;  // used only when not ignored; overrides the API's own colour for this type
 } waste_api_type_rule_t;
 
-// Persisted setup for a single council's "Impact Apps" (waste-info.com.au)
-// instance. Any council on this platform works by changing subdomain +
-// property_id alone - no code changes.
+// Persisted setup for whichever council backend is in use (SPEC.md 3.13).
+// `backend` (a council_backend_t) selects the implementation; the remaining
+// identity fields split by family:
+//   - Impact Apps: council_subdomain + property_id (any council on that
+//     platform works by changing the subdomain alone - no code changes).
+//   - Bespoke backends (Knox/Whitehorse/Merri-bek/Monash): address_id, an
+//     opaque variable-length string produced by waste_api_search_address()
+//     and never interpreted by anything except that same backend.
 typedef struct {
     uint8_t                 version;
     bool                    enabled;
-    char                    council_subdomain[WASTE_API_SUBDOMAIN_MAX_LEN + 1];  // e.g. "maribyrnong"
-    uint32_t                property_id;
-    char                    property_label[WASTE_API_LABEL_MAX_LEN + 1];  // e.g. "12 Example St, Footscray" - display only
+    uint8_t                 backend;  // council_backend_t
+    char                    council_subdomain[WASTE_API_SUBDOMAIN_MAX_LEN + 1];  // IMPACT_APPS only
+    uint32_t                property_id;                                          // IMPACT_APPS only
+    char                    address_id[WASTE_API_ADDRESS_ID_MAX_LEN + 1];         // bespoke backends only
+    char                    property_label[WASTE_API_LABEL_MAX_LEN + 1];  // display only, all backends
     waste_api_type_rule_t   type_rules[WASTE_API_MAX_TYPE_RULES];
 } waste_api_config_t;
+
+// True when the config identifies a fetchable property for its backend -
+// the "is anything actually set up?" test used by the poll task and UI.
+bool waste_api_config_complete(const waste_api_config_t *cfg);
 
 // Loads config from NVS only - does not make a network call.
 esp_err_t waste_api_init(void);
@@ -105,6 +121,19 @@ int waste_api_fetch_localities(const char *subdomain, waste_api_locality_t *out,
 int waste_api_fetch_streets(const char *subdomain, uint32_t locality_id, waste_api_street_t *out, int max_out);
 int waste_api_fetch_properties(const char *subdomain, uint32_t street_id, waste_api_property_t *out, int max_out);
 
+// --- Bespoke-backend address search: the single search-and-pick step that
+// replaces the three-level wizard for Knox/Whitehorse/Merri-bek/Monash. The
+// returned id is opaque - store it in config.address_id verbatim. Blocking
+// HTTPS; returns entries filled or -1 on failure. ---
+
+typedef struct {
+    char id[WASTE_API_ADDRESS_ID_MAX_LEN + 1];
+    char label[96];
+} waste_api_search_result_t;
+
+int waste_api_search_address(uint8_t backend, const char *query,
+                              waste_api_search_result_t *out, int max_out);
+
 // --- Diagnostics: on-demand fetch for the web UI's "Test API" feature.
 // Bypasses the poll cache entirely - a fresh, blocking HTTPS call every time
 // it's invoked, so the user can verify their setup without waiting for the
@@ -118,12 +147,13 @@ typedef struct {
     char              event_type[24];  // e.g. "organic", "recycle" - display only
 } waste_api_event_t;
 
-// Fetches every dated event in [today, today+lookahead_days], sorted by date
-// ascending, into out[] - deliberately RAW and unfiltered (includes "waste"
-// and every other event_type the API returns, using the API's own colour),
-// so the web UI can show the user real data to build a type_rules mapping
-// against rather than guessing. Returns the count filled, or -1 on failure
-// (network/parse error - distinct from a successful fetch that simply found
-// nothing, which returns 0).
-int waste_api_fetch_upcoming(const char *subdomain, uint32_t property_id,
+// Fetches upcoming dated events for cfg's backend, sorted by date ascending,
+// into out[] - deliberately RAW and unfiltered (includes "waste" and every
+// other event_type the backend returns), so the web UI can show the user real
+// data to build a type_rules mapping against rather than guessing. For Impact
+// Apps the window is [today, today+lookahead_days]; the bespoke backends
+// return next-collection-per-stream regardless (lookahead_days is ignored).
+// Returns the count filled, or -1 on failure (network/parse error - distinct
+// from a successful fetch that simply found nothing, which returns 0).
+int waste_api_fetch_upcoming(const waste_api_config_t *cfg,
                               int lookahead_days, waste_api_event_t *out, int max_out);

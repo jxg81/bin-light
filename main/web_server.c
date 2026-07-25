@@ -315,6 +315,19 @@ static int append_type_mapping_rows(char *buf, size_t buf_size, int off, const w
         "</table><p><button type='submit' form='mapform'>Save mapping</button></p>");
 }
 
+// The configured council's display name, whatever the backend. Bespoke
+// backends serve exactly one council each, so a backend lookup suffices;
+// Impact Apps resolves by subdomain (falling back to the raw subdomain for
+// unlisted councils reached via the free-text escape hatch).
+static const char *api_council_name(const waste_api_config_t *cfg)
+{
+    if (cfg->backend == COUNCIL_BACKEND_IMPACT_APPS) {
+        return council_display_name(cfg->council_subdomain);
+    }
+    const council_t *c = council_find_by_backend(cfg->backend);
+    return (c != NULL) ? c->name : "?";
+}
+
 // out must be at least HHMM_BUF_SIZE bytes. Sized for uint16_t's full range
 // (not just the 0-1439 minutes-since-midnight values we actually pass), so
 // the compiler's format-truncation check can prove this never truncates.
@@ -481,10 +494,10 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "it reports nothing due.</p>",
         api_cfg.enabled ? "checked" : "");
 
-    if (api_cfg.property_id != 0) {
+    if (waste_api_config_complete(&api_cfg)) {
         off = safe_append(html, HTML_BUF_SIZE, off,
             "<p>Configured: <b>%s</b><br>%s</p>",
-            council_display_name(api_cfg.council_subdomain), api_cfg.property_label);
+            api_council_name(&api_cfg), api_cfg.property_label);
     } else {
         off = safe_append(html, HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
     }
@@ -715,6 +728,10 @@ static esp_err_t test_post_handler(httpd_req_t *req)
 }
 
 #define SETUP_LOOKUP_MAX    150
+// Bespoke address search renders each match as a link carrying the (encoded)
+// opaque id - Merri-bek's packed ids make those links ~800 bytes each, so
+// this cap is what keeps the page inside SETUP_HTML_BUF_SIZE.
+#define SETUP_SEARCH_MAX    12
 #define SETUP_HTML_BUF_SIZE 20000
 
 // Percent-encodes a string for safe use as one application/x-www-form-urlencoded
@@ -761,12 +778,48 @@ static bool get_query_param(httpd_req_t *req, const char *key, char *out, size_t
     return found;
 }
 
-// No-JS, server-rendered locality -> street -> property wizard for configuring
-// the external bin-collection API. Every step is a plain GET link carrying
-// accumulated state in the query string; the final "save" step persists via
-// waste_api_set_config() and redirects home. Saving via a GET link rather than
-// a POST is a deliberate simplification - no CSRF-relevant risk on a
-// single-user LAN device, consistent with how simple the rest of this UI is.
+// Auto-populate a starting colour mapping: fetch what's actually coming up
+// for this property and build one rule per distinct type seen, defaulting
+// "waste" to ignored (weekly, no reminder value) and everything else to the
+// name-keyed default, falling back to the nearest preset to the API's own
+// colour - so the mapping on the home page usually needs no manual editing.
+static void auto_map_type_rules(waste_api_config_t *cfg)
+{
+    memset(cfg->type_rules, 0, sizeof(cfg->type_rules));
+    waste_api_event_t events[API_TEST_MAX_EVENTS];
+    int n = waste_api_fetch_upcoming(cfg, API_TEST_LOOKAHEAD_DAYS, events, API_TEST_MAX_EVENTS);
+    int rule_count = 0;
+    for (int i = 0; i < n && rule_count < WASTE_API_MAX_TYPE_RULES; i++) {
+        bool already = false;
+        for (int r = 0; r < rule_count; r++) {
+            if (strcmp(cfg->type_rules[r].event_type, events[i].event_type) == 0) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            continue;
+        }
+        waste_api_type_rule_t *rule = &cfg->type_rules[rule_count];
+        snprintf(rule->event_type, sizeof(rule->event_type), "%s", events[i].event_type);
+        rule->ignored = (strcmp(events[i].event_type, "waste") == 0);
+        schedule_color_t named_default;
+        rule->color = default_color_for_type(events[i].event_type, &named_default)
+                          ? named_default
+                          : nearest_preset_color(events[i].color);
+        rule_count++;
+    }
+}
+
+// No-JS, server-rendered setup wizard for the external bin-collection API.
+// Every step is a plain GET link carrying accumulated state in the query
+// string; the final save step persists via waste_api_set_config() and
+// redirects home. Saving via a GET link rather than a POST is a deliberate
+// simplification - no CSRF-relevant risk on a single-user LAN device.
+//
+// Two flows, chosen by the selected council's backend (SPEC.md 3.13.5):
+//   Impact Apps:  council -> locality -> street -> property -> save
+//   bespoke:      council -> address search -> pick a match -> bsave
 static esp_err_t api_setup_get_handler(httpd_req_t *req)
 {
     char step[16] = "";
@@ -777,6 +830,9 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
     char street_id_str[16] = "";
     char property_id_str[16] = "";
     char label[WASTE_API_LABEL_MAX_LEN + 1] = "";
+    char council_param[40] = "";
+    char query[80] = "";
+    char address_id[WASTE_API_ADDRESS_ID_MAX_LEN + 1] = "";
 
     get_query_param(req, "step", step, sizeof(step));
     get_query_param(req, "subdomain", subdomain, sizeof(subdomain));
@@ -784,48 +840,51 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
     get_query_param(req, "street", street_id_str, sizeof(street_id_str));
     get_query_param(req, "property", property_id_str, sizeof(property_id_str));
     get_query_param(req, "label", label, sizeof(label));
+    get_query_param(req, "council", council_param, sizeof(council_param));
+    get_query_param(req, "q", query, sizeof(query));
+    get_query_param(req, "id", address_id, sizeof(address_id));
+
+    const council_t *council = council_find_by_param(council_param);
+
+    // A council picked from the dropdown routes by its backend: Impact Apps
+    // continues into the existing locality wizard; a bespoke backend goes to
+    // the single search-and-pick flow.
+    if (strcmp(step, "council") == 0 && council != NULL &&
+        council->backend == COUNCIL_BACKEND_IMPACT_APPS) {
+        snprintf(subdomain, sizeof(subdomain), "%s", council->param);
+        snprintf(step, sizeof(step), "locality");
+    }
 
     if (strcmp(step, "save") == 0 && property_id_str[0] != '\0') {
         waste_api_config_t cfg = waste_api_get_config();
         cfg.enabled = true;
+        cfg.backend = COUNCIL_BACKEND_IMPACT_APPS;
         snprintf(cfg.council_subdomain, sizeof(cfg.council_subdomain), "%s", subdomain);
         cfg.property_id = (uint32_t)strtoul(property_id_str, NULL, 10);
+        cfg.address_id[0] = '\0';
         snprintf(cfg.property_label, sizeof(cfg.property_label), "%s", label);
-
-        // Auto-populate a starting colour mapping: fetch what's actually
-        // coming up for this property and build one rule per distinct type
-        // seen, defaulting "waste" to ignored and everything else to the
-        // nearest of our 4 presets to the API's own colour - so the mapping
-        // on the home page usually needs no manual editing at all.
-        memset(cfg.type_rules, 0, sizeof(cfg.type_rules));
-        waste_api_event_t events[API_TEST_MAX_EVENTS];
-        int n = waste_api_fetch_upcoming(cfg.council_subdomain, cfg.property_id,
-                                          API_TEST_LOOKAHEAD_DAYS, events, API_TEST_MAX_EVENTS);
-        int rule_count = 0;
-        for (int i = 0; i < n && rule_count < WASTE_API_MAX_TYPE_RULES; i++) {
-            bool already = false;
-            for (int r = 0; r < rule_count; r++) {
-                if (strcmp(cfg.type_rules[r].event_type, events[i].event_type) == 0) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) {
-                continue;
-            }
-            waste_api_type_rule_t *rule = &cfg.type_rules[rule_count];
-            snprintf(rule->event_type, sizeof(rule->event_type), "%s", events[i].event_type);
-            rule->ignored = (strcmp(events[i].event_type, "waste") == 0);
-            schedule_color_t named_default;
-            rule->color = default_color_for_type(events[i].event_type, &named_default)
-                              ? named_default
-                              : nearest_preset_color(events[i].color);
-            rule_count++;
-        }
+        auto_map_type_rules(&cfg);
 
         // Persists and wakes the poll task to fetch immediately, so the real
         // evaluator has fresh, mapped data right away rather than waiting for
         // the next 12h interval.
+        waste_api_set_config(&cfg);
+
+        httpd_resp_set_status(req, "303 See Other");
+        httpd_resp_set_hdr(req, "Location", "/");
+        httpd_resp_send(req, NULL, 0);
+        return ESP_OK;
+    }
+
+    if (strcmp(step, "bsave") == 0 && council != NULL && address_id[0] != '\0') {
+        waste_api_config_t cfg = waste_api_get_config();
+        cfg.enabled = true;
+        cfg.backend = (uint8_t)council->backend;
+        cfg.council_subdomain[0] = '\0';
+        cfg.property_id = 0;
+        snprintf(cfg.address_id, sizeof(cfg.address_id), "%s", address_id);
+        snprintf(cfg.property_label, sizeof(cfg.property_label), "%s", label);
+        auto_map_type_rules(&cfg);
         waste_api_set_config(&cfg);
 
         httpd_resp_set_status(req, "303 See Other");
@@ -857,7 +916,52 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
     char enc_subdomain[WASTE_API_SUBDOMAIN_MAX_LEN * 3 + 1];
     url_encode_component(subdomain, enc_subdomain, sizeof(enc_subdomain));
 
-    if (strcmp(step, "property") == 0 && street_id_str[0] != '\0') {
+    if (strcmp(step, "council") == 0 && council != NULL) {
+        // Bespoke backend: one search box instead of the three-level wizard.
+        char enc_param[sizeof(council_param) * 3 + 1];
+        url_encode_component(council->param, enc_param, sizeof(enc_param));
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+            "<h2>%s</h2>"
+            "<p>Start typing your street address, then pick your property from "
+            "the matches.</p>"
+            "<form method='GET' action='/api-setup'>"
+            "<input type='hidden' name='step' value='bsearch'>"
+            "<input type='hidden' name='council' value='%s'>"
+            "<label>Address: <input type='text' name='q' size='28'></label> "
+            "<button type='submit'>Search</button>"
+            "</form>",
+            council->name, enc_param);
+    } else if (strcmp(step, "bsearch") == 0 && council != NULL && query[0] != '\0') {
+        char enc_param[sizeof(council_param) * 3 + 1];
+        url_encode_component(council->param, enc_param, sizeof(enc_param));
+
+        waste_api_search_result_t *results = malloc(sizeof(waste_api_search_result_t) * SETUP_SEARCH_MAX);
+        int n = (results != NULL)
+                    ? waste_api_search_address((uint8_t)council->backend, query, results, SETUP_SEARCH_MAX)
+                    : -1;
+        if (n < 0) {
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+                "<p>Couldn't search %s's address lookup just now &mdash; check the "
+                "device's connection and try again.</p>", council->name);
+        } else if (n == 0) {
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+                "<p>No matches for \"%s\". Try just the house number and street name.</p>", query);
+        } else {
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your address</h2>");
+            for (int i = 0; i < n; i++) {
+                char enc_id[sizeof(results[i].id) * 3 + 1];
+                char enc_label[sizeof(results[i].label) * 3 + 1];
+                url_encode_component(results[i].id, enc_id, sizeof(enc_id));
+                url_encode_component(results[i].label, enc_label, sizeof(enc_label));
+                off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+                    "<a class='item' href='/api-setup?step=bsave&council=%s&id=%s&label=%s'>%s</a>",
+                    enc_param, enc_id, enc_label, results[i].label);
+            }
+        }
+        if (results != NULL) {
+            free(results);
+        }
+    } else if (strcmp(step, "property") == 0 && street_id_str[0] != '\0') {
         uint32_t street_id = (uint32_t)strtoul(street_id_str, NULL, 10);
         waste_api_property_t *props = malloc(sizeof(waste_api_property_t) * SETUP_LOOKUP_MAX);
         int n = (props != NULL) ? waste_api_fetch_properties(subdomain, street_id, props, SETUP_LOOKUP_MAX) : -1;
@@ -915,10 +1019,16 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         }
     } else {
         waste_api_config_t cfg = waste_api_get_config();
-        if (cfg.property_id != 0) {
+        // The dropdown entry corresponding to the current config, so the list
+        // reopens showing what's actually selected.
+        const council_t *current = (cfg.backend == COUNCIL_BACKEND_IMPACT_APPS)
+                                       ? council_find_impact_apps(cfg.council_subdomain)
+                                       : council_find_by_backend(cfg.backend);
+
+        if (waste_api_config_complete(&cfg)) {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Currently configured: <b>%s</b>, %s (property #%u)</p>",
-                council_display_name(cfg.council_subdomain), cfg.property_label, (unsigned)cfg.property_id);
+                "<p>Currently configured: <b>%s</b><br>%s</p>",
+                api_council_name(&cfg), cfg.property_label);
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
         }
@@ -927,7 +1037,6 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         // configured council's own state; otherwise VIC.
         char state[8] = "";
         if (!get_query_param(req, "state", state, sizeof(state)) || state[0] == '\0') {
-            const council_t *current = council_find_impact_apps(cfg.council_subdomain);
             snprintf(state, sizeof(state), "%s", current ? current->state : COUNCIL_DEFAULT_STATE);
         }
         bool state_known = false;
@@ -967,19 +1076,19 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
 
         off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
             "<form method='GET' action='/api-setup'>"
-            "<input type='hidden' name='step' value='locality'>"
-            "<label>Council: <select name='subdomain'>");
+            "<input type='hidden' name='step' value='council'>"
+            "<label>Council: <select name='council'>");
         for (size_t c = 0; c < COUNCIL_COUNT; c++) {
             if (strcmp(COUNCILS[c].state, state) != 0) {
                 continue;
             }
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<option value='%s' %s>%s</option>",
                 COUNCILS[c].param,
-                strcmp(COUNCILS[c].param, cfg.council_subdomain) == 0 ? "selected" : "",
+                (current != NULL && current == &COUNCILS[c]) ? "selected" : "",
                 COUNCILS[c].name);
         }
         off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-            "</select></label> <button type='submit'>Find my suburb</button></form>");
+            "</select></label> <button type='submit'>Find my address</button></form>");
 
         // The escape hatch that keeps SPEC.md 3.3's deliberate flexibility:
         // any council on this platform works without a firmware change, listed
@@ -1034,18 +1143,17 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
         "<h1>Bin Collection API Test</h1>"
         "<p><a href='/'>&larr; Back to schedule</a></p>");
 
-    if (cfg.property_id == 0 || cfg.council_subdomain[0] == '\0') {
+    if (!waste_api_config_complete(&cfg)) {
         off = safe_append(html, HTML_BUF_SIZE, off,
             "<p>No council/address configured yet &mdash; <a href='/api-setup'>set one up first</a>.</p>");
     } else {
         off = safe_append(html, HTML_BUF_SIZE, off,
             "<p>Testing <b>%s</b>, %s &mdash; raw data for the next %d days "
             "(nothing filtered out yet):</p>",
-            council_display_name(cfg.council_subdomain), cfg.property_label, API_TEST_LOOKAHEAD_DAYS);
+            api_council_name(&cfg), cfg.property_label, API_TEST_LOOKAHEAD_DAYS);
 
         waste_api_event_t events[API_TEST_MAX_EVENTS];
-        int n = waste_api_fetch_upcoming(cfg.council_subdomain, cfg.property_id,
-                                          API_TEST_LOOKAHEAD_DAYS, events, API_TEST_MAX_EVENTS);
+        int n = waste_api_fetch_upcoming(&cfg, API_TEST_LOOKAHEAD_DAYS, events, API_TEST_MAX_EVENTS);
         if (n < 0) {
             off = safe_append(html, HTML_BUF_SIZE, off,
                 "<p style='color:#a00'>Couldn't reach the API just now &mdash; check the device's Wi-Fi "

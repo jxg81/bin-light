@@ -39,6 +39,22 @@ cc -o "$OUT/test_councils" test_councils.c $MAIN/councils.c $CFLAGS
 echo
 "$OUT/test_councils" 2>/dev/null || status=1
 
+echo
+echo "building test_dates..."
+cc -o "$OUT/test_dates" test_dates.c $MAIN/date_parse.c $CFLAGS
+echo
+"$OUT/test_dates" 2>/dev/null || status=1
+
+echo
+echo "building test_backends..."
+# Compiles the real waste_api.c against captured council payloads (fixtures/).
+# cJSON comes straight from the managed component - same code as the device.
+CJSON=../../managed_components/espressif__cjson/cJSON
+cc -o "$OUT/test_backends" test_backends.c $MAIN/date_parse.c $MAIN/councils.c "$CJSON/cJSON.c" \
+   -I "$CJSON" $CFLAGS
+echo
+"$OUT/test_backends" 2>/dev/null || status=1
+
 if [ "$1" = "render" ]; then
     echo
     echo "building render_page..."

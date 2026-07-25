@@ -26,7 +26,13 @@ esp_err_t waste_api_set_config(const waste_api_config_t *c) { s_api = *c; return
 int waste_api_fetch_localities(const char *s, waste_api_locality_t *o, int m) { (void)s;(void)o;(void)m; return -1; }
 int waste_api_fetch_streets(const char *s, uint32_t l, waste_api_street_t *o, int m) { (void)s;(void)l;(void)o;(void)m; return -1; }
 int waste_api_fetch_properties(const char *s, uint32_t st, waste_api_property_t *o, int m) { (void)s;(void)st;(void)o;(void)m; return -1; }
-int waste_api_fetch_upcoming(const char *s, uint32_t p, int d, waste_api_event_t *o, int m) { (void)s;(void)p;(void)d;(void)o;(void)m; return -1; }
+int waste_api_fetch_upcoming(const waste_api_config_t *c, int d, waste_api_event_t *o, int m) { (void)c;(void)d;(void)o;(void)m; return -1; }
+int waste_api_search_address(uint8_t b, const char *q, waste_api_search_result_t *o, int m) { (void)b;(void)q;(void)o;(void)m; return -1; }
+bool waste_api_config_complete(const waste_api_config_t *c)
+{
+    if (c->backend == COUNCIL_BACKEND_IMPACT_APPS) return c->council_subdomain[0] != '\0' && c->property_id != 0;
+    return c->address_id[0] != '\0';
+}
 
 static FILE *s_out;
 void stub_capture(const char *buf, int len) { fwrite(buf, 1, (size_t)len, s_out); }

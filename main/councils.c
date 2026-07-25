@@ -23,16 +23,23 @@
 // `wellington` in Gippsland, VIC.
 const council_t COUNCILS[] = {
     // --- VIC ---
+    // The four bespoke entries (Knox, Merri-bek, City of Monash, Whitehorse)
+    // are the critical working group (SPEC.md 1.2) alongside Maribyrnong.
+    // Their param is a stable slug for URL/config use, not a subdomain.
     {"Baw Baw Shire Council",                "VIC", COUNCIL_BACKEND_IMPACT_APPS, "baw-baw"},
     {"Benalla Rural City Council",           "VIC", COUNCIL_BACKEND_IMPACT_APPS, "benalla"},
     {"City of Ballarat",                     "VIC", COUNCIL_BACKEND_IMPACT_APPS, "ballarat"},
+    {"City of Monash",                       "VIC", COUNCIL_BACKEND_MONASH,      "monash"},
     {"Hobsons Bay City Council",             "VIC", COUNCIL_BACKEND_IMPACT_APPS, "hobsons-bay"},
     {"Horsham Rural City Council",           "VIC", COUNCIL_BACKEND_IMPACT_APPS, "hrcc"},
+    {"Knox City Council",                    "VIC", COUNCIL_BACKEND_KNOX,        "knox"},
     {"Maribyrnong City Council",             "VIC", COUNCIL_BACKEND_IMPACT_APPS, "maribyrnong"},
+    {"Merri-bek City Council",               "VIC", COUNCIL_BACKEND_MERRI_BEK,   "merri-bek"},
     {"Moira Shire Council",                  "VIC", COUNCIL_BACKEND_IMPACT_APPS, "moira"},
     {"Murrindindi Shire Council",            "VIC", COUNCIL_BACKEND_IMPACT_APPS, "murrindindi"},
     {"Pyrenees Shire Council",               "VIC", COUNCIL_BACKEND_IMPACT_APPS, "pyrenees"},
     {"Wellington Shire Council",             "VIC", COUNCIL_BACKEND_IMPACT_APPS, "wellington"},
+    {"Whitehorse City Council",              "VIC", COUNCIL_BACKEND_WHITEHORSE,  "whitehorse"},
 
     // --- NSW ---
     {"Bayside Council",                      "NSW", COUNCIL_BACKEND_IMPACT_APPS, "rockdale"},
@@ -85,18 +92,33 @@ static const struct { const char *code; const char *label; } STATE_LABELS[] = {
     {"ACT", "Australian Capital Territory"},
 };
 
-const council_t *council_find_impact_apps(const char *subdomain)
+const council_t *council_find_by_param(const char *param)
 {
-    if (subdomain == NULL || subdomain[0] == '\0') {
+    if (param == NULL || param[0] == '\0') {
         return NULL;
     }
     for (size_t i = 0; i < COUNCIL_COUNT; i++) {
-        if (COUNCILS[i].backend == COUNCIL_BACKEND_IMPACT_APPS &&
-            strcmp(COUNCILS[i].param, subdomain) == 0) {
+        if (strcmp(COUNCILS[i].param, param) == 0) {
             return &COUNCILS[i];
         }
     }
     return NULL;
+}
+
+const council_t *council_find_by_backend(uint8_t backend)
+{
+    for (size_t i = 0; i < COUNCIL_COUNT; i++) {
+        if ((uint8_t)COUNCILS[i].backend == backend) {
+            return &COUNCILS[i];
+        }
+    }
+    return NULL;
+}
+
+const council_t *council_find_impact_apps(const char *subdomain)
+{
+    const council_t *c = council_find_by_param(subdomain);
+    return (c != NULL && c->backend == COUNCIL_BACKEND_IMPACT_APPS) ? c : NULL;
 }
 
 const char *council_display_name(const char *subdomain)

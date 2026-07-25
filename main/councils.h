@@ -2,6 +2,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 // The supported-council table (SPEC.md 3.13.5). Users pick their council by
 // name from a dropdown; they should never have to know, choose, or understand
@@ -10,14 +11,22 @@
 // Only councils whose backend is actually implemented belong in here. Listing
 // a council we can't yet serve would be worse than omitting it: the user picks
 // their own council by name, gets an address wizard, and only then discovers
-// nothing works. The bespoke Victorian backends (Knox, Whitehorse, Merri-bek,
-// Monash) and the 46 South Australian councils are researched and specified
-// (SPEC.md 3.13.2-3.13.4) but not built, so they are deliberately absent.
+// nothing works. The 46 South Australian councils are researched (SPEC.md
+// 3.13.2) but their backend is not built, so they are deliberately absent.
+//
+// The enum values are persisted in NVS (waste_api_config_t.backend), so they
+// must never be renumbered - append only.
 
 typedef enum {
     // Every council on the white-label "Impact Apps" platform, identified by
     // its waste-info.com.au subdomain. See SPEC.md 3.3.
     COUNCIL_BACKEND_IMPACT_APPS = 0,
+    // Bespoke single-council backends, SPEC.md 3.13.3/3.13.4. Each serves
+    // exactly one LGA of the critical working group (SPEC.md 1.2).
+    COUNCIL_BACKEND_KNOX        = 1,
+    COUNCIL_BACKEND_WHITEHORSE  = 2,
+    COUNCIL_BACKEND_MERRI_BEK   = 3,
+    COUNCIL_BACKEND_MONASH      = 4,
 } council_backend_t;
 
 typedef struct {
@@ -46,6 +55,16 @@ extern const size_t STATE_ORDER_COUNT;
 // one (which is legitimate - the free-text escape hatch exists precisely so
 // unlisted councils on the same platform still work).
 const council_t *council_find_impact_apps(const char *subdomain);
+
+// The council with this param, any backend, or NULL. Params are unique across
+// the whole table (enforced by test/host/test_councils.c), so no backend
+// qualifier is needed.
+const council_t *council_find_by_param(const char *param);
+
+// The first council served by this backend, or NULL. Meaningful for the
+// bespoke single-council backends; for shared platforms (Impact Apps) it
+// returns an arbitrary member, so look up by param instead there.
+const council_t *council_find_by_backend(uint8_t backend);
 
 // A human-readable name for an Impact Apps subdomain: the council's display
 // name when listed, otherwise the subdomain itself. Never NULL, so it can be

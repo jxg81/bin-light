@@ -1,5 +1,6 @@
 #include "waste_api.h"
 
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -13,11 +14,17 @@
 #include "nvs.h"
 #include "cJSON.h"
 
+#include "date_parse.h"
+
 static const char *TAG = "waste_api";
 
 #define WASTE_API_NVS_NAMESPACE  "binlight"
-#define WASTE_API_NVS_KEY        "waste_api_v2"
-#define WASTE_API_STRUCT_VERSION 2
+#define WASTE_API_NVS_KEY        "waste_api_v3"
+#define WASTE_API_STRUCT_VERSION 3
+
+// v2 (pre-backend-abstraction, Impact Apps only) is migrated on first boot
+// rather than discarded - a working Maribyrnong setup survives the upgrade.
+#define WASTE_API_NVS_KEY_V2     "waste_api_v2"
 
 // Cache is a separate blob from the config: it's derived data we can refetch,
 // not user configuration, and mixing them would mean a cache write rewriting
@@ -31,7 +38,11 @@ static const char *TAG = "waste_api";
 // sparsely, whereas a too-narrow window used to translate directly into the
 // light being wrong.
 #define EVENTS_LOOKAHEAD_DAYS 30
-#define EVENTS_BUF_SIZE       4096   // real observed 2-week response was ~700 bytes; generous margin
+// Sized for the largest measured schedule response across all backends:
+// Merri-bek's AddressDetails is 4397 bytes (would overflow the previous
+// 4096), Monash's HTML-in-JSON ~2.5KB, Impact Apps ~700B, Knox 363B,
+// Whitehorse ~450B.
+#define EVENTS_BUF_SIZE       8192
 #define LOOKUP_BUF_SIZE       16384  // locality/street/property lists can be much larger than an events response
 #define HTTP_TIMEOUT_MS       8000
 #define POLL_MAX_EVENTS       16     // 30-day window across several bin types
@@ -99,7 +110,56 @@ static waste_api_config_t default_config(void)
 {
     waste_api_config_t c = {0};
     c.version = WASTE_API_STRUCT_VERSION;
+    c.backend = COUNCIL_BACKEND_IMPACT_APPS;
     return c;
+}
+
+// The v2 layout, exactly as compiled before the backend abstraction - no
+// backend discriminator, no address_id. Kept only for one-time migration.
+typedef struct {
+    uint8_t                 version;
+    bool                    enabled;
+    char                    council_subdomain[WASTE_API_SUBDOMAIN_MAX_LEN + 1];
+    uint32_t                property_id;
+    char                    property_label[WASTE_API_LABEL_MAX_LEN + 1];
+    waste_api_type_rule_t   type_rules[WASTE_API_MAX_TYPE_RULES];
+} waste_api_config_v2_t;
+
+// Loads a v2 blob into *out (as a v3 struct), true on success. Everything in
+// v2 was Impact Apps by definition.
+static bool load_legacy_v2(nvs_handle_t handle, waste_api_config_t *out)
+{
+    size_t size = 0;
+    waste_api_config_v2_t old;
+    if (nvs_get_blob(handle, WASTE_API_NVS_KEY_V2, NULL, &size) != ESP_OK ||
+        size != sizeof(waste_api_config_v2_t) ||
+        nvs_get_blob(handle, WASTE_API_NVS_KEY_V2, &old, &size) != ESP_OK ||
+        old.version != 2) {
+        return false;
+    }
+    *out = default_config();
+    out->enabled = old.enabled;
+    out->backend = COUNCIL_BACKEND_IMPACT_APPS;
+    memcpy(out->council_subdomain, old.council_subdomain, sizeof(out->council_subdomain));
+    out->property_id = old.property_id;
+    memcpy(out->property_label, old.property_label, sizeof(out->property_label));
+    memcpy(out->type_rules, old.type_rules, sizeof(out->type_rules));
+    return true;
+}
+
+bool waste_api_config_complete(const waste_api_config_t *cfg)
+{
+    switch (cfg->backend) {
+    case COUNCIL_BACKEND_IMPACT_APPS:
+        return cfg->council_subdomain[0] != '\0' && cfg->property_id != 0;
+    case COUNCIL_BACKEND_KNOX:
+    case COUNCIL_BACKEND_WHITEHORSE:
+    case COUNCIL_BACKEND_MERRI_BEK:
+    case COUNCIL_BACKEND_MONASH:
+        return cfg->address_id[0] != '\0';
+    default:
+        return false;
+    }
 }
 
 static esp_err_t persist_config(const waste_api_config_t *cfg)
@@ -179,9 +239,18 @@ esp_err_t waste_api_init(void)
             if (err == ESP_OK && loaded.version == WASTE_API_STRUCT_VERSION) {
                 s_config = loaded;
                 nvs_close(handle);
-                ESP_LOGI(TAG, "loaded waste API config from NVS (enabled=%d)", s_config.enabled);
+                ESP_LOGI(TAG, "loaded waste API config from NVS (enabled=%d, backend=%u)",
+                         s_config.enabled, (unsigned)s_config.backend);
                 return ESP_OK;
             }
+        }
+
+        // No v3 blob: migrate a v2 one instead of discarding a working setup.
+        if (load_legacy_v2(handle, &s_config)) {
+            nvs_close(handle);
+            ESP_LOGI(TAG, "migrated waste API config v2 -> v3 (Impact Apps, enabled=%d)", s_config.enabled);
+            persist_config(&s_config);
+            return ESP_OK;
         }
         nvs_close(handle);
     }
@@ -211,6 +280,7 @@ esp_err_t waste_api_set_config(const waste_api_config_t *cfg)
     waste_api_config_t to_store = *cfg;
     to_store.version = WASTE_API_STRUCT_VERSION;
     to_store.council_subdomain[WASTE_API_SUBDOMAIN_MAX_LEN] = '\0';
+    to_store.address_id[WASTE_API_ADDRESS_ID_MAX_LEN] = '\0';
     to_store.property_label[WASTE_API_LABEL_MAX_LEN] = '\0';
     for (int i = 0; i < WASTE_API_MAX_TYPE_RULES; i++) {
         to_store.type_rules[i].event_type[sizeof(to_store.type_rules[i].event_type) - 1] = '\0';
@@ -479,21 +549,651 @@ static int apply_type_rules(const waste_api_config_t *cfg, waste_api_event_t *ev
     return out_n;
 }
 
+// ------------------------------------------------- bespoke council backends --
+//
+// Knox, Whitehorse, Merri-bek and Monash (SPEC.md 3.13.3/3.13.4) - the
+// critical working group (SPEC.md 1.2) minus Maribyrnong, which rides the
+// Impact Apps path above. All four share one shape: an opaque address id
+// (produced by the search functions below, stored in config.address_id) and
+// a fetch that returns the next collection date per waste stream. Each
+// backend normalises its streams onto the Impact Apps event_type vocabulary
+// (waste / recycle / organic / glass) so everything downstream - type rules,
+// ignore defaults, the name-keyed colour table, the sticky cache, the
+// resolver - is completely backend-agnostic.
+//
+// None of these backends return colour data, so events are coloured here
+// from the same defaults the web UI's name-keyed table uses (Victorian lid
+// colours; the user can still remap via type rules).
+
+static schedule_color_t bespoke_default_color(const char *event_type)
+{
+    if (strcmp(event_type, "recycle") == 0) return (schedule_color_t){255, 150, 0}; // tuned yellow, see web_server.c
+    if (strcmp(event_type, "organic") == 0) return (schedule_color_t){0, 255, 0};
+    if (strcmp(event_type, "glass") == 0)   return (schedule_color_t){128, 0, 128};
+    return (schedule_color_t){255, 0, 0};   // waste / anything unrecognised
+}
+
+// Percent-encodes src into dst (RFC 3986 unreserved set kept literal).
+static void url_encode(char *dst, size_t dst_size, const char *src)
+{
+    static const char *hex = "0123456789ABCDEF";
+    size_t o = 0;
+    for (const char *p = src; *p != '\0' && o + 4 < dst_size; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (isalnum(c) || c == '-' || c == '_' || c == '.' || c == '~') {
+            dst[o++] = (char)c;
+        } else {
+            dst[o++] = '%';
+            dst[o++] = hex[c >> 4];
+            dst[o++] = hex[c & 0xF];
+        }
+    }
+    dst[o] = '\0';
+}
+
+static void insert_event_sorted(waste_api_event_t *out, int *n, int max_out, const waste_api_event_t *ev)
+{
+    if (*n >= max_out) {
+        return;
+    }
+    time_t ev_time = event_mktime(ev->year, ev->month, ev->day);
+    int pos = *n;
+    while (pos > 0 && event_mktime(out[pos - 1].year, out[pos - 1].month, out[pos - 1].day) > ev_time) {
+        out[pos] = out[pos - 1];
+        pos--;
+    }
+    out[pos] = *ev;
+    (*n)++;
+}
+
+// Builds one event from a prose/markup string carrying a date ("Next
+// collection is <span>05 August 2026</span>") and inserts it. Quietly skips
+// strings with no parseable date - a missing stream is data, not an error.
+static void add_stream_event(waste_api_event_t *out, int *n, int max_out,
+                              const char *event_type, const char *text)
+{
+    if (text == NULL) {
+        return;
+    }
+    waste_api_event_t ev = {0};
+    if (!date_parse_flex(text, &ev.year, &ev.month, &ev.day)) {
+        return;
+    }
+    snprintf(ev.event_type, sizeof(ev.event_type), "%s", event_type);
+    ev.color = bespoke_default_color(event_type);
+    insert_event_sorted(out, n, max_out, &ev);
+}
+
+// --- Knox (SPEC.md 3.13.4): two plain JSON calls on knox.vic.gov.au. ---
+//
+// The recurring-weekday strings ("Weekly collection on Wednesday" /
+// "Fortnightly collection on Wednesday") are deliberately NOT used as a waste
+// dow signal: which of the two describes general waste is ambiguous in the
+// payload, and every stream arrives as an explicit dated event anyway.
+
+static int knox_fetch_events(const char *address_id, waste_api_event_t *out, int max_out)
+{
+    char enc[64];
+    url_encode(enc, sizeof(enc), address_id);
+    char url[160];
+    snprintf(url, sizeof(url), "https://www.knox.vic.gov.au/rubbish-collection/find?address=%s", enc);
+
+    char *buf = malloc(EVENTS_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, EVENTS_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL || !cJSON_IsObject(root)) {
+        ESP_LOGW(TAG, "knox: unexpected response shape");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    static const struct { const char *field; const char *type; } STREAMS[] = {
+        {"rubbish_date",   "waste"},
+        {"recycling_date", "recycle"},
+        {"green_date",     "organic"},
+    };
+    int n = 0;
+    for (size_t i = 0; i < sizeof(STREAMS) / sizeof(STREAMS[0]); i++) {
+        cJSON *item = cJSON_GetObjectItem(root, STREAMS[i].field);
+        add_stream_event(out, &n, max_out, STREAMS[i].type,
+                          cJSON_IsString(item) ? item->valuestring : NULL);
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+static int knox_search(const char *query, waste_api_search_result_t *out, int max_out)
+{
+    char enc[256];
+    url_encode(enc, sizeof(enc), query);
+    char url[384];
+    snprintf(url, sizeof(url), "https://www.knox.vic.gov.au/rubbish-collection/autocomplete/find?q=%s", enc);
+
+    char *buf = malloc(LOOKUP_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, LOOKUP_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL || !cJSON_IsArray(root)) {
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    int n = 0;
+    int count = cJSON_GetArraySize(root);
+    for (int i = 0; i < count && n < max_out; i++) {
+        cJSON *item = cJSON_GetArrayItem(root, i);
+        cJSON *value = cJSON_GetObjectItem(item, "value");
+        cJSON *label = cJSON_GetObjectItem(item, "label");
+        if (!cJSON_IsString(value) || !cJSON_IsString(label)) {
+            continue;
+        }
+        snprintf(out[n].id, sizeof(out[n].id), "%s", value->valuestring);
+        snprintf(out[n].label, sizeof(out[n].label), "%s", label->valuestring);
+        n++;
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+// --- Whitehorse (SPEC.md 3.13.4): public "Weave" GIS on
+// map.whitehorse.vic.gov.au. Recycling and organics arrive as explicit next
+// dates; household waste is weekly on collectionDay, which becomes the
+// recurring waste-dow signal (same mechanism Impact Apps' recurring rule
+// feeds). ---
+
+static int whitehorse_fetch_events(const char *address_id, waste_api_event_t *out, int max_out,
+                                    bool *out_dow_known, uint8_t *out_dow)
+{
+    char enc[64];
+    url_encode(enc, sizeof(enc), address_id);
+    char url[256];
+    snprintf(url, sizeof(url),
+             "https://map.whitehorse.vic.gov.au/weave/services/v1/feature/getFeaturesByIds"
+             "?entityId=lyr_vicmap_property&datadefinition=dd_whm_property_waste&ids=%s", enc);
+
+    char *buf = malloc(EVENTS_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, EVENTS_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        return -1;
+    }
+
+    int n = -1;
+    cJSON *features = cJSON_GetObjectItem(root, "features");
+    cJSON *feature = cJSON_IsArray(features) ? cJSON_GetArrayItem(features, 0) : NULL;
+    cJSON *props = cJSON_GetObjectItem(feature, "properties");
+    cJSON *dd = cJSON_GetObjectItem(props, "dd_whm_property_waste");
+    cJSON *rec = cJSON_IsArray(dd) ? cJSON_GetArrayItem(dd, 0) : NULL;
+    if (rec != NULL) {
+        n = 0;
+        cJSON *next_recycle = cJSON_GetObjectItem(rec, "nextRecycle");
+        cJSON *next_gobs = cJSON_GetObjectItem(rec, "nextGOBS");
+        add_stream_event(out, &n, max_out, "recycle",
+                          cJSON_IsString(next_recycle) ? next_recycle->valuestring : NULL);
+        add_stream_event(out, &n, max_out, "organic",
+                          cJSON_IsString(next_gobs) ? next_gobs->valuestring : NULL);
+
+        cJSON *day = cJSON_GetObjectItem(rec, "collectionDay");
+        if (out_dow_known != NULL && cJSON_IsString(day)) {
+            int wd = date_parse_weekday(day->valuestring);
+            if (wd >= 0) {
+                *out_dow_known = true;
+                if (out_dow != NULL) {
+                    *out_dow = (uint8_t)wd;
+                }
+            }
+        }
+    } else {
+        ESP_LOGW(TAG, "whitehorse: unexpected response shape");
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+static int whitehorse_search(const char *query, waste_api_search_result_t *out, int max_out)
+{
+    char enc[256];
+    url_encode(enc, sizeof(enc), query);
+    char url[448];
+    // Small limit on purpose: the reference client asks for 1000, which would
+    // be unusable here (SPEC.md 3.13.4).
+    snprintf(url, sizeof(url),
+             "https://map.whitehorse.vic.gov.au/weave/services/v1/index/search"
+             "?query=%s&indexes=index.property&type=EXACT&crs=EPSG:3857&limit=%d", enc, max_out);
+
+    char *buf = malloc(LOOKUP_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, LOOKUP_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        return -1;
+    }
+
+    int n = -1;
+    cJSON *results = cJSON_GetObjectItem(root, "results");
+    if (cJSON_IsArray(results)) {
+        n = 0;
+        int count = cJSON_GetArraySize(results);
+        for (int i = 0; i < count && n < max_out; i++) {
+            cJSON *item = cJSON_GetArrayItem(results, i);
+            cJSON *id = cJSON_GetObjectItem(item, "id");
+            cJSON *label = cJSON_GetObjectItem(item, "display1");
+            if (!cJSON_IsString(id) || !cJSON_IsString(label)) {
+                continue;
+            }
+            snprintf(out[n].id, sizeof(out[n].id), "%s", id->valuestring);
+            snprintf(out[n].label, sizeof(out[n].label), "%s", label->valuestring);
+            n++;
+        }
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+// --- Merri-bek (SPEC.md 3.13.3): ArcGIS address search + the council's own
+// CMS API. The "address id" packs everything AddressDetails needs,
+// '|'-separated: rate codes for waste/recycling/FOGO/glass, day, zone, glass
+// week, then the address itself. Coordinates are NOT included - the endpoint
+// ignores them entirely (verified by probing with garbage values), so zeros
+// are sent and the EPSG:28355 projection the council's own JS performs is
+// skipped. ---
+
+// A bare CMS content-page id, mandatory, and it has already changed once
+// (86612 -> 183782 between research and implementation). When Merri-bek
+// stops working, this - and the year baked into the calendar page URL - is
+// the first thing to re-check. SPEC.md 3.13.3.
+#define MERRIBEK_CPAGE "183782"
+
+static int merribek_fetch_events(const char *address_id, waste_api_event_t *out, int max_out)
+{
+    // Unpack "waste|recycle|fogo|glass|Day|Zone|Week|ADDRESS".
+    char id_copy[WASTE_API_ADDRESS_ID_MAX_LEN + 1];
+    snprintf(id_copy, sizeof(id_copy), "%s", address_id);
+    char *fields[8] = {0};
+    char *p = id_copy;
+    for (int i = 0; i < 8; i++) {
+        fields[i] = p;
+        if (i == 7) {
+            break; // the address is the tail; it may itself never contain '|'
+        }
+        char *sep = strchr(p, '|');
+        if (sep == NULL) {
+            ESP_LOGW(TAG, "merri-bek: malformed address id");
+            return -1;
+        }
+        *sep = '\0';
+        p = sep + 1;
+    }
+
+    char enc_addr[256];
+    url_encode(enc_addr, sizeof(enc_addr), fields[7]);
+    char url[640];
+    snprintf(url, sizeof(url),
+             "https://www.merri-bek.vic.gov.au/api/AddressDetails"
+             "?xPoint=0&yPoint=0&wasteDay=%s&wasteRateCode=%s&recycleRateCode=%s"
+             "&fogoRateCode=%s&glassRateCode=%s&zone=%s&glassWeekNumber=%s"
+             "&address=%s&cpage=" MERRIBEK_CPAGE,
+             fields[4], fields[0], fields[1], fields[2], fields[3], fields[5], fields[6], enc_addr);
+
+    char *buf = malloc(EVENTS_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, EVENTS_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        return -1;
+    }
+
+    cJSON *rec = cJSON_IsArray(root) ? cJSON_GetArrayItem(root, 0) : root;
+    cJSON *no_service = cJSON_GetObjectItem(rec, "noService");
+    if (cJSON_IsString(no_service) && strcmp(no_service->valuestring, "no service") == 0) {
+        // Either a genuinely unserviced address or - just as likely - the
+        // cpage id has rotated again and the endpoint is rejecting the
+        // request while claiming success. Treat as a fetch failure so the
+        // sticky cache is left alone.
+        ESP_LOGW(TAG, "merri-bek: 'no service' response - unserviced address, or cpage (%s) has changed",
+                 MERRIBEK_CPAGE);
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    static const struct { const char *field; const char *type; } STREAMS[] = {
+        {"wasteNext",   "waste"},
+        {"recycleNext", "recycle"},
+        {"fogoNext",    "organic"},
+        {"glassNext",   "glass"},
+    };
+    int n = 0;
+    for (size_t i = 0; i < sizeof(STREAMS) / sizeof(STREAMS[0]); i++) {
+        cJSON *item = cJSON_GetObjectItem(rec, STREAMS[i].field);
+        add_stream_event(out, &n, max_out, STREAMS[i].type,
+                          cJSON_IsString(item) ? item->valuestring : NULL);
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+static int merribek_search(const char *query, waste_api_search_result_t *out, int max_out)
+{
+    // The layer stores addresses UPPERCASE and unabbreviated; matching is
+    // case-sensitive, so uppercase the query on the way in (SPEC.md 3.13.3).
+    // Single quotes are doubled for the SQL-ish LIKE - Merri-bek has real
+    // apostrophe streets (O'Hea Street, Coburg).
+    char upper[96];
+    size_t o = 0;
+    for (const char *p = query; *p != '\0' && o + 2 < sizeof(upper); p++) {
+        if (*p == '\'') {
+            upper[o++] = '\'';
+            upper[o++] = '\'';
+        } else {
+            upper[o++] = (char)toupper((unsigned char)*p);
+        }
+    }
+    upper[o] = '\0';
+
+    char where[160];
+    snprintf(where, sizeof(where), "UPPER(EZI_Address) LIKE '%s%%'", upper);
+    char enc_where[480];
+    url_encode(enc_where, sizeof(enc_where), where);
+
+    char url[768];
+    snprintf(url, sizeof(url),
+             "https://services6.arcgis.com/8L5sOwfzTAvcvQur/ArcGIS/rest/services/WasteServices4Bin/FeatureServer/0/query"
+             "?where=%s&outFields=EZI_Address,Waste_Rate_Code,Recycling_Rate_Code,FOGO_Rate_Code,"
+             "Glass_Rate_Code,Day,Zone,GlassWeek&returnGeometry=false&resultRecordCount=%d&f=json",
+             enc_where, max_out);
+
+    char *buf = malloc(LOOKUP_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, LOOKUP_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        return -1;
+    }
+
+    int n = -1;
+    cJSON *features = cJSON_GetObjectItem(root, "features");
+    if (cJSON_IsArray(features)) {
+        n = 0;
+        int count = cJSON_GetArraySize(features);
+        for (int i = 0; i < count && n < max_out; i++) {
+            cJSON *attrs = cJSON_GetObjectItem(cJSON_GetArrayItem(features, i), "attributes");
+            cJSON *addr  = cJSON_GetObjectItem(attrs, "EZI_Address");
+            cJSON *waste = cJSON_GetObjectItem(attrs, "Waste_Rate_Code");
+            cJSON *recy  = cJSON_GetObjectItem(attrs, "Recycling_Rate_Code");
+            cJSON *fogo  = cJSON_GetObjectItem(attrs, "FOGO_Rate_Code");
+            cJSON *glass = cJSON_GetObjectItem(attrs, "Glass_Rate_Code");
+            cJSON *day   = cJSON_GetObjectItem(attrs, "Day");
+            cJSON *zone  = cJSON_GetObjectItem(attrs, "Zone");
+            cJSON *week  = cJSON_GetObjectItem(attrs, "GlassWeek");
+            if (!cJSON_IsString(addr) || !cJSON_IsString(waste) || !cJSON_IsString(recy) ||
+                !cJSON_IsString(fogo) || !cJSON_IsString(glass) || !cJSON_IsString(day) ||
+                !cJSON_IsString(zone) || !cJSON_IsNumber(week)) {
+                continue;
+            }
+            snprintf(out[n].id, sizeof(out[n].id), "%s|%s|%s|%s|%s|%s|%d|%s",
+                     waste->valuestring, recy->valuestring, fogo->valuestring, glass->valuestring,
+                     day->valuestring, zone->valuestring, (int)week->valuedouble, addr->valuestring);
+            snprintf(out[n].label, sizeof(out[n].label), "%s", addr->valuestring);
+            n++;
+        }
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+// --- Monash (SPEC.md 3.13.4): OpenCities "MyArea". The schedule arrives as
+// an HTML fragment inside a JSON envelope; the CSS class tokens
+// (general-waste / recycling / green-waste) are the stable machine
+// vocabulary, NOT the <h3> display labels a council can rename at will.
+// Akamai-fronted: served fine to honest clients, but a browser User-Agent
+// that doesn't match the TLS fingerprint gets 403 - so no UA games, ever
+// (verified live: plain curl 200, spoofed-Chrome curl 403). ---
+
+// Finds needle inside the first len bytes of hay (a bounded strstr - the
+// block being scanned is a slice of a larger HTML string, not its own
+// NUL-terminated buffer).
+static const char *find_in(const char *hay, size_t len, const char *needle)
+{
+    size_t nlen = strlen(needle);
+    if (nlen == 0 || len < nlen) {
+        return NULL;
+    }
+    for (size_t i = 0; i + nlen <= len; i++) {
+        if (memcmp(hay + i, needle, nlen) == 0) {
+            return hay + i;
+        }
+    }
+    return NULL;
+}
+
+static int monash_fetch_events(const char *address_id, waste_api_event_t *out, int max_out)
+{
+    char enc[128];
+    url_encode(enc, sizeof(enc), address_id);
+    char url[256];
+    // ocsvclang is mandatory: without it the endpoint returns
+    // {"success":false} with HTTP 200 and no message (SPEC.md 3.13.4).
+    snprintf(url, sizeof(url),
+             "https://www.monash.vic.gov.au/ocapi/Public/myarea/wasteservices"
+             "?geolocationid=%s&ocsvclang=en-AU", enc);
+
+    char *buf = malloc(EVENTS_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, EVENTS_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        return -1;
+    }
+
+    cJSON *success = cJSON_GetObjectItem(root, "success");
+    cJSON *content = cJSON_GetObjectItem(root, "responseContent");
+    if (!cJSON_IsTrue(success) || !cJSON_IsString(content)) {
+        // success:false means a malformed request (bad/missing ocsvclang) at
+        // least as often as an unknown address id.
+        ESP_LOGW(TAG, "monash: success=false or missing content");
+        cJSON_Delete(root);
+        return -1;
+    }
+
+    static const struct { const char *token; const char *type; } TOKENS[] = {
+        {"general-waste", "waste"},
+        {"recycling",     "recycle"},
+        {"green-waste",   "organic"},
+    };
+
+    int n = 0;
+    const char *html = content->valuestring; // cJSON already unescaped it
+    const char *p = html;
+    while ((p = strstr(p, "waste-services-result")) != NULL) {
+        const char *after = p + strlen("waste-services-result");
+        if (*after == 's') {
+            // The container div's class is "waste-services-results" (plural) -
+            // same prefix, not a service block.
+            p = after;
+            continue;
+        }
+        const char *class_end = strchr(p, '"');
+        const char *next_block = strstr(after, "waste-services-result");
+        size_t block_len = next_block ? (size_t)(next_block - p) : strlen(p);
+        size_t class_len = (class_end && (size_t)(class_end - p) < block_len)
+                               ? (size_t)(class_end - p) : block_len;
+
+        const char *type = NULL;
+        for (size_t t = 0; t < sizeof(TOKENS) / sizeof(TOKENS[0]); t++) {
+            if (find_in(p, class_len, TOKENS[t].token) != NULL) {
+                type = TOKENS[t].type;
+                break;
+            }
+        }
+        // date-precise guards against deployments that return a week number
+        // instead of a real date; one-off services (hard waste) match no
+        // token and are skipped.
+        if (type != NULL && find_in(p, class_len, "date-precise") != NULL) {
+            const char *ns = find_in(p, block_len, "next-service");
+            if (ns != NULL) {
+                size_t rest = block_len - (size_t)(ns - p);
+                const char *gt = find_in(ns, rest, ">");
+                if (gt != NULL) {
+                    char text[48];
+                    size_t o = 0;
+                    for (const char *c = gt + 1; c < p + block_len && *c != '<' && o + 1 < sizeof(text); c++) {
+                        text[o++] = *c;
+                    }
+                    text[o] = '\0';
+                    add_stream_event(out, &n, max_out, type, text);
+                }
+            }
+        }
+        p = after;
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+static int monash_search(const char *query, waste_api_search_result_t *out, int max_out)
+{
+    char enc[256];
+    url_encode(enc, sizeof(enc), query);
+    char url[384];
+    snprintf(url, sizeof(url), "https://www.monash.vic.gov.au/api/v1/myarea/search?keywords=%s", enc);
+
+    char *buf = malloc(LOOKUP_BUF_SIZE);
+    if (buf == NULL) {
+        return -1;
+    }
+    if (http_get(url, buf, LOOKUP_BUF_SIZE) != ESP_OK) {
+        free(buf);
+        return -1;
+    }
+    cJSON *root = cJSON_Parse(buf);
+    free(buf);
+    if (root == NULL) {
+        return -1;
+    }
+
+    int n = -1;
+    cJSON *items = cJSON_GetObjectItem(root, "Items");
+    if (cJSON_IsArray(items)) {
+        n = 0;
+        int count = cJSON_GetArraySize(items);
+        for (int i = 0; i < count && n < max_out; i++) {
+            cJSON *item = cJSON_GetArrayItem(items, i);
+            cJSON *id = cJSON_GetObjectItem(item, "Id");
+            cJSON *label = cJSON_GetObjectItem(item, "AddressSingleLine");
+            if (!cJSON_IsString(id) || !cJSON_IsString(label)) {
+                continue;
+            }
+            snprintf(out[n].id, sizeof(out[n].id), "%s", id->valuestring);
+            snprintf(out[n].label, sizeof(out[n].label), "%s", label->valuestring);
+            n++;
+        }
+    }
+    cJSON_Delete(root);
+    return n;
+}
+
+// --- dispatch ---
+
+int waste_api_search_address(uint8_t backend, const char *query,
+                              waste_api_search_result_t *out, int max_out)
+{
+    switch (backend) {
+    case COUNCIL_BACKEND_KNOX:       return knox_search(query, out, max_out);
+    case COUNCIL_BACKEND_WHITEHORSE: return whitehorse_search(query, out, max_out);
+    case COUNCIL_BACKEND_MERRI_BEK:  return merribek_search(query, out, max_out);
+    case COUNCIL_BACKEND_MONASH:     return monash_search(query, out, max_out);
+    default:
+        return -1; // Impact Apps uses the locality/street/property wizard instead
+    }
+}
+
+// One raw fetch for whatever backend cfg selects, normalised to sorted dated
+// events + the optional recurring waste weekday. Everything above this layer
+// is backend-agnostic.
+static int fetch_events_for_config(const waste_api_config_t *cfg, int lookahead_days,
+                                    waste_api_event_t *out, int max_out,
+                                    bool *out_dow_known, uint8_t *out_dow)
+{
+    if (out_dow_known != NULL) {
+        *out_dow_known = false;
+    }
+    switch (cfg->backend) {
+    case COUNCIL_BACKEND_IMPACT_APPS:
+        return fetch_and_parse_events(cfg->council_subdomain, cfg->property_id, lookahead_days,
+                                       out, max_out, out_dow_known, out_dow);
+    case COUNCIL_BACKEND_KNOX:
+        return knox_fetch_events(cfg->address_id, out, max_out);
+    case COUNCIL_BACKEND_WHITEHORSE:
+        return whitehorse_fetch_events(cfg->address_id, out, max_out, out_dow_known, out_dow);
+    case COUNCIL_BACKEND_MERRI_BEK:
+        return merribek_fetch_events(cfg->address_id, out, max_out);
+    case COUNCIL_BACKEND_MONASH:
+        return monash_fetch_events(cfg->address_id, out, max_out);
+    default:
+        ESP_LOGW(TAG, "unknown backend %u", (unsigned)cfg->backend);
+        return -1;
+    }
+}
+
 // -------------------------------------------------------- events polling --
 
 static void do_fetch_events(void)
 {
     waste_api_config_t cfg = waste_api_get_config();
-    if (!cfg.enabled || cfg.council_subdomain[0] == '\0' || cfg.property_id == 0) {
+    if (!cfg.enabled || !waste_api_config_complete(&cfg)) {
         return;
     }
 
     waste_api_event_t events[POLL_MAX_EVENTS];
     bool waste_dow_known = false;
     uint8_t waste_weekday = 0;
-    int n = fetch_and_parse_events(cfg.council_subdomain, cfg.property_id, EVENTS_LOOKAHEAD_DAYS,
-                                    events, sizeof(events) / sizeof(events[0]),
-                                    &waste_dow_known, &waste_weekday);
+    int n = fetch_events_for_config(&cfg, EVENTS_LOOKAHEAD_DAYS,
+                                     events, sizeof(events) / sizeof(events[0]),
+                                     &waste_dow_known, &waste_weekday);
     if (n < 0) {
         // Network/parse failure. Leave the cache entirely alone - a failed
         // poll is not evidence that the collection we already know about
@@ -554,10 +1254,10 @@ static void do_fetch_events(void)
              to_persist.has_event ? "known" : "unknown");
 }
 
-int waste_api_fetch_upcoming(const char *subdomain, uint32_t property_id,
+int waste_api_fetch_upcoming(const waste_api_config_t *cfg,
                               int lookahead_days, waste_api_event_t *out, int max_out)
 {
-    return fetch_and_parse_events(subdomain, property_id, lookahead_days, out, max_out, NULL, NULL);
+    return fetch_events_for_config(cfg, lookahead_days, out, max_out, NULL, NULL);
 }
 
 bool waste_api_get_next_event(waste_api_next_event_t *out)
