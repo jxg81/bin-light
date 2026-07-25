@@ -379,7 +379,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<tr><td>On from</td><td><input type='time' name='start' value='%s'></td></tr>"
         "<tr><td>Turn off after</td><td><input type='number' name='duration_hours' min='1' max='23' value='%u'> hours</td></tr>"
-        "<tr><td>Brightness</td><td><input type='range' name='brightness' min='0' max='255' value='%u'></td></tr>",
+        "<tr><td>Brightness</td><td><input type='range' name='brightness' min='10' max='255' value='%u'></td></tr>",
         start_str, (unsigned)s.duration_hours, (unsigned)s.brightness);
 
     off = safe_append(html, HTML_BUF_SIZE, off,

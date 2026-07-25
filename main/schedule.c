@@ -21,6 +21,14 @@ static const char *TAG = "schedule";
 #define SCHEDULE_POLL_MS        30000
 #define TEST_PREVIEW_DURATION_MS (2UL * 60 * 1000)
 
+// Brightness is a multiplier applied to every colour channel in
+// led_state_set_dual(), so 0 renders the light black no matter which colour
+// the schedule resolved - indistinguishable from broken hardware. Never let
+// it reach 0: "off" is expressed by the schedule not being due, not by a
+// zero multiplier.
+#define SCHEDULE_DEFAULT_BRIGHTNESS 128  // 50%
+#define SCHEDULE_MIN_BRIGHTNESS     10   // ~4%: dim, but unambiguously lit
+
 static schedule_t s_schedule;
 static SemaphoreHandle_t s_mutex;
 static TaskHandle_t s_task_handle;
@@ -32,6 +40,7 @@ static schedule_t default_schedule(void)
     s.version = SCHEDULE_STRUCT_VERSION;
     s.start_minute = 15 * 60;   // 3:00pm
     s.duration_hours = 20;
+    s.brightness = SCHEDULE_DEFAULT_BRIGHTNESS;
     s.light_mode = LIGHT_MODE_SINGLE_COLOUR;
     s.secondary_default_color = (schedule_color_t){255, 0, 0}; // red, "general waste"
     return s;
@@ -81,6 +90,19 @@ esp_err_t schedule_init(void)
         if (err == ESP_OK && loaded.version == SCHEDULE_STRUCT_VERSION) {
             s_schedule = loaded;
             nvs_close(handle);
+
+            // Self-heal, not a schema change: devices flashed before the
+            // brightness default existed stored a valid v5 blob with
+            // brightness 0, which renders the light permanently black. Repair
+            // it in place rather than bumping SCHEDULE_STRUCT_VERSION, which
+            // would needlessly discard the rest of a working configuration.
+            if (s_schedule.brightness < SCHEDULE_MIN_BRIGHTNESS) {
+                ESP_LOGW(TAG, "stored brightness was %u, raising to default %u",
+                         (unsigned)s_schedule.brightness, SCHEDULE_DEFAULT_BRIGHTNESS);
+                s_schedule.brightness = SCHEDULE_DEFAULT_BRIGHTNESS;
+                persist_schedule(&s_schedule);
+            }
+
             ESP_LOGI(TAG, "loaded schedule from NVS");
             return ESP_OK;
         }
@@ -114,6 +136,9 @@ esp_err_t schedule_set(const schedule_t *new_schedule)
     }
     if (to_store.light_mode != LIGHT_MODE_DUAL_COLOUR) {
         to_store.light_mode = LIGHT_MODE_SINGLE_COLOUR;
+    }
+    if (to_store.brightness < SCHEDULE_MIN_BRIGHTNESS) {
+        to_store.brightness = SCHEDULE_MIN_BRIGHTNESS;
     }
     for (int i = 0; i < SCHEDULE_MAX_COLOR_RULES; i++) {
         schedule_color_rule_t *r = &to_store.rules[i];

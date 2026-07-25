@@ -870,12 +870,15 @@ rather than always showing a full table.
   `POST /save` form and the same `schedule_t`/`settings` backing values as
   today; this is a rendering/grouping change in `web_server.c`, not a data
   model change.
-- **Default brightness bug, fixed as part of this**: `default_schedule()`
-  currently leaves `brightness` at `0` (an oversight — `schedule_t s = {0}`
-  zero-initializes it and nothing sets it afterwards, unlike `start_minute`/
-  `duration_hours` which do get explicit defaults). Changing to **50%**
-  (`128`/255) as part of this change, so a freshly-flashed or freshly-reset
-  device is actually visible rather than silently at zero brightness.
+- **Default brightness bug — FIXED (implemented ahead of the rest of §3.11)**.
+  `default_schedule()` left `brightness` at `0` (`schedule_t s = {0}`
+  zero-initialises it and nothing set it afterwards, unlike `start_minute`/
+  `duration_hours`). Because brightness multiplies every colour channel in
+  `led_state_set_dual()`, 0 renders the light black regardless of the resolved
+  colour — indistinguishable from broken hardware. See §6 bug 16 for the full
+  fix, which is four parts, not one: default 128, a **self-heal on load** for
+  devices already carrying a zero-brightness v5 blob, a `schedule_set()` floor,
+  and a matching UI slider minimum.
 - **Checkbox-gated, collapsible detail sections, CSS-only** — no JavaScript:
   this project has deliberately stayed no-JS everywhere else (the `/api-setup`
   wizard is explicitly a "no-JS wizard" design choice, §3.3), so progressive
@@ -1442,7 +1445,8 @@ three different things that are easy to conflate.
 | §3.7 second LED / dual-colour | ✅ | ✅ | ⚠️ **never confirmed** — no one has said LED2 lights |
 | §3.10 boot self-test | ✅ | ✅ | ⚠️ **never confirmed** — user has not reported seeing it |
 | §3.8 "Test" button | ✅ | ⚠️ **fix NOT flashed** | ❌ failed on hardware; see below |
-| §3.11 Preferences UI + brightness fix | ❌ not written | — | — |
+| §3.11 brightness default fix (§6 bug 16) | ✅ | ⚠️ not yet flashed | — |
+| §3.11 Preferences UI reorganisation | ❌ not written | — | — |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |
 | §3.13 additional council backends | ❌ not written (research complete) | — | — |
@@ -1467,11 +1471,11 @@ in the web UI afterwards, **the device has been sitting at brightness 0 ever
 since** — which would make the Test button appear to do nothing regardless of
 whether the preview logic was right.
 
-So the failure reported in §3.8 has **two candidate causes**, and only one was
-fixed. Before re-diagnosing the preview logic:
-1. Set Brightness in the web UI to something non-zero, and press Test again.
-2. Apply the §3.11 fix (default brightness 50% = 128) so a fresh device is
-   never invisible.
+**Status: both candidate causes are now fixed in code, neither yet flashed.**
+The brightness fix (§6 bug 16) self-heals the stored zero value on the next
+boot, so no manual reconfiguration is needed — flash and the device should
+repair itself, logging `stored brightness was 0, raising to default 128`.
+That log line is the confirmation to look for. Then press Test.
 
 **Useful discriminator**: the §3.10 boot self-test runs at hard-coded brightness
 255, deliberately ignoring the stored setting. So if the LEDs cycle colours at
@@ -1603,6 +1607,32 @@ flash-and-observe or a live diagnostic to catch.
     URL extension) plus an explicit `<link rel='icon'>` in each page's `<head>`.
     Bumped `max_uri_handlers` 5→8 to fit the new handler with headroom for
     §3.8's planned `/test` endpoint.
+16. **Default brightness of 0 made the light permanently black** — and was
+    very likely the real cause of the §3.8 "Test button does nothing" report,
+    which had previously been attributed solely to preview logic.
+    `default_schedule()` never assigned `brightness`, so the `{0}`
+    zero-initialiser left it at 0; `led_state_set_dual()` scales every channel
+    by `brightness/255`, so *every* colour resolved to black. Found by reading
+    the code while auditing state before a context compaction, not from a bug
+    report — the symptom (a dead Test button) pointed at entirely the wrong
+    subsystem. Fixed in four parts, because the obvious one-line fix would not
+    have helped the already-flashed device:
+    - `default_schedule()` sets `SCHEDULE_DEFAULT_BRIGHTNESS` (128, 50%).
+    - **`schedule_init()` self-heals on load**: a stored blob with brightness
+      below the floor is repaired in place and re-persisted. Without this the
+      new default would only apply to a factory-reset device — the §3.7 work
+      had already written a *valid* v5 blob containing brightness 0, and
+      `schedule_init()` would happily keep loading it forever. Deliberately
+      **not** done via a `SCHEDULE_STRUCT_VERSION` bump, which would have
+      discarded an otherwise-working configuration to fix one field.
+    - `schedule_set()` clamps to `SCHEDULE_MIN_BRIGHTNESS` (10, ~4%) so the
+      value can't be driven back to 0 from the UI.
+    - The web UI slider's `min` moved 0→10 to match, so the floor is visible
+      rather than silently applied after saving.
+
+    Design note: "off" is expressed by the schedule not being due, never by a
+    zero multiplier — which is why a floor costs nothing and removes a whole
+    class of "is it broken or just dark?" confusion.
 
 **Breaking NVS schema changes** (not bugs, but worth tracking since each one
 resets user-configured state on first boot after flashing): `schedule_t` went
