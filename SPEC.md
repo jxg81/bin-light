@@ -1462,19 +1462,28 @@ three different things that are easy to conflate.
 | §3.1–3.3, 3.6 core + Impact Apps API | ✅ | ✅ | ✅ working |
 | §3.9 mDNS (`binlight.local`) | ✅ | ✅ | ✅ user browsed via it |
 | `/favicon.ico` (§6 bug 15) | ✅ | ✅ | ✅ console 404 gone |
-| §3.7 second LED / dual-colour | ✅ | ✅ | ⚠️ **never confirmed** — no one has said LED2 lights |
-| §3.10 boot self-test | ✅ | ✅ | ⚠️ **never confirmed** — user has not reported seeing it |
-| §3.8 "Test" button | ✅ | ⚠️ **fix NOT flashed** | ❌ failed on hardware; see below |
-| §3.11 brightness default fix (§6 bug 16) | ✅ | ⚠️ not yet flashed | — |
+| §3.7 second LED / dual-colour | ✅ | ✅ | ⚠️ LED2 not *separately* confirmed — see note |
+| §3.10 boot self-test | ✅ | ✅ | ⚠️ not explicitly confirmed |
+| §3.8 "Display Next Collection" button | ✅ | ✅ | ✅ **works** — confirmed on hardware |
+| §3.11 brightness default fix (§6 bug 16) | ✅ | ✅ | ✅ **works** — see below |
+| Warmer yellow `(255,150,0)` (§2) | ✅ | ✅ | ⚠️ red/green/purple good; yellow deferred (§5) |
 | §3.11 Preferences UI reorganisation | ❌ not written | — | — |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |
 | §3.13 additional council backends | ❌ not written (research complete) | — | — |
 
-**There is one unflashed change in the working tree**: the
-`schedule_preview_next()` relaxation described at the end of §3.8. It was written
-in response to the Test button failing, but the device has **not** been rebuilt
-since. Any further debugging of that button must start by flashing.
+**Everything committed is flashed** as of the yellow/brightness build — the
+working tree and the device are in step. Nothing is pending a flash.
+
+**Two things still worth an explicit look**, both cheap and both currently
+assumed-but-unverified:
+- **LED2** has never been confirmed to light *independently*. Colours have
+  been judged through the enclosure, but nobody has stated that the second
+  pixel works — a two-pixel chain fails silently to one pixel if the data
+  link between them is bad. The boot self-test (§3.10) drives LED1 solo, then
+  LED2 solo, then both, so watching one boot settles it conclusively.
+- **The boot self-test itself** has not been explicitly reported as seen. The
+  same single boot confirms both.
 
 ### ⚠️ Likely second cause of the Test-button failure — check this first
 
@@ -1491,11 +1500,19 @@ in the web UI afterwards, **the device has been sitting at brightness 0 ever
 since** — which would make the Test button appear to do nothing regardless of
 whether the preview logic was right.
 
-**Status: both candidate causes are now fixed in code, neither yet flashed.**
-The brightness fix (§6 bug 16) self-heals the stored zero value on the next
-boot, so no manual reconfiguration is needed — flash and the device should
-repair itself, logging `stored brightness was 0, raising to default 128`.
-That log line is the confirmation to look for. Then press Test.
+**RESOLVED — flashed and confirmed working on hardware.** The button now
+lights the LEDs. Since the light was previously black and nothing else about
+the colour resolution changed, **the brightness-0 bug was the real cause**,
+and the earlier `schedule_preview_next()` relaxation (flashed at the same
+time) was fixing a secondary issue at most. The self-heal path in
+`schedule_init()` is therefore also confirmed working — the device repaired
+its stored zero-brightness blob without a factory reset, exactly as designed.
+
+Retained as a worked example: the reported symptom ("Test button does
+nothing") pointed at the feature that was just written, while the actual
+defect was a zero default in unrelated, older code. The discriminator that
+would have found it faster is the boot self-test, which runs at hard-coded
+brightness 255 and so isolates the LED path from all stored state.
 
 **Useful discriminator**: the §3.10 boot self-test runs at hard-coded brightness
 255, deliberately ignoring the stored setting. So if the LEDs cycle colours at
@@ -1542,6 +1559,18 @@ right entry is already chosen — saving just snaps the stored value onto the
 current palette. Without the nearest-match behaviour a stale value would match
 no `<option>` at all and the browser would display the first entry, making a
 yellow rule look as though it were set to Red.
+
+**⚠️ Open question on the current yellow assessment**: it is not established
+whether the mapping form was re-saved *after* flashing `(255,150,0)`. If it
+wasn't, the stored rule still holds the old `(255,255,0)` and the light will
+still be showing the original over-green yellow — meaning the "yellow is still
+problematic, defer it" conclusion (§5) may have been formed against the old
+value rather than the new one. **Worth re-checking before spending any effort
+on enclosure-level fixes**: press Save on the colour mapping form, or watch the
+boot self-test, which uses `SELF_TEST_COLORS` directly and so always shows the
+current palette regardless of what is stored in NVS. If yellow looks right in
+the boot self-test but wrong in normal operation, that is this wrinkle, not
+diffraction.
 
 **Proper fix, deferred deliberately**: move `COLOR_PRESETS` +
 `nearest_preset_color()` out of [web_server.c](main/web_server.c) into a small
