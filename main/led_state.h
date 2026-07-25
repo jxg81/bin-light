@@ -32,3 +32,16 @@ led_color_t led_state_get_current(void);
 // their wiring work. Blocks for ~6 seconds total; leaves both LEDs off when
 // done.
 void led_state_run_self_test(void);
+
+// Starts a background task making both LEDs breathe the given colour - a
+// slow, calm brightness ramp up and down (SPEC.md 3.4's AutoAP "waiting for
+// setup" indicator; a device-state signal, so both LEDs always move together
+// and light_mode does not apply). No-op if already breathing. The caller must
+// ensure nothing else is driving the LEDs while breathing runs - in practice
+// this is only used during boot-time provisioning, before the schedule task
+// exists.
+void led_state_breathe_start(led_color_t color);
+
+// Stops the breathing task (blocking briefly until it has exited) and turns
+// both LEDs off. Safe to call when not breathing.
+void led_state_breathe_stop(void);

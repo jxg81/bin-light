@@ -449,7 +449,7 @@ gap in ESP-IDF's default TLS config for a legitimate (if unusually
 configured) certificate chain. See §6 for the full list of build/runtime
 issues hit and fixed this session.
 
-### 3.4 Wi-Fi setup without Matter ("AutoAP" mode, planned, not yet implemented)
+### 3.4 Wi-Fi setup without Matter ("AutoAP" mode, implemented)
 
 **Reclassified from "stretch goal" to prerequisite for giving a device to
 anyone else — see §1.1.** Currently Wi-Fi credentials are Kconfig-only
@@ -490,6 +490,58 @@ that doesn't depend on Matter at all:
   over a multi-second period — started when AutoAP mode begins, stopped
   (LEDs handed back to `schedule_task_fn`) once provisioning succeeds and the
   device reconnects in station mode.
+
+**As built (2026-07-26)** — in [wifi_manager.c](main/wifi_manager.c), with the
+breathing indicator in [led_state.c](main/led_state.c). Deviations from the
+design above, all deliberate:
+
+- **Hand-rolled SoftAP provisioning, not the `wifi_provisioning` component.**
+  That component's SoftAP transport speaks a protobuf/`protocomm` protocol
+  designed for Espressif's phone apps — it does *not* serve an HTML page, so
+  "no companion app, just a browser" would have meant shipping a companion app
+  after all. The device already has `esp_http_server` and a no-JS UI
+  convention, so provisioning is 2 handlers reusing that. Fewer dependencies,
+  and it's the browser flow §3.4 actually asked for.
+- **Credentials are verified before they are persisted.** The POST handler
+  applies them, calls `esp_wifi_connect()` and **blocks on the outcome** (20s
+  cap), so the HTTP response *is* the result — "Connected" or "Couldn't join"
+  on the same page, no JavaScript and no polling. A typo never reaches NVS,
+  so a mistyped password can't strand the device.
+- **APSTA during the attempt**, so the phone keeps its connection to the setup
+  AP while the station side joins the real network. The AP is torn down ~4s
+  *after* success, so the confirmation page reaches the browser first.
+- **AutoAP is also the recovery path, not just first boot.** If stored
+  credentials exist but can't be used at boot, the device opens AutoAP *and*
+  retries the stored network every 60s in the background. One mechanism covers
+  both real cases: the router was merely slow or rebooting (it reconnects
+  itself and AutoAP closes), or the network is genuinely gone (the user
+  provisions the new one).
+- **Kconfig credentials are retained as a development fallback**, not removed.
+  Priority is NVS → Kconfig → AutoAP. The committed default is blank, so a
+  fresh device goes straight to setup mode — the behaviour that matters for
+  handing devices out — while the author's bench device can still have its
+  network compiled in.
+- **`POST /wifi-forget`** on the main UI erases the stored credentials and
+  reboots into AutoAP: the deliberate path for moving a device to a different
+  network while the old one still works (e.g. handing it to someone else).
+  Schedule and council config are untouched. A software-only partial stand-in
+  for §3.12's factory-reset button.
+- **Scanned SSIDs are HTML-escaped.** They are attacker-controlled bytes —
+  anyone in range can broadcast an SSID containing markup at a device sitting
+  in setup mode — and they land in both text and attribute contexts.
+- **The setup AP is open (no password)**: the standard consumer-IoT trade-off,
+  since a WPA password would have to be printed on the device to be usable and
+  the AP exists only for the minutes provisioning takes.
+- **Breathing is a triangle ramp** (brightness 8→160 over 3s, 40ms ticks) in
+  its own small task rather than a sine — smooth enough at that tick rate
+  without floating point or a lookup table. It never reaches zero, since fully
+  dark would read as an idle device rather than one waiting for input.
+
+**Not yet verified on hardware.** The whole flow — AP visibility, the setup
+page, a real join, the reboot path — needs a device. Note that flashing this
+onto a device whose Wi-Fi is currently compiled into `sdkconfig` will keep
+working via the Kconfig fallback, so *testing* AutoAP means either blanking
+the Kconfig SSID or using "Forget this network" from the UI.
 
 ### 3.5 Over-the-air (OTA) firmware updates
 
@@ -1810,7 +1862,7 @@ three different things that are easy to conflate.
 | Merri-bek cpage self-discovery + year-derived URLs | ✅ | ❌ **not yet flashed** | ⚠️ host-tested end to end against real page bytes |
 | DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
 | §3.12 physical buttons | ❌ not written | — | — |
-| §3.4 AutoAP | ❌ not written | — | — |
+| §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ❌ **not yet flashed** | ❌ needs a device |
 | §3.13 additional council backends | ❌ not written (research complete) | — | — |
 
 **The §3.11 UI build is committed but NOT yet flashed** — the working tree is
@@ -1935,6 +1987,13 @@ the setup flows for both backend families. The owner's directive stands:
 is nice-to-have.* What remains is on-device verification, which no host test
 can substitute for:
 
+0. **Note the Wi-Fi change first (§3.4).** Credentials now come from NVS, with
+   the compiled-in Kconfig pair only as a fallback. Your bench device has its
+   network in `sdkconfig`, so it will keep connecting exactly as before — but
+   that also means AutoAP won't be exercised until you either blank the
+   Kconfig SSID or press "Forget this network and restart setup" on the home
+   page. Worth doing once deliberately, since it's the flow every handed-out
+   device will start in.
 1. **Flash** (this also carries the still-unflashed §3.11 UI and §3.3 work
    below). Watch the first boot for `migrated waste API config v2 -> v3` —
    the existing Maribyrnong setup must survive, not reset.

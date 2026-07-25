@@ -1,24 +1,27 @@
 menu "Bin Light Configuration"
 
     config BINLIGHT_WIFI_SSID
-        string "Wi-Fi SSID"
+        string "Wi-Fi SSID (optional, development only)"
         default ""
         help
-            Set this via `idf.py menuconfig`. Deliberately left empty here so
-            no real credential is ever committed - your value is stored in
-            sdkconfig, which is gitignored.
+            Optional since AutoAP provisioning landed (SPEC.md 3.4). Leave
+            empty for normal builds: the device will raise its own setup
+            network and be provisioned from a browser, and those credentials
+            are stored in NVS. A value here is only a convenience for the
+            developer's own bench device, and is used solely when nothing has
+            been provisioned yet. Deliberately empty in the repo so no real
+            credential is ever committed - your value lives in sdkconfig,
+            which is gitignored.
 
     config BINLIGHT_WIFI_PASSWORD
-        string "Wi-Fi Password"
+        string "Wi-Fi Password (optional, development only)"
         default ""
         help
-            Set this via `idf.py menuconfig`. Deliberately left empty here so
-            no real credential is ever committed - your value is stored in
-            sdkconfig, which is gitignored. Compiled-in credentials go away
-            entirely once AutoAP provisioning lands (SPEC.md 3.4).
+            See BINLIGHT_WIFI_SSID. Optional; provisioned credentials in NVS
+            always take priority over anything compiled in.
 
     config BINLIGHT_WIFI_MAXIMUM_RETRY
-        int "Wi-Fi connect attempts to wait for at boot before continuing offline"
+        int "Wi-Fi connect attempts at boot before falling back to AutoAP setup mode"
         default 10
 
     config BINLIGHT_SNTP_SERVER

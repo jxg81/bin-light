@@ -34,6 +34,16 @@ bool waste_api_config_complete(const waste_api_config_t *c)
     return c->address_id[0] != '\0';
 }
 
+const char *wifi_manager_current_ssid(void) { return "Home-WiFi"; }
+esp_err_t wifi_manager_forget_credentials(void) { return ESP_OK; }
+void waste_api_merribek_calendar_url(char *buf, size_t buf_size)
+{
+    snprintf(buf, buf_size, "https://www.merri-bek.vic.gov.au/living-in-merri-bek/"
+             "waste-and-recycling/bins-and-collection-services/waste-calendar26/");
+}
+
+const char *stub_query_string = NULL;
+
 static FILE *s_out;
 void stub_capture(const char *buf, int len) { fwrite(buf, 1, (size_t)len, s_out); }
 
@@ -91,6 +101,10 @@ int main(int argc, char **argv)
     }
 
     bool setup_page = (argc > 1 && strcmp(argv[1], "--setup") == 0);
+    if (argc > 1 && strcmp(argv[1], "--merribek") == 0) {
+        setup_page = true;
+        stub_query_string = "step=council&council=merri-bek";
+    }
 
     s_out = fopen(argc > 2 ? argv[2] : "/dev/stdout", "w");
     httpd_req_t req = {0};

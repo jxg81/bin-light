@@ -63,6 +63,7 @@ if [ "$1" = "render" ]; then
     "$OUT/render_page" --empty   "$OUT/home-unconfigured.html"
     "$OUT/render_page" --max     "$OUT/home-worst-case.html"
     "$OUT/render_page" --setup   "$OUT/api-setup.html"
+    "$OUT/render_page" --merribek "$OUT/api-setup-merribek.html"
     echo "page sizes (HTML_BUF_SIZE must exceed the largest home-*;"
     echo "SETUP_HTML_BUF_SIZE must exceed api-setup):"
     wc -c "$OUT"/*.html

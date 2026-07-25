@@ -5,13 +5,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_http_server.h"
 #include "esp_log.h"
+#include "esp_system.h"
 
 #include "councils.h"
 #include "schedule.h"
 #include "settings.h"
 #include "waste_api.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "web_server";
 
@@ -19,14 +23,14 @@ static const char *TAG = "web_server";
 // compiling root_get_handler() on the host against stubs and dumping the
 // bytes it emits:
 //
-//   factory-fresh, nothing configured   7145
-//   realistic setup (3 event types)     8679
+//   factory-fresh, nothing configured   7555
+//   realistic setup (3 event types)     9084
 //   worst case (8 event types, i.e.
 //     WASTE_API_MAX_TYPE_RULES, with
-//     long type names and address)     10877
+//     long type names and address)     11269
 //
-// 12288 leaves ~1.4KB over the worst case. Note the fresh-device page alone
-// is 7145 bytes: the previous 7200 would have truncated on any real
+// 12288 leaves ~1KB over the worst case. Note the fresh-device page alone is
+// 7555 bytes: the original 7200 would have truncated on any real
 // configuration. Each handler also logs an error if it ever hits the ceiling,
 // because safe_append() truncates *silently* and a truncated page drops form
 // fields - which then read back as "absent"/unchecked on the next save,
@@ -578,7 +582,22 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<p style='margin-top:1em'><button type='submit'>Save</button></p>"
-        "</form></body></html>");
+        "</form>");
+
+    // Outside the /save form (it posts elsewhere), last on the page because
+    // it's the one destructive action here.
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<div class='sect'><h2>Wi-Fi</h2>"
+        "<p>Connected to <b>%s</b>.</p>"
+        "<form method='POST' action='/wifi-forget'>"
+        "<button type='submit'>Forget this network and restart setup</button></form>"
+        "<p class='note'>Use this to move the light to a different Wi-Fi network. It "
+        "restarts, both LEDs breathe white, and a network named binlight-XXXX appears "
+        "for you to join. Your schedule and council settings are kept.</p>"
+        "</div>",
+        wifi_manager_current_ssid());
+
+    off = safe_append(html, HTML_BUF_SIZE, off, "</body></html>");
 
     if (off >= HTML_BUF_SIZE) {
         ESP_LOGE(TAG, "home page truncated at %d bytes - raise HTML_BUF_SIZE", HTML_BUF_SIZE);
@@ -712,6 +731,45 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     httpd_resp_set_hdr(req, "Location", "/");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
+}
+
+// Erases the stored Wi-Fi credentials and reboots into AutoAP setup mode
+// (SPEC.md 3.4) - the deliberate path for moving a device to a new network.
+// The device normally falls into AutoAP by itself when the stored network is
+// unreachable, so this is for the case where the old network still exists and
+// works: handing the device to someone else, or changing which network it
+// should be on.
+//
+// Renders a confirmation page and only then reboots, so the response reaches
+// the browser before the connection drops.
+static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
+{
+    esp_err_t err = wifi_manager_forget_credentials();
+    if (err != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to erase credentials");
+        return ESP_FAIL;
+    }
+
+    static const char PAGE[] =
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Wi-Fi Reset</title>"
+        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}</style>"
+        "</head><body><h1>Wi-Fi reset</h1>"
+        "<p>The saved network has been forgotten and the light is restarting.</p>"
+        "<p>In a few seconds both LEDs will start breathing white, and a Wi-Fi network "
+        "named <b>binlight-XXXX</b> will appear. Join it and a setup page will open at "
+        "<b>http://192.168.4.1/</b>.</p>"
+        "<p>Your schedule and council settings have been kept.</p>"
+        "</body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, PAGE, HTTPD_RESP_USE_STRLEN);
+
+    // Let the response actually flush before the reset.
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+    return ESP_OK; // not reached
 }
 
 // Previews whatever the light would show at its next scheduled occurrence
@@ -1370,7 +1428,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 8; // 7 in use, small headroom for future additions
+    config.max_uri_handlers = 9; // 8 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -1418,6 +1476,11 @@ esp_err_t web_server_start(void)
         .method = HTTP_POST,
         .handler = test_post_handler,
     };
+    static const httpd_uri_t wifi_forget_uri = {
+        .uri = "/wifi-forget",
+        .method = HTTP_POST,
+        .handler = wifi_forget_post_handler,
+    };
 
     httpd_register_uri_handler(server, &root_uri);
     httpd_register_uri_handler(server, &save_uri);
@@ -1426,6 +1489,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &api_test_post_uri);
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &test_uri);
+    httpd_register_uri_handler(server, &wifi_forget_uri);
 
     ESP_LOGI(TAG, "HTTP server started");
     return ESP_OK;

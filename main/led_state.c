@@ -111,6 +111,64 @@ led_color_t led_state_get_current(void)
     return color;
 }
 
+// --- breathing indicator (SPEC.md 3.4) --------------------------------------
+
+#define BREATHE_TICK_MS    40
+#define BREATHE_PERIOD_MS  3000  // one full up-and-down cycle
+#define BREATHE_MIN        8     // never fully dark - "off" would read as idle
+#define BREATHE_MAX        160   // calm, not glaring
+
+static TaskHandle_t s_breathe_task;
+static volatile bool s_breathe_stop_requested;
+static led_color_t s_breathe_color;
+
+static void breathe_task_fn(void *arg)
+{
+    const int steps = BREATHE_PERIOD_MS / BREATHE_TICK_MS;
+    const int half = steps / 2;
+    int step = 0;
+
+    while (!s_breathe_stop_requested) {
+        // Triangle ramp: up for the first half of the period, down for the
+        // second. A triangle reads as smooth at 40ms ticks without pulling in
+        // floating-point or a sine table.
+        int pos = (step < half) ? step : (steps - step);
+        uint8_t b = (uint8_t)(BREATHE_MIN + (BREATHE_MAX - BREATHE_MIN) * pos / half);
+        led_state_set_dual(s_breathe_color, s_breathe_color, b);
+        step = (step + 1) % steps;
+        vTaskDelay(pdMS_TO_TICKS(BREATHE_TICK_MS));
+    }
+    led_state_off();
+    s_breathe_task = NULL;
+    vTaskDelete(NULL);
+}
+
+void led_state_breathe_start(led_color_t color)
+{
+    if (s_breathe_task != NULL) {
+        return;
+    }
+    s_breathe_color = color;
+    s_breathe_stop_requested = false;
+    if (xTaskCreate(breathe_task_fn, "led_breathe", 2048, NULL, tskIDLE_PRIORITY + 2, &s_breathe_task) != pdPASS) {
+        ESP_LOGW(TAG, "failed to start breathe task");
+        s_breathe_task = NULL;
+    }
+}
+
+void led_state_breathe_stop(void)
+{
+    if (s_breathe_task == NULL) {
+        return;
+    }
+    s_breathe_stop_requested = true;
+    // The task exits within one tick; wait for it so the caller can safely
+    // drive the LEDs the moment this returns.
+    while (s_breathe_task != NULL) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
 void led_state_run_self_test(void)
 {
     static const led_color_t off = {0, 0, 0};
