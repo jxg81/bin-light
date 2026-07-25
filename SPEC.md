@@ -99,10 +99,18 @@ JSON, and no colour data at all.
   equal duty, so a naive `(255,255,0)` yellow reads distinctly **green**
   (confirmed on hardware through the PLA cover). `COLOR_PRESETS` yellow is
   therefore `(255,150,0)`, green deliberately pulled down. This is a
-  perceptual calibration, not a bug — expect to re-tune it if the filament,
-  wall thickness or LED batch changes. Same class of empirical finding as the
+  perceptual calibration, not a bug. Same class of empirical finding as the
   RGB byte order above: do not "correct" it back to a mathematically pure
   value.
+  - **Red, green and purple are confirmed good** on hardware through the test
+    cover — no further tuning expected for those.
+  - **Yellow is provisional and deliberately not finalised.** It remains
+    hard to get right, and testing showed it's materially affected by
+    **viewing angle and diffraction through the cover**, not just by the RGB
+    ratio — meaning it can't be settled against a bare test cover, because
+    the final enclosure has different geometry and a divider between the two
+    LEDs (§3.7). Re-tuning now would be re-work. **Deferred to final
+    integration testing in the printed enclosure — see §5.**
 
 ## 3. Requirements
 
@@ -1560,6 +1568,34 @@ so both should land together rather than moving the same code twice.
 - **Matter over Wi-Fi commissioning** — its own phase, per the "core first, Matter
   last" decision. Nothing in 3.2–3.4 blocks it; the single `led_state_set()` seam
   still applies.
+
+- **Final yellow calibration — do this during final integration testing, in the
+  real printed enclosure.** Red, green and purple are confirmed good and need
+  no further work. Yellow is the one problem colour: `(255,150,0)` is an
+  improvement on `(255,255,0)` but still not right, and testing established
+  that it's affected by **viewing angle and diffraction**, not just the
+  channel ratio. It therefore cannot be settled against the flat test cover —
+  the production enclosure has different geometry and a divider between the
+  two LEDs (§3.7), both of which change how the light mixes.
+
+  When doing this:
+  1. Judge it **assembled, in the final enclosure**, from the angles the light
+     will actually be viewed at (it sits by the bins — likely seen from a
+     distance and off-axis, not head-on at arm's length).
+  2. Use the **boot self-test** (§3.10) to compare: it runs all four colours
+     at full brightness with no configuration involved, so it isolates the
+     palette from schedule/brightness state.
+  3. Change the `Yellow` entry in `COLOR_PRESETS`
+     ([web_server.c](main/web_server.c)) **and** the matching entry in
+     `SELF_TEST_COLORS` ([led_state.c](main/led_state.c)) — two places, kept
+     in sync deliberately (see §4's note on the shared-colour-module refactor
+     that would collapse them into one).
+  4. Then **press Save once** on the colour mapping form, or stored rules will
+     keep the old value — see §4's "palette changes do not reach already-saved
+     rules".
+  5. If the ratio alone can't fix it, the remaining levers are physical:
+     diffuser thickness/finish, LED standoff distance, or matte vs glossy
+     inner surface.
 
 ## 6. Bugs fixed (troubleshooting reference)
 
