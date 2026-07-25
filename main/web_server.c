@@ -14,7 +14,16 @@
 
 static const char *TAG = "web_server";
 
-#define HTML_BUF_SIZE   7200
+// Sized against the worst case for the home page, which is the largest of the
+// three: ~4.9KB of static markup plus the loop-expanded parts - 5 timezone
+// options, 7 weekday options, 3 colour rules (each with a 4-option colour
+// select and a 4-option frequency select), and up to WASTE_API_MAX_TYPE_RULES
+// (8) colour-mapping rows at ~390 bytes each. That tops out around 11KB, so a
+// council reporting the full 8 event types still fits. Each handler logs an
+// error if it hits the ceiling anyway, because safe_append() truncates
+// silently and a truncated page drops form fields - which then read back as
+// "absent"/unchecked on the next save.
+#define HTML_BUF_SIZE   12288
 #define SAVE_BODY_MAX   1024
 #define FIELD_BUF_SIZE  16
 #define API_TEST_LOOKAHEAD_DAYS 28
@@ -163,16 +172,28 @@ static schedule_color_t nearest_preset_color(schedule_color_t c)
 // entry, i.e. a yellow rule would appear to be set to Red. Nearest-match keeps
 // the UI truthful across palette changes, and re-saving snaps the stored value
 // onto the current palette.
-static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name, schedule_color_t current)
+// form_id: NULL for the enclosing form (the usual case), or the id of a
+// different form this control belongs to (see append_type_mapping_rows).
+static int append_color_select_for(char *buf, size_t buf_size, int off, const char *field_name,
+                                    schedule_color_t current, const char *form_id)
 {
     size_t selected_idx = nearest_preset_index(current);
-    off = safe_append(buf, buf_size, off, "<select name='%s'>", field_name);
+    if (form_id != NULL) {
+        off = safe_append(buf, buf_size, off, "<select form='%s' name='%s'>", form_id, field_name);
+    } else {
+        off = safe_append(buf, buf_size, off, "<select name='%s'>", field_name);
+    }
     for (size_t c = 0; c < COLOR_PRESET_COUNT; c++) {
         const color_preset_t *cp = &COLOR_PRESETS[c];
         off = safe_append(buf, buf_size, off, "<option value='#%02x%02x%02x' %s>%s</option>",
             cp->r, cp->g, cp->b, (c == selected_idx) ? "selected" : "", cp->label);
     }
     return safe_append(buf, buf_size, off, "</select>");
+}
+
+static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name, schedule_color_t current)
+{
+    return append_color_select_for(buf, buf_size, off, field_name, current, NULL);
 }
 
 static schedule_color_t preset_by_label(const char *label)
@@ -217,25 +238,51 @@ static bool default_color_for_type(const char *event_type, schedule_color_t *out
 // back to, so editing from the home page stays on the home page. Renders
 // nothing if there's no mapping saved yet (e.g. API never configured, or the
 // auto-fetch at setup time found nothing).
-static int append_type_mapping_form(char *buf, size_t buf_size, int off,
-                                     const waste_api_config_t *cfg, const char *redirect_to)
+static int count_type_rules(const waste_api_config_t *cfg)
 {
-    int type_count = 0;
+    int n = 0;
     for (int i = 0; i < WASTE_API_MAX_TYPE_RULES; i++) {
         if (cfg->type_rules[i].event_type[0] != '\0') {
-            type_count++;
+            n++;
         }
     }
+    return n;
+}
+
+// The colour-mapping controls posted to /api-test, rendered *inside* the home
+// page's /save form's DOM but belonging to a different form.
+//
+// HTML forms can't nest, and since 3.11 the mapping table lives inside the
+// collapsible "Bin collection API" block, which is itself inside the /save
+// form. The way out is HTML5's `form=` attribute: an empty
+// <form id='mapform' action='/api-test'> is emitted *before* the /save form
+// opens (see append_type_mapping_anchor), carrying the two hidden fields, and
+// every control below claims membership of it by id. No nesting, no
+// JavaScript, and the browser submits exactly the same body /api-test already
+// parses.
+static int append_type_mapping_anchor(char *buf, size_t buf_size, int off,
+                                       const waste_api_config_t *cfg, const char *redirect_to)
+{
+    int type_count = count_type_rules(cfg);
     if (type_count == 0) {
+        return off;
+    }
+    return safe_append(buf, buf_size, off,
+        "<form id='mapform' method='POST' action='/api-test'>"
+        "<input type='hidden' name='type_count' value='%d'>"
+        "<input type='hidden' name='redirect_to' value='%s'>"
+        "</form>", type_count, redirect_to);
+}
+
+static int append_type_mapping_rows(char *buf, size_t buf_size, int off, const waste_api_config_t *cfg)
+{
+    if (count_type_rules(cfg) == 0) {
         return off;
     }
 
     off = safe_append(buf, buf_size, off,
         "<h3>Colour mapping</h3>"
-        "<form method='POST' action='/api-test'>"
-        "<input type='hidden' name='type_count' value='%d'>"
-        "<input type='hidden' name='redirect_to' value='%s'>"
-        "<table><tr><th>Type</th><th>Ignore</th><th>Colour</th></tr>", type_count, redirect_to);
+        "<table><tr><th>Type</th><th>Ignore</th><th>Colour</th></tr>");
 
     int idx = 0;
     for (int i = 0; i < WASTE_API_MAX_TYPE_RULES; i++) {
@@ -249,14 +296,15 @@ static int append_type_mapping_form(char *buf, size_t buf_size, int off,
         snprintf(color_field, sizeof(color_field), "type%d_color", idx);
 
         off = safe_append(buf, buf_size, off,
-            "<tr><td>%s<input type='hidden' name='%s' value='%s'></td>"
-            "<td><input type='checkbox' name='%s' %s></td><td>",
+            "<tr><td>%s<input type='hidden' form='mapform' name='%s' value='%s'></td>"
+            "<td><input type='checkbox' form='mapform' name='%s' %s></td><td>",
             r->event_type, name_field, r->event_type, ignored_field, r->ignored ? "checked" : "");
-        off = append_color_select(buf, buf_size, off, color_field, r->color);
+        off = append_color_select_for(buf, buf_size, off, color_field, r->color, "mapform");
         off = safe_append(buf, buf_size, off, "</td></tr>");
         idx++;
     }
-    return safe_append(buf, buf_size, off, "</table><p><button type='submit'>Save mapping</button></p></form>");
+    return safe_append(buf, buf_size, off,
+        "</table><p><button type='submit' form='mapform'>Save mapping</button></p>");
 }
 
 // out must be at least HHMM_BUF_SIZE bytes. Sized for uint16_t's full range
@@ -332,12 +380,14 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char start_str[HHMM_BUF_SIZE];
     minutes_to_hhmm(s.start_minute, start_str);
 
+    waste_api_config_t api_cfg = waste_api_get_config();
+
     int off = 0;
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Bin Light Schedule</title>"
+        "<title>Bin Light</title>"
         "<style>"
         "body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
         "table{width:100%%;border-collapse:collapse;}"
@@ -345,58 +395,43 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "input[type=time],input[type=date]{width:9em;}"
         "input[type=range]{width:8em;}"
         "input[type=number]{width:4em;}"
+        ".note{color:#888;}"
+        // Progressive disclosure without JavaScript (SPEC.md 3.11): the
+        // section's own enable checkbox reveals its detail block via the
+        // sibling combinator. The .sect wrapper is load-bearing - a bare
+        // "input:checked ~ .details" would match *every* later .details on the
+        // page, so ticking the API box would also expand the manual schedule.
+        ".sect{margin:1.5em 0;}"
+        ".details{display:none;}"
+        ".sect input:checked ~ .details{display:block;}"
         "</style></head><body>"
-        "<h1>Bin Light Schedule</h1>"
+        "<h1>Bin Light</h1>"
         "<form method='POST' action='/test' style='margin:0 0 1em 0'>"
-        "<button type='submit'>Test (light both LEDs for 2 min)</button></form>");
+        "<button type='submit'>Display Next Collection (30 seconds)</button></form>");
 
-    waste_api_config_t api_cfg = waste_api_get_config();
-    off = safe_append(html, HTML_BUF_SIZE, off, "<h2>Bin collection API</h2>");
-    if (api_cfg.property_id != 0) {
-        off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>Configured: <b>%s</b>, %s (property #%u)</p>",
-            api_cfg.council_subdomain, api_cfg.property_label, (unsigned)api_cfg.property_id);
-    } else {
-        off = safe_append(html, HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
-    }
-
-    // Its own <form> (posts to /api-test) since it can't nest inside the
-    // /save form below - rendered from the saved config directly, no live
-    // fetch, so the home page stays fast. /api-setup auto-populates this at
-    // setup time; /api-test can (re)discover new types via a live fetch.
-    off = append_type_mapping_form(html, HTML_BUF_SIZE, off, &api_cfg, "/");
-
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<p><a href='/api-setup'>Change council / address</a>"
-        " &middot; <a href='/api-test'>Test API (show upcoming weeks)</a></p>");
+    // Emitted before the /save form opens, because forms can't nest - see the
+    // comment on append_type_mapping_anchor().
+    off = append_type_mapping_anchor(html, HTML_BUF_SIZE, off, &api_cfg, "/");
 
     off = safe_append(html, HTML_BUF_SIZE, off, "<form method='POST' action='/save'>");
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<p><label><input type='checkbox' name='api_enabled' %s> Use automatic bin collection API</label></p>"
-        "<p style='color:#888'>When enabled and reachable, the API overrides the manual "
-        "schedule below entirely, including turning the light off on weeks it reports "
-        "nothing due. The manual schedule below is used only when the API is disabled, "
-        "not yet configured, or unreachable.</p>",
-        api_cfg.enabled ? "checked" : "");
+
+    // ---- Preferences: settings that apply whichever schedule is driving the
+    // light, so they sit above (and outside) both schedule sections.
+    const char *current_tz = settings_get_tz();
+    const tz_preset_t *current_preset = find_tz_preset(current_tz);
+    char escaped_tz[SETTINGS_TZ_MAX_LEN * 6 + 1];
+    html_escape_attr(current_tz, escaped_tz, sizeof(escaped_tz));
 
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<h2>Manual schedule</h2>"
+        "<h2>Preferences</h2>"
         "<table>"
-        "<tr><td>Enabled</td><td><input type='checkbox' name='enabled' %s></td></tr>",
-        s.enabled ? "checked" : "");
-
-    off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Bin night</td><td><select name='bin_night_weekday'>");
-    for (int i = 0; i < 7; i++) {
-        off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%d' %s>%s</option>",
-            i, (i == s.bin_night_weekday) ? "selected" : "", WEEKDAY_LABEL[i]);
-    }
-    off = safe_append(html, HTML_BUF_SIZE, off, "</select></td></tr>");
-
-    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<tr><td>Brightness</td><td><input type='range' name='brightness' min='10' max='255' value='%u'></td></tr>"
         "<tr><td>On from</td><td><input type='time' name='start' value='%s'></td></tr>"
         "<tr><td>Turn off after</td><td><input type='number' name='duration_hours' min='1' max='23' value='%u'> hours</td></tr>"
-        "<tr><td>Brightness</td><td><input type='range' name='brightness' min='10' max='255' value='%u'></td></tr>",
-        start_str, (unsigned)s.duration_hours, (unsigned)s.brightness);
+        "<tr><td colspan='2' class='note'>The light turns on at the chosen time on the night "
+        "before a collection, and stays on for the given number of hours (carrying past "
+        "midnight if needed).</td></tr>",
+        (unsigned)s.brightness, start_str, (unsigned)s.duration_hours);
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<tr><td>Light mode</td><td><select name='light_mode'>"
@@ -405,14 +440,75 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "</select></td></tr>",
         LIGHT_MODE_SINGLE_COLOUR, (s.light_mode == LIGHT_MODE_SINGLE_COLOUR) ? "selected" : "",
         LIGHT_MODE_DUAL_COLOUR, (s.light_mode == LIGHT_MODE_DUAL_COLOUR) ? "selected" : "");
+
     off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Second LED default colour</td><td>");
     off = append_color_select(html, HTML_BUF_SIZE, off, "secondary_default_color", s.secondary_default_color);
     off = safe_append(html, HTML_BUF_SIZE, off,
         "</td></tr>"
-        "<tr><td colspan='2' style='color:#888'>In dual colour mode, the second LED shows this "
+        "<tr><td colspan='2' class='note'>In dual colour mode, the second LED shows this "
         "colour (general waste, by default red) unless the schedule finds two distinct bin "
-        "types due the same night, in which case it shows the second one instead. Only used "
-        "when \"Light mode\" above is set to dual colour.</td></tr>");
+        "types due the same night, in which case it shows the second one instead.</td></tr>");
+
+    off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Timezone</td><td><select name='tz'>");
+    for (size_t i = 0; i < TZ_PRESET_COUNT; i++) {
+        off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%s' %s>%s</option>",
+            TZ_PRESETS[i].tz, (&TZ_PRESETS[i] == current_preset) ? "selected" : "", TZ_PRESETS[i].label);
+    }
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<option value='custom' %s>Custom&hellip;</option></select></td></tr>"
+        "<tr><td>Custom TZ</td><td><input type='text' name='tz_custom' size='24' value='%s'></td></tr>"
+        "<tr><td colspan='2' class='note'>The custom POSIX TZ string is used only when "
+        "\"Custom&hellip;\" is selected above.</td></tr>"
+        "</table>",
+        current_preset == NULL ? "selected" : "", escaped_tz);
+
+    // ---- Bin collection API (collapsed until enabled)
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<div class='sect'><h2>Bin collection API</h2>"
+        "<input type='checkbox' id='api_en' name='api_enabled' %s>"
+        "<label for='api_en'> Use automatic bin collection API</label>"
+        "<div class='details'>"
+        "<p class='note'>When enabled and reachable, the API is authoritative: it overrides "
+        "the manual / fallback schedule entirely, including turning the light off on weeks "
+        "it reports nothing due.</p>",
+        api_cfg.enabled ? "checked" : "");
+
+    if (api_cfg.property_id != 0) {
+        off = safe_append(html, HTML_BUF_SIZE, off,
+            "<p>Configured: <b>%s</b>, %s (property #%u)</p>",
+            api_cfg.council_subdomain, api_cfg.property_label, (unsigned)api_cfg.property_id);
+    } else {
+        off = safe_append(html, HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
+    }
+
+    // Rendered from the saved config directly, no live fetch, so the home page
+    // stays fast. /api-setup auto-populates this at setup time; /api-test can
+    // (re)discover new types via a live fetch.
+    off = append_type_mapping_rows(html, HTML_BUF_SIZE, off, &api_cfg);
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<p><a href='/api-setup'>Change council / address</a>"
+        " &middot; <a href='/api-test'>Test API (show upcoming weeks)</a></p>"
+        "</div></div>");
+
+    // ---- Manual / fallback schedule (collapsed until enabled)
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<div class='sect'><h2>Manual / Fallback Schedule</h2>"
+        "<input type='checkbox' id='man_en' name='enabled' %s>"
+        "<label for='man_en'> Use manual / fallback schedule</label>"
+        "<div class='details'>"
+        "<p class='note'>Optional. This is only used when the API above is switched off or "
+        "not configured, or when it can't be reached and the last collection date it gave "
+        "us has already passed. If the API is working, nothing here has any effect.</p>"
+        "<table>",
+        s.enabled ? "checked" : "");
+
+    off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Bin night</td><td><select name='bin_night_weekday'>");
+    for (int i = 0; i < 7; i++) {
+        off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%d' %s>%s</option>",
+            i, (i == s.bin_night_weekday) ? "selected" : "", WEEKDAY_LABEL[i]);
+    }
+    off = safe_append(html, HTML_BUF_SIZE, off, "</select></td></tr>");
 
     for (int i = 0; i < SCHEDULE_MAX_COLOR_RULES; i++) {
         const schedule_color_rule_t *r = &s.rules[i];
@@ -440,18 +536,14 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "</table>"
-        "<p style='color:#888'>The light turns on at the chosen time on bin night, and stays on for "
-        "the given number of hours (carrying past midnight if needed).</p>");
-
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<h2>How the colour rules work</h2>"
+        "<h3>How the colour rules work</h3>"
         "<p>Each colour has its own independent cycle: its first collection date "
         "and how often it repeats (every 1-4 weeks) &mdash; these don't need to "
         "match between colours. If more than one colour is due the same week, "
         "Colour 1 takes priority, then Colour 2, then Colour 3.</p>"
-        "<p style='color:#888'>Example: Yellow first collected 6 Jul 2026, every "
+        "<p class='note'>Example: Yellow first collected 6 Jul 2026, every "
         "2 weeks. Green first collected 13 Jul 2026, every 3 weeks:</p>"
-        "<ul style='color:#888'>"
+        "<ul class='note'>"
         "<li>Week of 6 Jul &rarr; <b>Yellow</b> (Yellow's first week)</li>"
         "<li>Week of 13 Jul &rarr; <b>Green</b> (Green's first week)</li>"
         "<li>Week of 20 Jul &rarr; <b>Yellow</b> (2 weeks after its first)</li>"
@@ -459,28 +551,17 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<li>Week of 3 Aug &rarr; <b>Yellow</b>, and Green is also due this week "
         "&mdash; Yellow wins since it's Colour 1</li>"
         "</ul>"
-        "<p style='color:#888'>To disable a colour entirely, leave its \"Enabled\" "
-        "box unchecked.</p>");
-
-    const char *current_tz = settings_get_tz();
-    const tz_preset_t *current_preset = find_tz_preset(current_tz);
-    char escaped_tz[SETTINGS_TZ_MAX_LEN * 6 + 1];
-    html_escape_attr(current_tz, escaped_tz, sizeof(escaped_tz));
-
-    off = safe_append(html, HTML_BUF_SIZE, off, "<h2>Timezone</h2><p><select name='tz'>");
-    for (size_t i = 0; i < TZ_PRESET_COUNT; i++) {
-        off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%s' %s>%s</option>",
-            TZ_PRESETS[i].tz, (&TZ_PRESETS[i] == current_preset) ? "selected" : "", TZ_PRESETS[i].label);
-    }
-    off = safe_append(html, HTML_BUF_SIZE, off, "<option value='custom' %s>Custom&hellip;</option></select></p>",
-        current_preset == NULL ? "selected" : "");
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<p>Custom POSIX TZ string (used only when \"Custom&hellip;\" is selected above):<br>"
-        "<input type='text' name='tz_custom' size='40' value='%s'></p>", escaped_tz);
+        "<p class='note'>To disable a colour entirely, leave its \"Enabled\" "
+        "box unchecked.</p>"
+        "</div></div>");
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<p style='margin-top:1em'><button type='submit'>Save</button></p>"
         "</form></body></html>");
+
+    if (off >= HTML_BUF_SIZE) {
+        ESP_LOGE(TAG, "home page truncated at %d bytes - raise HTML_BUF_SIZE", HTML_BUF_SIZE);
+    }
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, off);
@@ -613,7 +694,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
 }
 
 // Previews whatever the light would show at its next scheduled occurrence
-// (SPEC.md 3.8) for a fixed 2 minutes, then hands back to the real evaluator.
+// (SPEC.md 3.8) for a fixed 30 seconds, then hands back to the real evaluator.
 // No body to read - the button always previews "next", nothing to configure.
 static esp_err_t test_post_handler(httpd_req_t *req)
 {
@@ -991,6 +1072,10 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
     }
 
     off = safe_append(html, HTML_BUF_SIZE, off, "</body></html>");
+
+    if (off >= HTML_BUF_SIZE) {
+        ESP_LOGE(TAG, "API test page truncated at %d bytes - raise HTML_BUF_SIZE", HTML_BUF_SIZE);
+    }
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, off);

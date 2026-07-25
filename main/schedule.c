@@ -19,7 +19,9 @@ static const char *TAG = "schedule";
 #define SCHEDULE_NVS_KEY        "schedule_v5"
 #define SCHEDULE_STRUCT_VERSION 5
 #define SCHEDULE_POLL_MS        30000
-#define TEST_PREVIEW_DURATION_MS (2UL * 60 * 1000)
+// SPEC.md 3.8: long enough to check the colours by eye, short enough that an
+// accidental press isn't an effective always-on override.
+#define TEST_PREVIEW_DURATION_MS (30UL * 1000)
 
 // Brightness is a multiplier applied to every colour channel in
 // led_state_set_dual(), so 0 renders the light black no matter which colour

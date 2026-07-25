@@ -131,7 +131,7 @@ JSON, and no colour data at all.
 | On-demand "Display Next Collection" button, previews next scheduled colour(s) | [schedule.c](main/schedule.c) — see 3.8 |
 | mDNS hostname advertisement (`binlight.local`) | [main.c](main/main.c) — see 3.9 |
 | Boot-time LED self-test (both LEDs cycle colours) | [led_state.c](main/led_state.c) — see 3.10 |
-| Preferences UI reorganisation + default brightness fix | **planned, not yet implemented** — see 3.11 |
+| Preferences UI reorganisation + default brightness fix | [web_server.c](main/web_server.c) — see 3.11 |
 | Physical buttons (factory reset, display-next / cancel) | **planned, not yet implemented** — see 3.12 |
 | Multi-council coverage + per-council backends | **researched, not yet implemented** — see 3.13 |
 
@@ -532,7 +532,7 @@ one rotating colour list.
   for night+colour whenever it's enabled and reachable; this manual rule set is
   the fallback for when it's disabled, unconfigured, or unreachable.
 
-**Rename + reframing (planned, not yet implemented)**: renamed in the web UI
+**Rename + reframing (implemented)**: renamed in the web UI
 from "Manual schedule" to **"Manual / Fallback Schedule"**, with its
 explanatory text updated to state plainly that it's optional and only takes
 over when the API can't be reached *or* its cached data is stale (a
@@ -722,14 +722,15 @@ show, rendered according to the current `light_mode` (single vs dual) — so the
 colours (and the second LED's wiring) can be checked without waiting for the
 real bin night or API poll window.
 
-**Revision (planned, not yet implemented)**:
-- **Renamed to "Display Next Collection"** — describes what it actually shows,
-  rather than reading as a generic hardware self-test (that's §3.10's boot
-  sequence).
-- **Illumination duration changed from 2 minutes to 30 seconds** — long enough
-  to check the colours by eye, short enough not to be an accidental
+**Revision** (the first two landed with §3.11; the third is still pending
+§3.3's resolver rework):
+- ✅ **Renamed to "Display Next Collection"** — describes what it actually
+  shows, rather than reading as a generic hardware self-test (that's §3.10's
+  boot sequence).
+- ✅ **Illumination duration changed from 2 minutes to 30 seconds** — long
+  enough to check the colours by eye, short enough not to be an accidental
   always-on override if pressed by mistake.
-- **Always backed by `schedule_get_next_collection()`** (§3.3's redesigned
+- ❌ **Always backed by `schedule_get_next_collection()`** (§3.3's redesigned
   resolver) instead of the old per-feature preview logic below — so its
   result is now **guaranteed available** except in the one narrow case that
   resolver defines as genuinely unknown (API stale *and* manual/fallback
@@ -869,7 +870,7 @@ operation. Called from `app_main()` right after `led_state_init()`, before
 Wi-Fi or anything else starts — the very first thing the device does on
 power-up.
 
-### 3.11 Preferences UI reorganisation + default brightness fix (planned, not yet implemented)
+### 3.11 Preferences UI reorganisation + default brightness fix (implemented)
 
 **Requirement**: several settings currently grouped under "Manual schedule"
 actually apply regardless of whether the manual or the API schedule is
@@ -915,6 +916,44 @@ rather than always showing a full table.
 - **"Manual / Fallback Schedule" section** (renamed, §3.6): unchanged fields
   (bin night, colour rules) minus the ones promoted to Preferences, now
   hidden until `enabled` is checked.
+
+**Implementation notes** (things the design above didn't anticipate, all in
+[web_server.c](main/web_server.c)):
+
+- **`.sect` wrappers are load-bearing, not cosmetic.** The obvious selector
+  `input:checked ~ .details` uses the *general* sibling combinator, which
+  matches **every** later `.details` sibling — so ticking "Use automatic bin
+  collection API" would also expand the Manual/Fallback block below it. Each
+  section is therefore wrapped in its own `<div class='sect'>` and the rule is
+  scoped `.sect input:checked ~ .details`, which confines the match to one
+  section. Verified in a browser across all four checked/unchecked
+  combinations.
+- **Collapsed ≠ excluded from the form.** `display:none` hides a control but
+  does **not** stop it submitting, so collapsing a section still posts every
+  field inside it at its current value. That's the behaviour we want —
+  collapsing the manual schedule must not silently wipe its stored rules on
+  the next Save — but it's worth stating, because the opposite (`disabled`, or
+  omitting the markup entirely) would have quietly destroyed config.
+- **The colour-mapping form nests inside the /save form's DOM via HTML5's
+  `form=` attribute.** Forms can't nest, and the mapping table posts to
+  `/api-test` while everything around it posts to `/save`. So an empty
+  `<form id='mapform' action='/api-test'>` (carrying the two hidden fields) is
+  emitted *before* the `/save` form opens, and each mapping control claims
+  membership with `form='mapform'`. Valid HTML5, still no JavaScript, and the
+  submitted body is byte-identical to what `/api-test` already parses. This is
+  why `append_type_mapping_form()` was split into
+  `append_type_mapping_anchor()` + `append_type_mapping_rows()`, and why
+  `append_color_select()` gained a `_for()` variant taking a form id.
+- **`HTML_BUF_SIZE` raised 7200 → 12288.** The reorganised home page's worst
+  case (8 colour-mapping rows, i.e. `WASTE_API_MAX_TYPE_RULES`) is ~11KB.
+  `safe_append()` truncates silently, and a truncated page **drops form
+  fields**, which then read back as absent/unchecked on the next Save — a
+  config-destroying failure that looks like nothing at all. Both
+  `root_get_handler()` and `api_test_get_handler()` now log an error if they
+  hit the ceiling, so this can never fail silently again.
+- **Also landed here** (§3.8's cheap half, independent of its resolver
+  rework): the button is renamed to **"Display Next Collection (30 seconds)"**
+  and `TEST_PREVIEW_DURATION_MS` dropped from 2 minutes to 30 seconds.
 
 ### 3.12 Physical buttons (planned, not yet implemented)
 
@@ -1467,13 +1506,18 @@ three different things that are easy to conflate.
 | §3.8 "Display Next Collection" button | ✅ | ✅ | ✅ **works** — confirmed on hardware |
 | §3.11 brightness default fix (§6 bug 16) | ✅ | ✅ | ✅ **works** — see below |
 | Warmer yellow `(255,150,0)` (§2) | ✅ | ✅ | ⚠️ red/green/purple good; yellow deferred (§5) |
-| §3.11 Preferences UI reorganisation | ❌ not written | — | — |
+| §3.11 Preferences UI reorganisation | ✅ | ❌ **not yet flashed** | ❌ |
+| §3.8 button rename + 30s duration | ✅ | ❌ **not yet flashed** | ❌ |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |
 | §3.13 additional council backends | ❌ not written (research complete) | — | — |
 
-**Everything committed is flashed** as of the yellow/brightness build — the
-working tree and the device are in step. Nothing is pending a flash.
+**The §3.11 UI build is committed but NOT yet flashed** — the working tree is
+ahead of the device. Everything before it (yellow/brightness) is flashed and in
+step. Build is clean (`idf.py build`, 0x130b60 bytes, 60% of the app partition
+free) and the collapsible CSS + form-attribute wiring were verified in a real
+browser against a static render of the generated markup, but nothing here has
+been exercised on the device yet.
 
 **Two things still worth an explicit look**, both cheap and both currently
 assumed-but-unverified:
@@ -1581,30 +1625,27 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: §3.11 Preferences UI reorganisation
+### ▶ Agreed next step: flash and check the §3.11 UI, then §3.3
 
-Decided with the owner: **do the UI work next, before the larger §3.3
-next-collection rework and the §3.13 backends.** Rationale — it's
-self-contained, touches only [web_server.c](main/web_server.c) rendering and
-the `POST /save` parser, has no bearing on the risky backend refactor, and
-makes the device materially easier to use while the harder work is in flight.
+§3.11 is **done in code** (all three parts: the Preferences section, the
+"Manual / Fallback Schedule" rename, and the CSS-only collapsible sections),
+plus §3.8's rename and 30-second duration. See §3.11's "Implementation notes"
+for the three non-obvious things that came out of it.
 
-Scope for that step, all from §3.11:
-1. New **"Preferences"** section, first on the page, holding Brightness, On
-   From, Turn off After, Light mode, Second LED default colour, and Timezone —
-   moved out of "Manual schedule" and the standalone Timezone section, because
-   they apply to API-driven and manual schedules alike.
-2. Rename "Manual schedule" → **"Manual / Fallback Schedule"**, with text
-   stating it is optional and only used when the API is unreachable or its
-   data is stale (§3.6).
-3. **Checkbox-gated collapsible detail** for the API and Manual sections,
-   driven by the *existing* `api_enabled` / `enabled` toggles — CSS-only
-   (`input:checked ~ .details`), no JavaScript, preserving the project's
-   no-JS property.
+**Next action is a flash and a look at the page**, which conveniently also
+settles the two long-standing unverified items above (LED2 independently, and
+the boot self-test) in the same boot.
 
-Already done ahead of that step: the default-brightness fix (§6 bug 16).
+Worth a specific eye on, since none of it has run on the device:
+- The two sections expand/collapse from their own checkbox only.
+- Saving with a section **collapsed** does not wipe that section's stored
+  values (it shouldn't — hidden fields still submit — but this is the one
+  failure mode that would silently destroy config).
+- "Save mapping" still posts to `/api-test` and returns to `/`, now that its
+  controls sit inside the `/save` form's DOM via `form='mapform'`.
+- No `web_server: home page truncated` error in the serial log.
 
-The ordering after this remains as §3.13 sets out: §3.3 rework → backend
+After that, the ordering remains as §3.13 sets out: §3.3 rework → backend
 abstraction (Knox first) → Whitehorse → Merri-bek → Monash → LGA dropdown →
 Impact Apps list → South Australia.
 
