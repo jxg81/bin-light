@@ -19,7 +19,7 @@ static const char *TAG = "led_state";
 static const led_color_t SELF_TEST_COLORS[] = {
     {255, 0,   0},   // Red
     {0,   255, 0},   // Green
-    {255, 255, 0},   // Yellow
+    {255, 150, 0},   // Yellow (green pulled down - see COLOR_PRESETS in web_server.c)
     {128, 0,   128}, // Purple
 };
 #define SELF_TEST_COLOR_COUNT (sizeof(SELF_TEST_COLORS) / sizeof(SELF_TEST_COLORS[0]))

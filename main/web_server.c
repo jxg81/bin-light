@@ -55,7 +55,11 @@ typedef struct {
 static const color_preset_t COLOR_PRESETS[] = {
     {"Red",    255, 0,   0},
     {"Green",  0,   255, 0},
-    {"Yellow", 255, 255, 0},
+    // Green is far more luminous than red on a WS2812 at equal duty, so a
+    // naive (255,255,0) reads distinctly green - especially diffused through
+    // the PLA enclosure. Pulling green down balances it perceptually. Tuned
+    // by eye against the real enclosure; see SPEC.md 2.
+    {"Yellow", 255, 150, 0},
     {"Purple", 128, 0,   128},
 };
 #define COLOR_PRESET_COUNT (sizeof(COLOR_PRESETS) / sizeof(COLOR_PRESETS[0]))
@@ -122,29 +126,10 @@ static int safe_append(char *buf, size_t buf_size, int off, const char *fmt, ...
     return new_off > (int)buf_size ? (int)buf_size : new_off;
 }
 
-// Renders a full <select> of the colour presets for one rotation slot,
-// preselecting whichever preset matches `current` exactly.
-static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name, schedule_color_t current)
+// Index of the preset closest to c, by squared distance in RGB space.
+static size_t nearest_preset_index(schedule_color_t c)
 {
-    off = safe_append(buf, buf_size, off, "<select name='%s'>", field_name);
-    for (size_t c = 0; c < COLOR_PRESET_COUNT; c++) {
-        const color_preset_t *cp = &COLOR_PRESETS[c];
-        bool selected = (cp->r == current.r && cp->g == current.g && cp->b == current.b);
-        off = safe_append(buf, buf_size, off, "<option value='#%02x%02x%02x' %s>%s</option>",
-            cp->r, cp->g, cp->b, selected ? "selected" : "", cp->label);
-    }
-    return safe_append(buf, buf_size, off, "</select>");
-}
-
-// Maps an arbitrary RGB colour (e.g. straight from the API's own "color" hex
-// field) to whichever of the 4 supported presets is closest, by squared
-// distance in RGB space. Used to auto-populate a sensible colour mapping
-// right after API setup completes, without asking the user to pick manually
-// for a council's colours that usually already correspond closely to one of
-// our 4 presets (red/green/yellow/purple).
-static schedule_color_t nearest_preset_color(schedule_color_t c)
-{
-    int best_idx = 0;
+    size_t best_idx = 0;
     long best_dist = -1;
     for (size_t i = 0; i < COLOR_PRESET_COUNT; i++) {
         long dr = (long)c.r - COLOR_PRESETS[i].r;
@@ -153,10 +138,41 @@ static schedule_color_t nearest_preset_color(schedule_color_t c)
         long dist = dr * dr + dg * dg + db * db;
         if (best_dist < 0 || dist < best_dist) {
             best_dist = dist;
-            best_idx = (int)i;
+            best_idx = i;
         }
     }
-    return (schedule_color_t){COLOR_PRESETS[best_idx].r, COLOR_PRESETS[best_idx].g, COLOR_PRESETS[best_idx].b};
+    return best_idx;
+}
+
+// Maps an arbitrary RGB colour (e.g. straight from the API's own "color" hex
+// field) to whichever of the 4 supported presets is closest. Used to
+// auto-populate a sensible colour mapping right after API setup completes,
+// without asking the user to pick manually for a council's colours that
+// usually already correspond closely to one of our 4 presets.
+static schedule_color_t nearest_preset_color(schedule_color_t c)
+{
+    size_t i = nearest_preset_index(c);
+    return (schedule_color_t){COLOR_PRESETS[i].r, COLOR_PRESETS[i].g, COLOR_PRESETS[i].b};
+}
+
+// Renders a full <select> of the colour presets for one rotation slot,
+// preselecting the *nearest* preset rather than requiring an exact RGB match.
+// Stored rules hold literal RGB values, so any tuning of COLOR_PRESETS (e.g.
+// warming the yellow, see above) would otherwise leave previously-saved rules
+// matching nothing - and an <option>-less <select> silently displays its first
+// entry, i.e. a yellow rule would appear to be set to Red. Nearest-match keeps
+// the UI truthful across palette changes, and re-saving snaps the stored value
+// onto the current palette.
+static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name, schedule_color_t current)
+{
+    size_t selected_idx = nearest_preset_index(current);
+    off = safe_append(buf, buf_size, off, "<select name='%s'>", field_name);
+    for (size_t c = 0; c < COLOR_PRESET_COUNT; c++) {
+        const color_preset_t *cp = &COLOR_PRESETS[c];
+        off = safe_append(buf, buf_size, off, "<option value='#%02x%02x%02x' %s>%s</option>",
+            cp->r, cp->g, cp->b, (c == selected_idx) ? "selected" : "", cp->label);
+    }
+    return safe_append(buf, buf_size, off, "</select>");
 }
 
 static schedule_color_t preset_by_label(const char *label)

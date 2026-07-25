@@ -91,6 +91,18 @@ JSON, and no colour data at all.
 - Confirmed empirically: this specific LED batch expects **RGB** byte order on the
   wire, not the WS2812 datasheet-standard GRB — `LED_STRIP_COLOR_COMPONENT_FMT_RGB`
   in [led_state.c](main/led_state.c). Do not "correct" this back to GRB.
+- **Enclosure**: transparent/natural PLA, printed. The LEDs are viewed through
+  it, so colours are judged **diffused, not bare** — the palette is tuned
+  against the real enclosure, and any future colour work should be evaluated
+  the same way rather than by the raw RGB values looking correct.
+- **Colour balance**: WS2812 green is substantially more luminous than red at
+  equal duty, so a naive `(255,255,0)` yellow reads distinctly **green**
+  (confirmed on hardware through the PLA cover). `COLOR_PRESETS` yellow is
+  therefore `(255,150,0)`, green deliberately pulled down. This is a
+  perceptual calibration, not a bug — expect to re-tune it if the filament,
+  wall thickness or LED batch changes. Same class of empirical finding as the
+  RGB byte order above: do not "correct" it back to a mathematically pure
+  value.
 
 ## 3. Requirements
 
@@ -1505,6 +1517,32 @@ path are demonstrably fine.
   return 403 here and work fine from the user's home connection — this already
   produced one wrong conclusion about Monash (§3.13.4). Never conclude "blocked"
   without a residential re-test.
+
+### ⚠️ Palette changes do not reach already-saved rules (known wrinkle)
+
+Colours are stored in NVS as **literal RGB triples**, in
+`waste_api_config_t.type_rules[].color` and `schedule_t.rules[].color` — not as
+a reference to `COLOR_PRESETS`. So editing the palette (e.g. the yellow
+recalibration in §2) changes what the *palette* means but leaves every
+previously-saved rule holding the old value, and the LED keeps showing the old
+colour.
+
+**After any palette change, press Save once on each affected form** (the colour
+mapping form and/or the manual schedule form on `/`). The dropdowns now
+preselect the *nearest* preset rather than requiring an exact RGB match, so the
+right entry is already chosen — saving just snaps the stored value onto the
+current palette. Without the nearest-match behaviour a stale value would match
+no `<option>` at all and the browser would display the first entry, making a
+yellow rule look as though it were set to Red.
+
+**Proper fix, deferred deliberately**: move `COLOR_PRESETS` +
+`nearest_preset_color()` out of [web_server.c](main/web_server.c) into a small
+shared module, and snap stored colours to the current palette in
+`schedule_init()`/`waste_api_init()` — the same self-heal-on-load pattern used
+for brightness (§6 bug 16). Not done yet because the palette is currently
+presentation-layer data, and §3.13 needs a shared colour module anyway (for
+name→RGB mapping, since none of the bespoke council backends return colours) —
+so both should land together rather than moving the same code twice.
 
 ### Open questions not yet resolved
 
