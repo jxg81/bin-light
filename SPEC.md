@@ -1510,7 +1510,13 @@ because it inverts §3.13's headline finding for *this* project:
   variable-length string, and Merri-bek's multi-field case is why per-backend
   config (§3.13.3) is unavoidable rather than a single shared id column.
 
-#### 3.13.5 Unified LGA dropdown — one council list across all backends
+#### 3.13.5 Unified LGA dropdown — one council list across all backends (implemented for Impact Apps)
+
+**Status**: built and shipping in [councils.h](main/councils.h)/[councils.c](main/councils.c),
+covering the **39 Impact Apps councils**. Built ahead of the sequencing below
+at the owner's request. Implementation notes and the deviations from the design
+that follows are at the end of this subsection.
+
 
 **Requirement**: automatic/API mode is selected by picking a council from a
 **single flat dropdown of supported LGAs**. The user should never see, choose,
@@ -1581,6 +1587,50 @@ five working-group councils first, shared-platform breadth last:
    lat/lon UX question. Largest coverage win, but zero value to the working
    group.
 
+**As built** (deviates from the design above in two deliberate ways):
+
+- **Only councils with a working backend are listed.** The design imagined all
+  89 entries including the 4 bespoke Victorian councils and the 46 SA ones,
+  with SA entries existing purely to route users to a different address flow.
+  Those backends don't exist yet, so listing them would mean a user picks their
+  own council by name, gets an address wizard, and only *then* discovers
+  nothing works — strictly worse than not listing it. The table ships with the
+  39 Impact Apps councils and grows as backends land. `council_backend_t` is
+  an enum with the other backends' slots left to be added, so this is an
+  append, not a rework.
+- **A state `<select>` filtering the council list, not one `<optgroup>` list.**
+  Requested by the owner during implementation ("default to VIC and have a
+  state and LGA drop down"). Filtering server-side costs one extra page load
+  when changing state — there's no JavaScript to filter client-side — so the
+  page defaults to **VIC** and a Victorian user never sees that round trip.
+  Two separate `<form>`s rather than one with two submit buttons, so which
+  button does what is unambiguous. This also keeps the rendered page small
+  (2.3KB for VIC, ~3KB for the largest state) rather than the ~3.9KB the
+  single-list design estimated, and it scales when SA's 46 arrive.
+- **The default state resolves in three steps**: an explicit `?state=` wins,
+  else the currently-configured council's own state, else VIC. So returning to
+  the page after setup shows the list you actually chose from.
+- **The free-text subdomain field survives**, demoted below the dropdown as
+  designed, preserving §3.3's deliberate "any council on this platform works
+  without a firmware change". Its hardcoded `maribyrnong` default is gone; it
+  now prefills from the saved config.
+- **Subdomains no longer leak into the UI.** The home page, `/api-setup` and
+  `/api-test` all show the display name via `council_display_name()`, which
+  falls back to the raw subdomain for unlisted councils. The internal property
+  id is no longer shown either — it was never actionable for a user.
+- **The two ambiguous councils were resolved empirically, not assumed.**
+  `campbelltown` and `wellington` both exist in more than one state. Fetching
+  each one's locality list settled it: Airds and Ambarvale place
+  `campbelltown` in NSW; Boisdale and Briagolong place `wellington` in
+  Gippsland, VIC.
+- **All 39 subdomains were re-probed live before shipping the table** (39/39
+  returned HTTP 200), rather than trusting the list recorded in §3.13.1.
+- **Structural tests**: [test/host/test_councils.c](test/host/test_councils.c)
+  guards the things a compiler can't — duplicate subdomains or names, a
+  typo'd state that would silently hide a council from every dropdown, empty
+  fields, and the sort order the single-pass renderer depends on. It also
+  prints per-state counts so a table edit shows up as a visible diff.
+
 ## 4. Current state of the code — READ THIS FIRST after a context reset
 
 This section exists so work can resume from this file alone. It records what is
@@ -1602,6 +1652,7 @@ three different things that are easy to conflate.
 | §3.11 Preferences UI reorganisation | ✅ | ❌ **not yet flashed** | ❌ |
 | §3.8 button rename + 30s duration | ✅ | ❌ **not yet flashed** | ❌ |
 | §3.3 next-collection rework (sticky cache, unified resolver) | ✅ | ❌ **not yet flashed** | ⚠️ 28 host tests pass; no device time |
+| §3.13.5 council dropdown (39 Impact Apps LGAs) | ✅ | ❌ **not yet flashed** | ⚠️ table tests pass; 39/39 probed live |
 | DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |

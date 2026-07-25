@@ -25,23 +25,31 @@ mkdir -p "$OUT"
 
 CFLAGS="-I stub -I $MAIN -Wall -Wno-unused-function"
 
+status=0
+
 echo "building test_resolver..."
 cc -o "$OUT/test_resolver" test_resolver.c $CFLAGS
 echo
-
 # stderr carries the modules' own ESP_LOG output; keep it out of the results.
-"$OUT/test_resolver" 2>/dev/null
-status=$?
+"$OUT/test_resolver" 2>/dev/null || status=1
+
+echo
+echo "building test_councils..."
+cc -o "$OUT/test_councils" test_councils.c $MAIN/councils.c $CFLAGS
+echo
+"$OUT/test_councils" 2>/dev/null || status=1
 
 if [ "$1" = "render" ]; then
     echo
     echo "building render_page..."
-    cc -o "$OUT/render_page" render_page.c $CFLAGS
+    cc -o "$OUT/render_page" render_page.c $MAIN/councils.c $CFLAGS
     "$OUT/render_page" ""        "$OUT/home-configured.html"
     "$OUT/render_page" --empty   "$OUT/home-unconfigured.html"
     "$OUT/render_page" --max     "$OUT/home-worst-case.html"
-    echo "page sizes (HTML_BUF_SIZE must exceed the largest):"
-    wc -c "$OUT"/home-*.html
+    "$OUT/render_page" --setup   "$OUT/api-setup.html"
+    echo "page sizes (HTML_BUF_SIZE must exceed the largest home-*;"
+    echo "SETUP_HTML_BUF_SIZE must exceed api-setup):"
+    wc -c "$OUT"/*.html
 fi
 
 exit $status

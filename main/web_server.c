@@ -8,6 +8,7 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 
+#include "councils.h"
 #include "schedule.h"
 #include "settings.h"
 #include "waste_api.h"
@@ -482,8 +483,8 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
     if (api_cfg.property_id != 0) {
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>Configured: <b>%s</b>, %s (property #%u)</p>",
-            api_cfg.council_subdomain, api_cfg.property_label, (unsigned)api_cfg.property_id);
+            "<p>Configured: <b>%s</b><br>%s</p>",
+            council_display_name(api_cfg.council_subdomain), api_cfg.property_label);
     } else {
         off = safe_append(html, HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
     }
@@ -769,7 +770,9 @@ static bool get_query_param(httpd_req_t *req, const char *key, char *out, size_t
 static esp_err_t api_setup_get_handler(httpd_req_t *req)
 {
     char step[16] = "";
-    char subdomain[WASTE_API_SUBDOMAIN_MAX_LEN + 1] = "maribyrnong";
+    // No hardcoded default - the council now comes from the dropdown, and the
+    // free-text field below it prefills from whatever is already configured.
+    char subdomain[WASTE_API_SUBDOMAIN_MAX_LEN + 1] = "";
     char locality_id_str[16] = "";
     char street_id_str[16] = "";
     char property_id_str[16] = "";
@@ -845,6 +848,8 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         "<style>"
         "body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
         "a.item{display:block;padding:.35em 0;border-bottom:1px solid #eee;text-decoration:none;}"
+        ".note{color:#888;}"
+        "select{max-width:100%%;}"
         "</style></head><body>"
         "<h1>Bin Collection API Setup</h1>"
         "<p><a href='/'>&larr; Back to schedule</a></p>");
@@ -913,20 +918,83 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         if (cfg.property_id != 0) {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
                 "<p>Currently configured: <b>%s</b>, %s (property #%u)</p>",
-                cfg.council_subdomain, cfg.property_label, (unsigned)cfg.property_id);
+                council_display_name(cfg.council_subdomain), cfg.property_label, (unsigned)cfg.property_id);
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
         }
+
+        // Which state's councils to list. Explicit ?state= wins; otherwise the
+        // configured council's own state; otherwise VIC.
+        char state[8] = "";
+        if (!get_query_param(req, "state", state, sizeof(state)) || state[0] == '\0') {
+            const council_t *current = council_find_impact_apps(cfg.council_subdomain);
+            snprintf(state, sizeof(state), "%s", current ? current->state : COUNCIL_DEFAULT_STATE);
+        }
+        bool state_known = false;
+        for (size_t i = 0; i < STATE_ORDER_COUNT; i++) {
+            if (strcmp(STATE_ORDER[i], state) == 0) {
+                state_known = true;
+                break;
+            }
+        }
+        if (!state_known) {
+            snprintf(state, sizeof(state), "%s", COUNCIL_DEFAULT_STATE);
+        }
+
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Set up a new council / address</h2>");
+
+        // Two separate forms rather than one with two buttons: changing state
+        // is a page reload that re-renders the council list (no JavaScript, so
+        // the filtering has to happen server-side), while choosing a council
+        // moves on to the address wizard. Keeping them apart makes which
+        // button does what obvious.
         off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-            "<h2>Set up a new council / address</h2>"
-            "<p>This works for any council running the same \"waste-info.com.au\" "
-            "platform &mdash; just enter their subdomain (the part before "
-            "\".waste-info.com.au\" in their bin-day lookup URL).</p>"
+            "<form method='GET' action='/api-setup' style='margin-bottom:1em'>"
+            "<label>State: <select name='state'>");
+        for (size_t i = 0; i < STATE_ORDER_COUNT; i++) {
+            int n = 0;
+            for (size_t c = 0; c < COUNCIL_COUNT; c++) {
+                if (strcmp(COUNCILS[c].state, STATE_ORDER[i]) == 0) {
+                    n++;
+                }
+            }
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<option value='%s' %s>%s (%d)</option>",
+                STATE_ORDER[i], strcmp(STATE_ORDER[i], state) == 0 ? "selected" : "",
+                council_state_label(STATE_ORDER[i]), n);
+        }
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+            "</select></label> <button type='submit'>Show councils</button></form>");
+
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
             "<form method='GET' action='/api-setup'>"
             "<input type='hidden' name='step' value='locality'>"
-            "<label>Council subdomain: <input type='text' name='subdomain' value='%s'></label> "
+            "<label>Council: <select name='subdomain'>");
+        for (size_t c = 0; c < COUNCIL_COUNT; c++) {
+            if (strcmp(COUNCILS[c].state, state) != 0) {
+                continue;
+            }
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<option value='%s' %s>%s</option>",
+                COUNCILS[c].param,
+                strcmp(COUNCILS[c].param, cfg.council_subdomain) == 0 ? "selected" : "",
+                COUNCILS[c].name);
+        }
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+            "</select></label> <button type='submit'>Find my suburb</button></form>");
+
+        // The escape hatch that keeps SPEC.md 3.3's deliberate flexibility:
+        // any council on this platform works without a firmware change, listed
+        // or not. Demoted below the dropdown rather than removed.
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+            "<h3>Council not listed?</h3>"
+            "<p class='note'>Any council running the same \"waste-info.com.au\" platform will "
+            "work &mdash; enter their subdomain (the part before \".waste-info.com.au\" in "
+            "their bin-day lookup URL).</p>"
+            "<form method='GET' action='/api-setup'>"
+            "<input type='hidden' name='step' value='locality'>"
+            "<label>Subdomain: <input type='text' name='subdomain' value='%s'></label> "
             "<button type='submit'>Find my suburb</button>"
-            "</form>", subdomain);
+            "</form>",
+            subdomain[0] != '\0' ? subdomain : cfg.council_subdomain);
     }
 
     off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "</body></html>");
@@ -971,9 +1039,9 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
             "<p>No council/address configured yet &mdash; <a href='/api-setup'>set one up first</a>.</p>");
     } else {
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>Testing <b>%s</b>, %s (property #%u) &mdash; raw data for the next %d days "
+            "<p>Testing <b>%s</b>, %s &mdash; raw data for the next %d days "
             "(nothing filtered out yet):</p>",
-            cfg.council_subdomain, cfg.property_label, (unsigned)cfg.property_id, API_TEST_LOOKAHEAD_DAYS);
+            council_display_name(cfg.council_subdomain), cfg.property_label, API_TEST_LOOKAHEAD_DAYS);
 
         waste_api_event_t events[API_TEST_MAX_EVENTS];
         int n = waste_api_fetch_upcoming(cfg.council_subdomain, cfg.property_id,

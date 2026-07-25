@@ -84,9 +84,17 @@ int main(int argc, char **argv)
         s_sched.light_mode = LIGHT_MODE_SINGLE_COLOUR;
     }
 
+    bool setup_page = (argc > 1 && strcmp(argv[1], "--setup") == 0);
+
     s_out = fopen(argc > 2 ? argv[2] : "/dev/stdout", "w");
     httpd_req_t req = {0};
-    root_get_handler(&req);
+    // No query string is stubbed, so /api-setup renders its first step - the
+    // state + council pickers, which is the page worth eyeballing.
+    if (setup_page) {
+        api_setup_get_handler(&req);
+    } else {
+        root_get_handler(&req);
+    }
     fclose(s_out);
     return 0;
 }
