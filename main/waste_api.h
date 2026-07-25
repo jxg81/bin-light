@@ -134,6 +134,14 @@ typedef struct {
 int waste_api_search_address(uint8_t backend, const char *query,
                               waste_api_search_result_t *out, int max_out);
 
+// Merri-bek's public waste-calendar page URL for the current year - the year
+// is baked into the council's URL (".../waste-calendar26/" in 2026, "27" in
+// 2027), so it is derived from the clock rather than hardcoded. Used for the
+// setup UI's guidance link, and it is the page the cpage self-discovery
+// mechanism scans (see waste_api.c). Falls back to the 2026 URL if the clock
+// hasn't synced yet.
+void waste_api_merribek_calendar_url(char *buf, size_t buf_size);
+
 // --- Diagnostics: on-demand fetch for the web UI's "Test API" feature.
 // Bypasses the poll cache entirely - a fresh, blocking HTTPS call every time
 // it's invoked, so the user can verify their setup without waiting for the

@@ -931,6 +931,25 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
             "<button type='submit'>Search</button>"
             "</form>",
             council->name, enc_param);
+
+        if (council->backend == COUNCIL_BACKEND_MERRI_BEK) {
+            // Merri-bek's address layer stores addresses in one exact
+            // canonical form, and this search matches from the start of that
+            // string - so the most reliable way to get a hit is to copy the
+            // exact spelling from the council's own autocomplete. The link is
+            // year-derived (the council bakes the year into the URL).
+            char cal_url[192];
+            waste_api_merribek_calendar_url(cal_url, sizeof(cal_url));
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+                "<p class='note'>Tip: Merri-bek needs your address spelled exactly the way "
+                "the council records it (all caps, street type written out in full, no "
+                "commas). The easy way to get it right: open "
+                "<a href='%s' target='_blank'>the council's waste calendar page</a>, start "
+                "typing your address there and let it autocomplete, then copy the completed "
+                "address and paste it into the search box above.</p>"
+                "<p class='note'>Example: <b>3/85 DAVIES STREET BRUNSWICK 3056</b></p>",
+                cal_url);
+        }
     } else if (strcmp(step, "bsearch") == 0 && council != NULL && query[0] != '\0') {
         char enc_param[sizeof(council_param) * 3 + 1];
         url_encode_component(council->param, enc_param, sizeof(enc_param));

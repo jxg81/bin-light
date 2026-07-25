@@ -1,0 +1,139 @@
+22</td></tr><tr><td id='23-11-2026' class="bin-calendar__day "> 23</td><td id='24-11-2026' class="bin-calendar__day "> 24</td><td id='25-11-2026' class="bin-calendar__day "> 25</td><td id='26-11-2026' class="bin-calendar__day "> 26</td><td id='27-11-2026' class="bin-calendar__day "> 27</td><td id='28-11-2026' class="bin-calendar__day "> 28</td><td id='29-11-2026' class="bin-calendar__day "> 29</td></tr><tr><td id='30-11-2026' class="bin-calendar__day "> 30</td><td></td><td></td><td></td><td></td><td></td><td></td></tr></table></div> <div class="bin-calendar__month "><h2>December</h2> <table role="presentation" aria-hidden="true"><thead><tr><td><span aria-hidden="true">Mo</span> <span class="sr-only">Monday</span></td><td><span aria-hidden="true">Tu</span> <span class="sr-only">Tuesday</span></td><td><span aria-hidden="true">We</span> <span class="sr-only">Wednesday</span></td><td><span aria-hidden="true">Th</span> <span class="sr-only">Thursday</span></td><td><span aria-hidden="true">Fr</span> <span class="sr-only">Friday</span></td><td><span aria-hidden="true">Sa</span> <span class="sr-only">Saturday</span></td><td><span aria-hidden="true">Su</span> <span class="sr-only">Sunday</span></td></tr></thead><tr><td></td><td id='1-12-2026' class="bin-calendar__day ">  1</td><td id='2-12-2026' class="bin-calendar__day ">  2</td><td id='3-12-2026' class="bin-calendar__day ">  3</td><td id='4-12-2026' class="bin-calendar__day ">  4</td><td id='5-12-2026' class="bin-calendar__day ">  5</td><td id='6-12-2026' class="bin-calendar__day ">  6</td></tr><tr><td id='7-12-2026' class="bin-calendar__day ">  7</td><td id='8-12-2026' class="bin-calendar__day ">  8</td><td id='9-12-2026' class="bin-calendar__day ">  9</td><td id='10-12-2026' class="bin-calendar__day "> 10</td><td id='11-12-2026' class="bin-calendar__day "> 11</td><td id='12-12-2026' class="bin-calendar__day "> 12</td><td id='13-12-2026' class="bin-calendar__day "> 13</td></tr><tr><td id='14-12-2026' class="bin-calendar__day "> 14</td><td id='15-12-2026' class="bin-calendar__day "> 15</td><td id='16-12-2026' class="bin-calendar__day "> 16</td><td id='17-12-2026' class="bin-calendar__day "> 17</td><td id='18-12-2026' class="bin-calendar__day "> 18</td><td id='19-12-2026' class="bin-calendar__day "> 19</td><td id='20-12-2026' class="bin-calendar__day "> 20</td></tr><tr><td id='21-12-2026' class="bin-calendar__day "> 21</td><td id='22-12-2026' class="bin-calendar__day "> 22</td><td id='23-12-2026' class="bin-calendar__day "> 23</td><td id='24-12-2026' class="bin-calendar__day "> 24</td><td id='25-12-2026' class="bin-calendar__day "> 25</td><td id='26-12-2026' class="bin-calendar__day "> 26</td><td id='27-12-2026' class="bin-calendar__day "> 27</td></tr><tr><td id='28-12-2026' class="bin-calendar__day "> 28</td><td id='29-12-2026' class="bin-calendar__day "> 29</td><td id='30-12-2026' class="bin-calendar__day "> 30</td><td id='31-12-2026' class="bin-calendar__day "> 31</td><td></td><td></td><td></td></tr><tr><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr></table></div>
+
+            </div>
+            <hr />
+
+
+        </div>
+    </section>
+    <section class="bin-calendar--no-print"><div class="container"><div class="mb-24 my-24"> 
+<p>Do you need a black and white version of your collection calendar?</p>
+<p>Enter your address, click the print button, select Adobe PDF, go to colour mode and select black and white.&nbsp;</p>
+<p><span data-teams="true">If you don't have a printer or need help viewing your calendar, please call our Customer Service team on <a class="telephoneNumber" href="tel:9240 1111">9240 1111</a>.</span></p></div></div></section>
+
+
+
+
+
+
+</main>
+
+<script>
+
+
+
+     $(document).on('submit',
+        '#autoform',
+        function() {
+
+
+            selectedAddressSubmit();
+
+            if (!autoPost)
+                return false;
+        });
+    $(document).ready(function () {
+        $(".is-garbage-fortnightly").hide();
+        $(".is-weekly-fogo").hide();
+        $("#noServices").hide();
+        $("#calendar").hide();
+        $("#nextCollections").hide();
+        if (2026 == 2026) {
+            $('#nextCollections').show();
+        }
+
+        function printBinCalendar() {
+            var body = $('body');
+            body.toggleClass('calendar-printing', true);
+            window.print();
+            body.toggleClass('calendar-printing', false);
+        }
+
+        /**
+         * Handle Print Calendar Button click
+        */
+        $(document).on('click', '#print-calendar-btn', printBinCalendar);
+
+
+                // This function on success will pass the selected address back to "selectedAddressReturn" (below)
+                mccAddressSearch("https://services6.arcgis.com/8L5sOwfzTAvcvQur/ArcGIS/rest/services/WasteServices4Bin/FeatureServer/0", "address");
+
+            //addressAutoComplete("address", "https://services6.arcgis.com/8L5sOwfzTAvcvQur/ArcGIS/rest/services/WasteServices4Bin/FeatureServer/0", "selectedAddress", "calendar","sd");
+            
+                                    $.ajax({
+                                        url: "/api/AddressDetails",
+                                        type: "GET",
+                                        dataType: "json",
+                                        data: {
+                                            xPoint: '316582.706',
+                                            yPoint: '5823136.983',
+                                            wasteDay: 'Monday',
+                                            wasteRateCode: '101',
+                                            recycleRateCode:'142',
+                                            fogoRateCode: '160',
+                                            glassRateCode:'170',
+                                            zone:'B',
+                                            glassWeekNumber:'3',
+                                            address: '1 VINCENT STREET OAK PARK 3046',
+                                            cpage: '183782'
+
+                                        },
+
+                                        success: function (data) {
+                                            if (data[0].noService === "no service") {
+                                                $("#noServices").show();
+                                                $("#displayAddressNoServices").html(data[0].Address);
+                                            } else {
+                                            updateCalendarFourBins(data[0]);
+                                            }
+                                        }
+
+
+
+                                    });});
+   
+
+
+
+function sendToNextYear(url) {
+$("#autoform").attr("action", url);
+$("#autoform").submit();
+
+
+}
+
+
+function selectedAddressReturn() {
+
+$("#calendar").hide();
+$("#your-details").hide();
+$("#selectedAddress").hide();
+$("#sAddress").val($("#address").val());
+
+
+}
+    function createDaySvg(dayNumber, flags) {
+        const layers = [];
+
+        // --- Background (exactly one) ---
+        if (flags.holiday) {
+            layers.push(`<img src="/site.resource.main/images/bin-holiday.png" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 0;"/>`);
+        }
+
+        // --- Rubbish (top-left) ---
+        if (flags.rubbish) {
+
+            layers.push(`<img src="/site.resource.main/images/bin.png" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 0;" /> `);
+        }
+
+        if (flags.recycle && flags.glass) {
+            layers.push(`<img src="/site.resource.main/images/recycleandglass.png" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 0;" /> `);
+        } else {
+
+            // --- Recycle overlay ---
+            if (flags.recycle) {
+                layers.push(`<img src="/site.resource.main/images/recycle.png" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 0;" /> `);
+
+            }
+
+            // --- G

@@ -1418,10 +1418,43 @@ out. That is still far more than Knox's `"69454"`, so the "id is an opaque
 variable-length string" requirement stands; it just needs ~120 bytes, not a
 coordinate pair.
 
-**Maintenance risk, stated plainly**: this is a single council's own CMS
-endpoint — one of its query parameters is `cpage=183782`, a bare content-page
-id that has already changed once — with no versioning and no stability
-guarantee. It can break on any site
+**cpage self-discovery (implemented, 2026-07-25)** — the annual `cpage` rot is
+now self-healing rather than a maintenance item:
+
+- Additional live probing refined the failure model: `cpage` must be a **real
+  CMS page id** — the *old* id (86612) still works because that page still
+  exists, while a made-up id gets **HTTP 500**. So the real risk is old
+  calendar pages eventually being deleted after a rotation, not the rotation
+  itself instantly breaking things.
+- The current id is embedded in the calendar page's own HTML (in its AJAX
+  call), but **only in the response to the address form POST** — the plain GET
+  page doesn't contain it.
+- So when `/api/AddressDetails` actively rejects a request (HTTP 500, or the
+  all-null `"no service"` body) while the network is demonstrably up, the
+  device POSTs its saved address fields to the **year-derived calendar URL**
+  (`.../waste-calendar%02d/` from the device clock — the council bakes the
+  year into the URL, `waste-calendar26/` in 2026, `27/` in 2027; tried for
+  this year, next year, then last year to cover both edges of the rollover),
+  scans the ~135KB response with a **streaming byte-state-machine** (never
+  buffered — it's far beyond any buffer here; boundary-safe by construction),
+  extracts the fresh id, and retries the fetch once. Transport-level failures
+  deliberately do *not* trigger discovery — if the Wi-Fi is down, discovery
+  would fail too.
+- The whole chain is host-tested end to end in `test_backends.c`: a stale
+  cpage (served a 500, as measured live) → discovery against the real
+  captured page bytes → retry → all four streams parsed.
+
+**Setup guidance (implemented)**: because the ArcGIS layer stores addresses in
+one exact canonical form (uppercase, street type in full, no commas), the
+Merri-bek search page shows a tip with a **year-derived link to the council's
+own calendar page**: type your address there, let it autocomplete, then copy
+the completed string into the device's search. Worked example (verified to
+return exactly one match): `3/85 DAVIES STREET BRUNSWICK 3056`.
+
+**Maintenance risk, restated**: this is a single council's own CMS endpoint
+with no versioning and no stability guarantee. The cpage rotation is now
+handled automatically; what discovery can *not* survive is a redesign that
+changes the calendar URL scheme or the form field names themselves. It can break on any site
 redesign, and unlike the two shared platforms, a break here helps exactly one
 user and has no upstream community watching it. That's the accepted cost of
 this exception; §3.6's manual / fallback schedule remains the safety net if it
@@ -1774,6 +1807,7 @@ three different things that are easy to conflate.
 | §3.13.5 council dropdown (39 Impact Apps LGAs) | ✅ | ❌ **not yet flashed** | ⚠️ table tests pass; 39/39 probed live |
 | §3.13.3/3.13.4 all four bespoke backends (Knox, Whitehorse, Merri-bek, Monash) | ✅ | ❌ **not yet flashed** | ⚠️ parsers pass against real captured payloads; nothing on-device yet |
 | waste_api config v2→v3 migration | ✅ | ❌ **not yet flashed** | ⚠️ host-tested; watch the first boot's log |
+| Merri-bek cpage self-discovery + year-derived URLs | ✅ | ❌ **not yet flashed** | ⚠️ host-tested end to end against real page bytes |
 | DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |

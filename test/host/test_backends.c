@@ -17,15 +17,20 @@
 
 // --- fixture-serving HTTP stub ----------------------------------------------
 
-static const struct { const char *url_substr; const char *path; } FIXTURES[] = {
-    {"knox.vic.gov.au/rubbish-collection/autocomplete", "fixtures/knox_search.json"},
-    {"knox.vic.gov.au/rubbish-collection/find",         "fixtures/knox_find.json"},
-    {"map.whitehorse.vic.gov.au/weave/services/v1/index/search",   "fixtures/whitehorse_search.json"},
-    {"map.whitehorse.vic.gov.au/weave/services/v1/feature",        "fixtures/whitehorse_features.json"},
-    {"services6.arcgis.com",                            "fixtures/merribek_search.json"},
-    {"merri-bek.vic.gov.au/api/AddressDetails",         "fixtures/merribek_details.json"},
-    {"monash.vic.gov.au/api/v1/myarea/search",          "fixtures/monash_search.json"},
-    {"monash.vic.gov.au/ocapi",                         "fixtures/monash_waste.json"},
+// First match wins, so more-specific substrings must come first: a stale
+// Merri-bek cpage (86612) is actively rejected with a 500, which is what
+// triggers the self-discovery path; the current cpage serves the real data.
+static const struct { const char *url_substr; const char *path; int status; } FIXTURES[] = {
+    {"knox.vic.gov.au/rubbish-collection/autocomplete", "fixtures/knox_search.json", 200},
+    {"knox.vic.gov.au/rubbish-collection/find",         "fixtures/knox_find.json", 200},
+    {"map.whitehorse.vic.gov.au/weave/services/v1/index/search",   "fixtures/whitehorse_search.json", 200},
+    {"map.whitehorse.vic.gov.au/weave/services/v1/feature",        "fixtures/whitehorse_features.json", 200},
+    {"services6.arcgis.com",                            "fixtures/merribek_search.json", 200},
+    {"cpage=86612",                                     NULL, 500},
+    {"merri-bek.vic.gov.au/api/AddressDetails",         "fixtures/merribek_details.json", 200},
+    {"waste-calendar",                                  "fixtures/merribek_calendar_page.html", 200},
+    {"monash.vic.gov.au/api/v1/myarea/search",          "fixtures/monash_search.json", 200},
+    {"monash.vic.gov.au/ocapi",                         "fixtures/monash_waste.json", 200},
 };
 
 struct stub_http_client {
@@ -43,18 +48,34 @@ esp_http_client_handle_t esp_http_client_init(const esp_http_client_config_t *co
     return c;
 }
 
+esp_err_t esp_http_client_set_header(esp_http_client_handle_t client, const char *key, const char *value)
+{
+    (void)client; (void)key; (void)value;
+    return ESP_OK;
+}
+
+esp_err_t esp_http_client_set_post_field(esp_http_client_handle_t client, const char *data, int len)
+{
+    (void)client; (void)data; (void)len;
+    return ESP_OK;
+}
+
 esp_err_t esp_http_client_perform(esp_http_client_handle_t client)
 {
     const char *path = NULL;
+    int status = 404;
     for (size_t i = 0; i < sizeof(FIXTURES) / sizeof(FIXTURES[0]); i++) {
         if (strstr(client->config.url, FIXTURES[i].url_substr) != NULL) {
             path = FIXTURES[i].path;
+            status = FIXTURES[i].status;
             break;
         }
     }
     if (path == NULL) {
-        fprintf(stderr, "stub_http: no fixture for %s\n", client->config.url);
-        client->status = 404;
+        if (status == 404) {
+            fprintf(stderr, "stub_http: no fixture for %s\n", client->config.url);
+        }
+        client->status = status; // body-less error response (e.g. the stale-cpage 500)
         return ESP_OK;
     }
     FILE *f = fopen(path, "rb");
@@ -77,7 +98,7 @@ esp_err_t esp_http_client_perform(esp_http_client_handle_t client)
         client->config.event_handler(&evt);
     }
     fclose(f);
-    client->status = 200;
+    client->status = status;
     return ESP_OK;
 }
 
@@ -194,6 +215,58 @@ int main(void)
         expect_event("  glass (03 Aug)", &ev[3], "glass", 2026, 8, 3);
     }
     check("malformed id fails cleanly", merribek_fetch_events("101|142", ev, POLL_MAX_EVENTS) == -1, "-1");
+
+    printf("\n== Merri-bek cpage self-discovery ==\n");
+    // The calendar-page URL is derived from the clock, since the council
+    // bakes the year into it (waste-calendar26/ in 2026).
+    {
+        time_t now = time(NULL);
+        struct tm tm_now;
+        localtime_r(&now, &tm_now);
+        int year = tm_now.tm_year + 1900;
+        if (year < 2026) year = 2026;
+        char want[32], got[192];
+        snprintf(want, sizeof(want), "waste-calendar%02d/", year % 100);
+        waste_api_merribek_calendar_url(got, sizeof(got));
+        snprintf(detail, sizeof(detail), "%s", strstr(got, "waste-calendar") ? strstr(got, "waste-calendar") : got);
+        check("calendar URL carries the current year", strstr(got, want) != NULL, detail);
+    }
+
+    // The scanner finds the id in the real page bytes even when the "cpage"
+    // token straddles a chunk boundary (the stub serves 512-byte chunks and
+    // the fixture places the token at offset 6000).
+    {
+        cpage_scan_t scan = {0};
+        FILE *f = fopen("fixtures/merribek_calendar_page.html", "rb");
+        check("calendar page fixture present", f != NULL, "");
+        if (f != NULL) {
+            char cbuf[512];
+            size_t got_n;
+            while ((got_n = fread(cbuf, 1, sizeof(cbuf), f)) > 0) {
+                cpage_scan_feed(&scan, cbuf, got_n);
+            }
+            fclose(f);
+            snprintf(detail, sizeof(detail), "found=%d digits=%s", scan.done, scan.digits);
+            check("scanner extracts the cpage id", scan.done && strcmp(scan.digits, "183782") == 0, detail);
+        }
+        // And it doesn't bite on lookalikes or short digit runs.
+        cpage_scan_t s2 = {0};
+        const char *decoy = "cpagex: '99' ... epage: '12345' ... cpage = 42 ... cpage: '183782'";
+        cpage_scan_feed(&s2, decoy, strlen(decoy));
+        snprintf(detail, sizeof(detail), "found=%d digits=%s", s2.done, s2.digits);
+        check("scanner skips decoys and short runs", s2.done && strcmp(s2.digits, "183782") == 0, detail);
+    }
+
+    // End to end: a stale cpage is rejected by the server (500 per the live
+    // probe), discovery scans the calendar page for the current id, and the
+    // fetch retries and succeeds - all inside one merribek_fetch_events call.
+    {
+        snprintf(s_merribek_cpage, sizeof(s_merribek_cpage), "86612"); // simulate a stale year
+        n = merribek_fetch_events("101|142|160|170|Monday|B|3|1 VINCENT STREET OAK PARK 3046", ev, POLL_MAX_EVENTS);
+        snprintf(detail, sizeof(detail), "n=%d cpage now=%s", n, s_merribek_cpage);
+        check("stale cpage self-heals and the fetch succeeds",
+              n == 4 && strcmp(s_merribek_cpage, "183782") == 0, detail);
+    }
 
     printf("\n== Monash ==\n");
     n = monash_search("4 Carson Street, Mulgrave", res, 12);

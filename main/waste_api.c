@@ -322,10 +322,17 @@ static esp_err_t http_event_handler(esp_http_client_event_t *evt)
 }
 
 // Blocking GET into buf (already allocated by the caller, buf_size bytes).
-static esp_err_t http_get(const char *url, char *buf, size_t buf_size)
+// out_status (optional) receives the HTTP status when the request completed
+// at the transport level, or -1 when it never got that far - letting callers
+// tell "the server rejected this" from "the network is down", which matters
+// for Merri-bek's cpage self-discovery below.
+static esp_err_t http_get_status(const char *url, char *buf, size_t buf_size, int *out_status)
 {
     http_buf_t hb = { .buf = buf, .capacity = buf_size, .len = 0, .overflow = false };
     buf[0] = '\0';
+    if (out_status != NULL) {
+        *out_status = -1;
+    }
 
     esp_http_client_config_t config = {
         .url = url,
@@ -343,6 +350,9 @@ static esp_err_t http_get(const char *url, char *buf, size_t buf_size)
     int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
     esp_http_client_cleanup(client);
 
+    if (out_status != NULL) {
+        *out_status = status;
+    }
     if (err != ESP_OK) {
         ESP_LOGW(TAG, "http request failed: %s", esp_err_to_name(err));
         return err;
@@ -356,6 +366,11 @@ static esp_err_t http_get(const char *url, char *buf, size_t buf_size)
         return ESP_ERR_NO_MEM;
     }
     return ESP_OK;
+}
+
+static esp_err_t http_get(const char *url, char *buf, size_t buf_size)
+{
+    return http_get_status(url, buf, buf_size, NULL);
 }
 
 static void parse_hex_color(const char *hex, schedule_color_t *out)
@@ -824,33 +839,151 @@ static int whitehorse_search(const char *query, waste_api_search_result_t *out, 
 // are sent and the EPSG:28355 projection the council's own JS performs is
 // skipped. ---
 
-// A bare CMS content-page id, mandatory, and it has already changed once
-// (86612 -> 183782 between research and implementation). When Merri-bek
-// stops working, this - and the year baked into the calendar page URL - is
-// the first thing to re-check. SPEC.md 3.13.3.
-#define MERRIBEK_CPAGE "183782"
+// A bare CMS content-page id, mandatory. It is a real page id, validated by
+// the server (a made-up value gets HTTP 500), and it rotates when the council
+// publishes a new year's calendar page (86612 -> 183782 between research and
+// implementation; old ids keep working only for as long as the old page
+// exists). Rather than being a hardcoded annual-maintenance item, the current
+// value is DISCOVERED at runtime when the compiled-in fallback stops working:
+// the calendar page's own HTML carries the id (in its AJAX call), so the
+// device POSTs its saved address fields to the year-derived calendar URL and
+// scans the response. SPEC.md 3.13.3.
+#define MERRIBEK_CPAGE_FALLBACK "183782"
 
-static int merribek_fetch_events(const char *address_id, waste_api_event_t *out, int max_out)
+// Runtime-discovered cpage (empty until a discovery has succeeded). Guarded
+// by s_mutex - fetches can run on both the poll task and the httpd task.
+static char s_merribek_cpage[12];
+
+static void merribek_calendar_url_for_year(char *buf, size_t buf_size, int year)
 {
-    // Unpack "waste|recycle|fogo|glass|Day|Zone|Week|ADDRESS".
-    char id_copy[WASTE_API_ADDRESS_ID_MAX_LEN + 1];
-    snprintf(id_copy, sizeof(id_copy), "%s", address_id);
-    char *fields[8] = {0};
-    char *p = id_copy;
-    for (int i = 0; i < 8; i++) {
-        fields[i] = p;
-        if (i == 7) {
-            break; // the address is the tail; it may itself never contain '|'
-        }
-        char *sep = strchr(p, '|');
-        if (sep == NULL) {
-            ESP_LOGW(TAG, "merri-bek: malformed address id");
-            return -1;
-        }
-        *sep = '\0';
-        p = sep + 1;
-    }
+    snprintf(buf, buf_size,
+             "https://www.merri-bek.vic.gov.au/living-in-merri-bek/waste-and-recycling/"
+             "bins-and-collection-services/waste-calendar%02d/", year % 100);
+}
 
+// The current year per the device clock, with a sane floor for the window
+// between boot and SNTP sync (when the clock reads 1970).
+static int merribek_current_year(void)
+{
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    int year = tm_now.tm_year + 1900;
+    return (year < 2026) ? 2026 : year;
+}
+
+void waste_api_merribek_calendar_url(char *buf, size_t buf_size)
+{
+    merribek_calendar_url_for_year(buf, buf_size, merribek_current_year());
+}
+
+// Streaming scanner for "cpage" followed by a digit run, fed byte-by-byte so
+// chunk boundaries can't split the match. The calendar page is ~135KB -
+// far beyond any buffer here - so it is never accumulated, only scanned.
+typedef struct {
+    size_t match_pos;   // progress through the literal "cpage"
+    int    seps_seen;   // separators consumed after the literal (: ' " = space)
+    char   digits[8];
+    size_t digits_len;
+    bool   done;
+} cpage_scan_t;
+
+static void cpage_scan_feed(cpage_scan_t *s, const char *data, size_t len)
+{
+    static const char LIT[] = "cpage";
+    for (size_t i = 0; i < len && !s->done; i++) {
+        char c = data[i];
+        if (s->match_pos < sizeof(LIT) - 1) {
+            s->match_pos = (c == LIT[s->match_pos]) ? s->match_pos + 1 : (c == LIT[0] ? 1 : 0);
+            s->seps_seen = 0;
+            s->digits_len = 0;
+            continue;
+        }
+        // Literal matched; allow a few separator chars, then collect digits.
+        if (c >= '0' && c <= '9') {
+            if (s->digits_len + 1 < sizeof(s->digits)) {
+                s->digits[s->digits_len++] = c;
+            }
+        } else if (s->digits_len > 0) {
+            if (s->digits_len >= 4) {
+                s->digits[s->digits_len] = '\0';
+                s->done = true; // a plausible page id (>=4 digits) ended
+            } else {
+                s->match_pos = 0; // too short to be a page id - keep looking
+            }
+        } else if ((c == ':' || c == '\'' || c == '"' || c == '=' || c == ' ') && ++s->seps_seen <= 4) {
+            // still between the literal and its value
+        } else {
+            s->match_pos = 0; // "cpagex" or similar - not our token
+        }
+    }
+}
+
+static esp_err_t cpage_scan_handler(esp_http_client_event_t *evt)
+{
+    if (evt->event_id == HTTP_EVENT_ON_DATA && evt->user_data != NULL && evt->data_len > 0) {
+        cpage_scan_feed((cpage_scan_t *)evt->user_data, (const char *)evt->data, (size_t)evt->data_len);
+    }
+    return ESP_OK;
+}
+
+// POSTs the saved address fields to the given calendar-page URL (the same
+// form submission a browser makes) and scans the response for the cpage id.
+static bool merribek_scan_calendar_page(const char *url, const char *body, char *out, size_t out_size)
+{
+    cpage_scan_t scan = {0};
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .event_handler = cpage_scan_handler,
+        .user_data = &scan,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = HTTP_TIMEOUT_MS,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        return false;
+    }
+    esp_http_client_set_header(client, "Content-Type", "application/x-www-form-urlencoded");
+    esp_http_client_set_post_field(client, body, strlen(body));
+    esp_err_t err = esp_http_client_perform(client);
+    int status = (err == ESP_OK) ? esp_http_client_get_status_code(client) : -1;
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK || status != 200 || !scan.done) {
+        ESP_LOGW(TAG, "merri-bek: cpage scan of %s failed (status %d, found=%d)", url, status, scan.done);
+        return false;
+    }
+    snprintf(out, out_size, "%s", scan.digits);
+    return true;
+}
+
+// Tries the calendar page for this year, then next year, then last year -
+// covering both edges of the annual rollover (new page not yet published /
+// old page already retired).
+static bool merribek_discover_cpage(const char *body, char *out, size_t out_size)
+{
+    int year = merribek_current_year();
+    const int years[] = {year, year + 1, year - 1};
+    for (size_t i = 0; i < sizeof(years) / sizeof(years[0]); i++) {
+        char url[192];
+        merribek_calendar_url_for_year(url, sizeof(url), years[i]);
+        if (merribek_scan_calendar_page(url, body, out, out_size)) {
+            ESP_LOGI(TAG, "merri-bek: discovered cpage %s from the %d calendar page", out, years[i]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// One attempt against /api/AddressDetails with a specific cpage.
+// Returns event count >= 0 on success; -1 on transport failure (network down
+// - don't bother with discovery, it would fail too); -2 when the server
+// actively rejected the request (HTTP 500, or the all-null "no service"
+// response) - the signature of a stale cpage, worth a discovery+retry.
+static int merribek_attempt_fetch(const char *fields[8], const char *cpage,
+                                   waste_api_event_t *out, int max_out)
+{
     char enc_addr[256];
     url_encode(enc_addr, sizeof(enc_addr), fields[7]);
     char url[640];
@@ -858,16 +991,21 @@ static int merribek_fetch_events(const char *address_id, waste_api_event_t *out,
              "https://www.merri-bek.vic.gov.au/api/AddressDetails"
              "?xPoint=0&yPoint=0&wasteDay=%s&wasteRateCode=%s&recycleRateCode=%s"
              "&fogoRateCode=%s&glassRateCode=%s&zone=%s&glassWeekNumber=%s"
-             "&address=%s&cpage=" MERRIBEK_CPAGE,
-             fields[4], fields[0], fields[1], fields[2], fields[3], fields[5], fields[6], enc_addr);
+             "&address=%s&cpage=%s",
+             fields[4], fields[0], fields[1], fields[2], fields[3], fields[5], fields[6],
+             enc_addr, cpage);
 
     char *buf = malloc(EVENTS_BUF_SIZE);
     if (buf == NULL) {
         return -1;
     }
-    if (http_get(url, buf, EVENTS_BUF_SIZE) != ESP_OK) {
+    int status = -1;
+    esp_err_t err = http_get_status(url, buf, EVENTS_BUF_SIZE, &status);
+    if (err != ESP_OK) {
         free(buf);
-        return -1;
+        // A response that reached us proves the network path works, so the
+        // rejection is about the request - i.e. very likely the cpage.
+        return (status >= 400) ? -2 : -1;
     }
     cJSON *root = cJSON_Parse(buf);
     free(buf);
@@ -878,14 +1016,8 @@ static int merribek_fetch_events(const char *address_id, waste_api_event_t *out,
     cJSON *rec = cJSON_IsArray(root) ? cJSON_GetArrayItem(root, 0) : root;
     cJSON *no_service = cJSON_GetObjectItem(rec, "noService");
     if (cJSON_IsString(no_service) && strcmp(no_service->valuestring, "no service") == 0) {
-        // Either a genuinely unserviced address or - just as likely - the
-        // cpage id has rotated again and the endpoint is rejecting the
-        // request while claiming success. Treat as a fetch failure so the
-        // sticky cache is left alone.
-        ESP_LOGW(TAG, "merri-bek: 'no service' response - unserviced address, or cpage (%s) has changed",
-                 MERRIBEK_CPAGE);
         cJSON_Delete(root);
-        return -1;
+        return -2;
     }
 
     static const struct { const char *field; const char *type; } STREAMS[] = {
@@ -902,6 +1034,63 @@ static int merribek_fetch_events(const char *address_id, waste_api_event_t *out,
     }
     cJSON_Delete(root);
     return n;
+}
+
+static int merribek_fetch_events(const char *address_id, waste_api_event_t *out, int max_out)
+{
+    // Unpack "waste|recycle|fogo|glass|Day|Zone|Week|ADDRESS".
+    char id_copy[WASTE_API_ADDRESS_ID_MAX_LEN + 1];
+    snprintf(id_copy, sizeof(id_copy), "%s", address_id);
+    const char *fields[8] = {0};
+    char *p = id_copy;
+    for (int i = 0; i < 8; i++) {
+        fields[i] = p;
+        if (i == 7) {
+            break; // the address is the tail; it may itself never contain '|'
+        }
+        char *sep = strchr(p, '|');
+        if (sep == NULL) {
+            ESP_LOGW(TAG, "merri-bek: malformed address id");
+            return -1;
+        }
+        *sep = '\0';
+        p = sep + 1;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    char cpage[sizeof(s_merribek_cpage)];
+    snprintf(cpage, sizeof(cpage), "%s", s_merribek_cpage[0] ? s_merribek_cpage : MERRIBEK_CPAGE_FALLBACK);
+    xSemaphoreGive(s_mutex);
+
+    int n = merribek_attempt_fetch(fields, cpage, out, max_out);
+    if (n != -2) {
+        return n;
+    }
+
+    // The server rejected this cpage - it has likely rotated with a new
+    // calendar year. Rediscover it from the calendar page and retry once.
+    ESP_LOGW(TAG, "merri-bek: cpage %s rejected, attempting rediscovery", cpage);
+    // Sized for the compiler's worst case: the encoded address appears twice
+    // (sAddress + address) at up to 255 bytes each, plus every other field.
+    char body[832];
+    char enc_addr[256];
+    url_encode(enc_addr, sizeof(enc_addr), fields[7]);
+    snprintf(body, sizeof(body),
+             "sAddress=%s&address=%s&xPoint=0&yPoint=0&wasteDay=%s&zone=%s"
+             "&wasteRateCode=%s&recycleRateCode=%s&fogoRateCode=%s&glassRateCode=%s"
+             "&glassWeekNumber=%s",
+             enc_addr, enc_addr, fields[4], fields[5], fields[0], fields[1], fields[2], fields[3], fields[6]);
+
+    char fresh[sizeof(s_merribek_cpage)];
+    if (!merribek_discover_cpage(body, fresh, sizeof(fresh)) || strcmp(fresh, cpage) == 0) {
+        return -1;
+    }
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(s_merribek_cpage, sizeof(s_merribek_cpage), "%s", fresh);
+    xSemaphoreGive(s_mutex);
+
+    n = merribek_attempt_fetch(fields, fresh, out, max_out);
+    return (n < 0) ? -1 : n;
 }
 
 static int merribek_search(const char *query, waste_api_search_result_t *out, int max_out)
