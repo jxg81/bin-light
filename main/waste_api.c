@@ -19,41 +19,79 @@ static const char *TAG = "waste_api";
 #define WASTE_API_NVS_KEY        "waste_api_v2"
 #define WASTE_API_STRUCT_VERSION 2
 
+// Cache is a separate blob from the config: it's derived data we can refetch,
+// not user configuration, and mixing them would mean a cache write rewriting
+// the user's settings blob twice a day.
+#define WASTE_API_CACHE_NVS_KEY   "waste_cache_v1"
+#define WASTE_API_CACHE_VERSION   1
+
 #define POLL_INTERVAL_MS      (12UL * 60 * 60 * 1000)  // 12 hours
-#define FRESHNESS_SECONDS     (30UL * 60 * 60)          // 30h: tolerates one missed poll before falling back
-#define EVENTS_LOOKAHEAD_DAYS 13
+// Widened from 13 days: under the sticky-cache model a wider window costs a
+// little bandwidth per poll and buys margin against a council publishing
+// sparsely, whereas a too-narrow window used to translate directly into the
+// light being wrong.
+#define EVENTS_LOOKAHEAD_DAYS 30
 #define EVENTS_BUF_SIZE       4096   // real observed 2-week response was ~700 bytes; generous margin
 #define LOOKUP_BUF_SIZE       16384  // locality/street/property lists can be much larger than an events response
 #define HTTP_TIMEOUT_MS       8000
+#define POLL_MAX_EVENTS       16     // 30-day window across several bin types
 
-typedef enum {
-    CACHE_NEVER_FETCHED = 0,
-    CACHE_HAS_EVENT,
-    CACHE_NO_EVENT,
-} cache_state_t;
-
-// Deliberately not persisted to NVS - the poll task fetches immediately on
-// start (same pattern as schedule_task_fn's first tick), so after a reboot
-// there's only a few seconds where waste_api_get_current() correctly reports
-// UNAVAILABLE and the manual schedule takes over. Not worth the extra
-// versioned-blob complexity to avoid that brief, harmless gap.
+// Persisted to NVS (SPEC.md 3.3). The earlier design deliberately kept this in
+// RAM only, on the grounds that a reboot cost a few harmless seconds of
+// "unknown" before the first poll landed. That's no longer acceptable: the
+// device is now required to *always* know the next collection, and a reboot at
+// the wrong moment (or with no network) would otherwise leave it blank.
 typedef struct {
-    cache_state_t     state;
+    uint8_t           version;
+    bool              has_event;
     uint16_t          event_year;
     uint8_t           event_month;
     uint8_t           event_day;
     schedule_color_t  color;            // primary (earliest) event's colour
     bool              has_secondary;    // a second distinct event shares the same date
     schedule_color_t  secondary_color;
-    bool              waste_dow_known;  // recurring general-waste rule's weekday was parsed this poll
-    uint8_t           waste_weekday;    // 0=Sunday..6=Saturday, valid only if waste_dow_known
-    time_t            fetched_at;
+    bool              waste_dow_known;  // recurring general-waste rule's weekday has been learned
+    uint8_t           waste_weekday;    // tm_wday convention (0=Sunday), valid only if waste_dow_known
 } waste_api_cache_t;
 
 static SemaphoreHandle_t s_mutex;
 static waste_api_config_t s_config;
 static waste_api_cache_t s_cache;
 static TaskHandle_t s_task_handle;
+
+// Whole days from a calendar date to today, both normalised to local noon so a
+// DST transition can't shift the count across a day boundary. Positive when
+// the date is in the past. Mirrors days_between() in schedule.c - duplicated
+// rather than shared, since exporting a date helper from schedule.h just for
+// this would couple the two modules for four lines of arithmetic.
+static long days_since(uint16_t y, uint8_t mo, uint8_t d)
+{
+    struct tm from_tm = {0};
+    from_tm.tm_year = (int)y - 1900;
+    from_tm.tm_mon = (int)mo - 1;
+    from_tm.tm_mday = d;
+    from_tm.tm_hour = 12;
+    from_tm.tm_isdst = -1;
+
+    time_t now = time(NULL);
+    struct tm to_tm;
+    localtime_r(&now, &to_tm);
+    to_tm.tm_hour = 12;
+    to_tm.tm_min = 0;
+    to_tm.tm_sec = 0;
+    to_tm.tm_isdst = -1;
+
+    time_t from_time = mktime(&from_tm);
+    time_t to_time = mktime(&to_tm);
+    if (from_time == (time_t)-1 || to_time == (time_t)-1) {
+        return 0;
+    }
+    // Round to nearest day, not truncate - across a DST change two local noons
+    // are 23 or 25 hours apart, and truncation would call a 23h gap zero days.
+    // Same reasoning as days_between() in schedule.c.
+    long secs = (long)(to_time - from_time);
+    return (secs >= 0) ? (secs + 43200) / 86400 : -((-secs + 43200) / 86400);
+}
 
 // ---------------------------------------------------------------- config --
 
@@ -80,12 +118,55 @@ static esp_err_t persist_config(const waste_api_config_t *cfg)
     return err;
 }
 
+static esp_err_t persist_cache(const waste_api_cache_t *cache)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(WASTE_API_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_blob(handle, WASTE_API_CACHE_NVS_KEY, cache, sizeof(*cache));
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "failed to persist next-collection cache: %s", esp_err_to_name(err));
+    }
+    return err;
+}
+
+static void load_cache(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(WASTE_API_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return;
+    }
+    size_t size = 0;
+    waste_api_cache_t loaded;
+    if (nvs_get_blob(handle, WASTE_API_CACHE_NVS_KEY, NULL, &size) == ESP_OK &&
+        size == sizeof(waste_api_cache_t) &&
+        nvs_get_blob(handle, WASTE_API_CACHE_NVS_KEY, &loaded, &size) == ESP_OK &&
+        loaded.version == WASTE_API_CACHE_VERSION) {
+        s_cache = loaded;
+        ESP_LOGI(TAG, "restored next-collection cache (event=%d %04u-%02u-%02u, waste_dow_known=%d)",
+                 s_cache.has_event, (unsigned)s_cache.event_year, (unsigned)s_cache.event_month,
+                 (unsigned)s_cache.event_day, s_cache.waste_dow_known);
+    } else {
+        s_cache = (waste_api_cache_t){ .version = WASTE_API_CACHE_VERSION };
+    }
+    nvs_close(handle);
+}
+
 esp_err_t waste_api_init(void)
 {
     s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) {
         return ESP_ERR_NO_MEM;
     }
+
+    s_cache = (waste_api_cache_t){ .version = WASTE_API_CACHE_VERSION };
+    load_cache();
 
     nvs_handle_t handle;
     esp_err_t err = nvs_open(WASTE_API_NVS_NAMESPACE, NVS_READWRITE, &handle);
@@ -305,9 +386,18 @@ static int fetch_and_parse_events(const char *subdomain, uint32_t property_id, i
             if (cJSON_IsArray(dow) && cJSON_GetArraySize(dow) > 0) {
                 cJSON *first = cJSON_GetArrayItem(dow, 0);
                 if (cJSON_IsNumber(first)) {
-                    *out_waste_dow_known = true;
-                    if (out_waste_weekday != NULL) {
-                        *out_waste_weekday = (uint8_t)first->valuedouble;
+                    int iso = (int)first->valuedouble;
+                    // The API reports ISO-8601 weekdays (Mon=1..Sun=7); the
+                    // rest of this project uses struct tm's (Sun=0..Sat=6).
+                    // They agree for Mon-Sat and differ *only* on Sunday,
+                    // which is why Maribyrnong's Friday dow:[5] has always
+                    // worked and hid this: a Sunday-collection council would
+                    // have produced an out-of-range weekday of 7.
+                    if (iso >= 1 && iso <= 7) {
+                        *out_waste_dow_known = true;
+                        if (out_waste_weekday != NULL) {
+                            *out_waste_weekday = (uint8_t)(iso == 7 ? 0 : iso);
+                        }
                     }
                 }
             }
@@ -398,42 +488,70 @@ static void do_fetch_events(void)
         return;
     }
 
-    waste_api_event_t events[8];
+    waste_api_event_t events[POLL_MAX_EVENTS];
     bool waste_dow_known = false;
     uint8_t waste_weekday = 0;
     int n = fetch_and_parse_events(cfg.council_subdomain, cfg.property_id, EVENTS_LOOKAHEAD_DAYS,
                                     events, sizeof(events) / sizeof(events[0]),
                                     &waste_dow_known, &waste_weekday);
     if (n < 0) {
-        return; // cache is left as-is; the freshness check in waste_api_get_current() ages it out
+        // Network/parse failure. Leave the cache entirely alone - a failed
+        // poll is not evidence that the collection we already know about
+        // isn't happening.
+        ESP_LOGW(TAG, "poll failed, keeping existing cache");
+        return;
     }
     n = apply_type_rules(&cfg, events, n);
 
+    // Drop anything already in the past, so a stale-but-still-listed event
+    // can't be picked as "next". events[] is sorted ascending.
+    int first = 0;
+    while (first < n && days_since(events[first].year, events[first].month, events[first].day) > 0) {
+        first++;
+    }
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
-    if (n > 0) {
-        s_cache.state = CACHE_HAS_EVENT;
-        s_cache.event_year = events[0].year;
-        s_cache.event_month = events[0].month;
-        s_cache.event_day = events[0].day;
-        s_cache.color = events[0].color;
+    bool changed = false;
+    if (first < n) {
+        // A qualifying event is authoritative: always overwrite.
+        s_cache.has_event = true;
+        s_cache.event_year = events[first].year;
+        s_cache.event_month = events[first].month;
+        s_cache.event_day = events[first].day;
+        s_cache.color = events[first].color;
         // A second distinct type sharing the same earliest date (e.g.
         // recycling AND glass together) - see SPEC.md 3.7. events[] is
-        // sorted by date, so only index 1 can possibly tie with index 0.
-        s_cache.has_secondary = (n > 1 && events[1].year == events[0].year &&
-                                  events[1].month == events[0].month && events[1].day == events[0].day);
+        // sorted by date, so only the next index can tie with this one.
+        s_cache.has_secondary = (first + 1 < n &&
+                                  events[first + 1].year == events[first].year &&
+                                  events[first + 1].month == events[first].month &&
+                                  events[first + 1].day == events[first].day);
         if (s_cache.has_secondary) {
-            s_cache.secondary_color = events[1].color;
+            s_cache.secondary_color = events[first + 1].color;
         }
-    } else {
-        s_cache.state = CACHE_NO_EVENT;
-        s_cache.has_secondary = false;
+        changed = true;
     }
-    s_cache.waste_dow_known = waste_dow_known;
-    s_cache.waste_weekday = waste_weekday;
-    s_cache.fetched_at = time(NULL);
+    // Note the absent `else`: a poll that found nothing does NOT clear the
+    // cache. Staleness is decided by the cached date passing (see
+    // waste_api_get_next_event), not by any given poll coming up empty.
+
+    // The recurring waste weekday is a separate signal with no expiry - only
+    // ever updated when a poll actually learns one, never cleared by one that
+    // didn't happen to see the recurring rule entry.
+    if (waste_dow_known && (!s_cache.waste_dow_known || s_cache.waste_weekday != waste_weekday)) {
+        s_cache.waste_dow_known = true;
+        s_cache.waste_weekday = waste_weekday;
+        changed = true;
+    }
+    waste_api_cache_t to_persist = s_cache;
     xSemaphoreGive(s_mutex);
 
-    ESP_LOGI(TAG, "fetch complete: %s", n > 0 ? "event found" : "no qualifying event in window");
+    if (changed) {
+        persist_cache(&to_persist);
+    }
+
+    ESP_LOGI(TAG, "poll complete: %d event(s) in window, next=%s", n,
+             to_persist.has_event ? "known" : "unknown");
 }
 
 int waste_api_fetch_upcoming(const char *subdomain, uint32_t property_id,
@@ -442,42 +560,33 @@ int waste_api_fetch_upcoming(const char *subdomain, uint32_t property_id,
     return fetch_and_parse_events(subdomain, property_id, lookahead_days, out, max_out, NULL, NULL);
 }
 
-waste_api_result_t waste_api_get_current(waste_api_slot_t *out_primary, waste_api_slot_t *out_secondary,
-                                          uint16_t *out_year, uint8_t *out_month, uint8_t *out_day)
+bool waste_api_get_next_event(waste_api_next_event_t *out)
 {
-    if (out_primary) *out_primary = (waste_api_slot_t){0};
-    if (out_secondary) *out_secondary = (waste_api_slot_t){0};
-
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool enabled = s_config.enabled;
     waste_api_cache_t cache = s_cache;
     xSemaphoreGive(s_mutex);
 
-    if (!enabled || cache.state == CACHE_NEVER_FETCHED) {
-        return WASTE_API_RESULT_UNAVAILABLE;
+    if (!enabled || !cache.has_event) {
+        return false;
+    }
+    // The one and only staleness rule: has the collection date itself passed?
+    // Note `> 0`, not `>= 0` - on the collection day the light's window may
+    // still be wrapping past midnight from the night before, so the date stays
+    // valid through its own day.
+    if (days_since(cache.event_year, cache.event_month, cache.event_day) > 0) {
+        return false;
     }
 
-    time_t age = time(NULL) - cache.fetched_at;
-    if (age < 0 || age > (time_t)FRESHNESS_SECONDS) {
-        return WASTE_API_RESULT_UNAVAILABLE;
+    if (out != NULL) {
+        out->year = cache.event_year;
+        out->month = cache.event_month;
+        out->day = cache.event_day;
+        out->color = cache.color;
+        out->has_secondary = cache.has_secondary;
+        out->secondary_color = cache.secondary_color;
     }
-
-    if (cache.state == CACHE_NO_EVENT) {
-        return WASTE_API_RESULT_NO_EVENT;
-    }
-
-    if (out_primary) {
-        out_primary->due = true;
-        out_primary->color = cache.color;
-    }
-    if (out_secondary && cache.has_secondary) {
-        out_secondary->due = true;
-        out_secondary->color = cache.secondary_color;
-    }
-    if (out_year) *out_year = cache.event_year;
-    if (out_month) *out_month = cache.event_month;
-    if (out_day) *out_day = cache.event_day;
-    return WASTE_API_RESULT_EVENT;
+    return true;
 }
 
 bool waste_api_get_waste_weekday(uint8_t *out_wday)
@@ -488,10 +597,6 @@ bool waste_api_get_waste_weekday(uint8_t *out_wday)
     xSemaphoreGive(s_mutex);
 
     if (!enabled || !cache.waste_dow_known) {
-        return false;
-    }
-    time_t age = time(NULL) - cache.fetched_at;
-    if (age < 0 || age > (time_t)FRESHNESS_SECONDS) {
         return false;
     }
     if (out_wday) *out_wday = cache.waste_weekday;

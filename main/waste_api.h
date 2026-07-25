@@ -50,32 +50,46 @@ esp_err_t waste_api_task_start(void);
 // e.g. right after the property is (re)configured.
 void waste_api_task_force_check(void);
 
-typedef enum {
-    WASTE_API_RESULT_UNAVAILABLE,  // disabled, never fetched, or the cache is stale -> caller should fall back
-    WASTE_API_RESULT_NO_EVENT,     // fetched fresh & reachable, nothing due -> caller should show nothing
-    WASTE_API_RESULT_EVENT,        // fetched fresh & reachable, an event was found -> caller uses date+colour
-} waste_api_result_t;
-
+// The next known dated collection, from the sticky cache (SPEC.md 3.3).
+// `year/month/day` is the day the bins are *collected*; bin night is the
+// evening before. has_secondary is true only when a second distinct event
+// (e.g. recycling AND glass) shares that same date - see SPEC.md 3.7.
 typedef struct {
-    bool              due;    // false if this slot has no event (e.g. only one qualifying event today)
-    schedule_color_t  color;  // valid only when due
-} waste_api_slot_t;
+    uint16_t          year;
+    uint8_t           month;
+    uint8_t           day;
+    schedule_color_t  color;
+    bool              has_secondary;
+    schedule_color_t  secondary_color;
+} waste_api_next_event_t;
 
-// The API's own colour choice(s) for the earliest qualifying date, and that
-// date (bin night is the evening before it). out_primary is populated only
-// when the return value is WASTE_API_RESULT_EVENT; out_secondary->due is only
-// true when a second distinct event (e.g. recycling AND glass) shares that
-// same date - see SPEC.md 3.7. Pointers may be NULL.
-waste_api_result_t waste_api_get_current(waste_api_slot_t *out_primary, waste_api_slot_t *out_secondary,
-                                          uint16_t *out_year, uint8_t *out_month, uint8_t *out_day);
+// The next known dated collection, or false if there isn't one.
+//
+// "Sticky": a poll that finds a qualifying event overwrites the cache, but a
+// poll that finds *nothing* (or fails outright) leaves it alone rather than
+// regressing to "unknown". The only thing that invalidates a cached date is
+// **the date itself passing** - there is no freshness timer. A network hiccup
+// or a lookahead window that briefly didn't reach far enough can no longer
+// discard a perfectly good future date, which is exactly how the light used
+// to go dark on a night it should have been lit.
+//
+// Returns false only when the API is disabled, nothing has ever been cached,
+// or the cached collection date is now in the past. The cache survives reboots
+// (persisted to NVS), so this is not false merely because we haven't polled
+// yet this boot.
+bool waste_api_get_next_event(waste_api_next_event_t *out);
 
-// True if the recurring general-waste collection weekday is known (parsed
-// from the events array's recurring rule entry on the most recent fresh
-// poll), writing it to *out_wday (0=Sunday..6=Saturday, struct tm.tm_wday
-// convention). False if the API is disabled/stale, or this council's data
-// never carried an evaluable weekly rule. Used in dual-colour light mode so
-// LED2 can show the general-waste reminder even in weeks with no other event
-// (see SPEC.md 3.7); single-colour mode never needs this.
+// The recurring general-waste collection weekday, in `struct tm.tm_wday`
+// convention (0=Sunday..6=Saturday) - note the API reports this in ISO-8601
+// (Mon=1..Sun=7); the conversion happens on the way in, so callers never see
+// the ISO form. Writes to *out_wday and returns true when known.
+//
+// Deliberately a *separate, independent* signal from waste_api_get_next_event()
+// rather than part of the same cache entry: a weekly recurrence doesn't expire
+// the way a specific dated event does, so it is never aged out - once learned,
+// it stays until a later poll reports a different one. Used so a plain
+// general-waste night can still be identified in weeks with no other event
+// (see SPEC.md 3.7).
 bool waste_api_get_waste_weekday(uint8_t *out_wday);
 
 // --- Address lookup, for the setup UI. Explicit subdomain param (not the

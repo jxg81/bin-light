@@ -280,7 +280,7 @@ then every field/endpoint was re-verified against live `curl` responses before
 locking in the design — the frontend bundle reading alone had gotten the
 `start`/`start_date` distinction and the per-event `color` field wrong initially.)*
 
-**Next-collection model, redesigned (planned, not yet implemented)** — found
+**Next-collection model, redesigned (implemented)** — found
 during real-hardware testing of §3.8's Test button: the old design (a poll
 cache that goes to `NO_EVENT`/`UNAVAILABLE` whenever a given poll's fixed
 13-day window or 30h freshness timer didn't happen to line up) could report
@@ -339,6 +339,81 @@ Resolved design:
   unchanged) — replacing the previous separate EVENT/NO_EVENT/UNAVAILABLE
   branches with one shared code path that "Display Next Collection" also
   uses, so they can no longer drift apart the way they just did.
+
+**As built** — the design above landed essentially as written, with these
+clarifications and corrections found while implementing and testing it:
+
+- **Naming**: the two replacement getters are `waste_api_get_next_event()`
+  (returning a `waste_api_next_event_t`) and `waste_api_get_waste_weekday()`
+  (kept, not renamed to `..._next_waste_date` — it returns a weekday, and
+  turning that into a date is the resolver's job, not the API layer's).
+  `waste_api_result_t` / `waste_api_slot_t` / `waste_api_get_current()` are
+  gone.
+- **`schedule_next_t` carries a `waste_only` flag.** The resolver returns the
+  *nearest* occasion, and whether the light should actually turn on for it is
+  the caller's decision, not the resolver's: general waste is weekly and needs
+  no reminder of its own, so the live evaluator lights a waste-only night in
+  dual-colour mode only (where LED2 *is* the general-waste indicator), while
+  "Display Next Collection" shows it regardless — it answers "what's next?",
+  not "should the light be on?". Keeping this one flag out of the resolver's
+  own logic is what lets a single code path serve both callers without
+  reintroducing mode-dependence inside it.
+- **Everything is now keyed on the collection date**, including the manual
+  schedule (whose `bin_night_weekday` is converted to a collection weekday by
+  adding a day) and the API's recurring waste weekday. That's what allows
+  `is_window_active_for_date()` to be the *only* window check left — the
+  weekday-keyed `is_window_active()` / `is_window_active_for_weekday()` pair
+  is deleted. It also fixed two off-by-ones, below.
+- **Off-by-one #1, fixed: the recurring waste weekday was treated as bin
+  night.** The API reports it the same way it reports dated events — as the
+  *collection* day — so lighting up on that weekday's evening was a day late.
+  Now its eve is used, consistently with dated events.
+- **Off-by-one #2, fixed: a manual rule never fired on its own first
+  collection.** `rule_due()` was evaluated against bin night while the UI
+  field is labelled "First collection", so entering the collection date made
+  `days_between()` return −1 on that first occurrence and the rule was skipped
+  until the following cycle. Rules are now evaluated against the collection
+  date, matching the label.
+- **ISO vs `tm_wday`, fixed**: the API's `dow` is ISO-8601 (Mon=1..Sun=7),
+  converted on the way in so callers only ever see `tm_wday` (Sun=0..Sat=6).
+  These agree for Mon–Sat and differ only on Sunday, which is why
+  Maribyrnong's Friday `dow:[5]` always worked and hid it; a Sunday-collection
+  council would have produced an out-of-range 7.
+- **`days_to_next_collection()`** handles the one genuinely subtle case: when
+  *today* is a collection day, its window opened last night, so it is either
+  still running (a window that wraps past midnight) or already over. While
+  running, today is still the right answer; once it closes, the answer must
+  roll to next week rather than stranding on a date that's been and gone.
+- **Lookahead widened 13 → 30 days** and the poll event buffer 8 → 16, per the
+  design note above.
+
+**DST day-counting bug, found by the host tests and fixed** — this one
+predates the rework and would have misfired twice a year. `days_between()`
+normalises both dates to local noon so a DST change can't flip the calendar
+date, but the two noons are then **23 or 25 hours apart**, not 24 — and C's
+integer division truncates *toward zero*, so a −23h gap came out as `0` days
+instead of `−1`. Concretely: for a collection falling on the DST-start Sunday
+(first Sunday of October in Melbourne), `day_diff` on the Saturday evening
+evaluated to 0 instead of −1, so `is_window_active_for_date()` returned false
+and **the light simply never came on that night**. Fixed by rounding to the
+nearest day (`(secs ± 43200) / 86400`, with the sign handled explicitly since
+truncation is asymmetric for negatives) in both `schedule.c` and
+`waste_api.c`. Pinned by the `DST boundaries (Melbourne)` cases in
+[test/host/test_resolver.c](test/host/test_resolver.c) — it is not reachable
+by inspection or by testing on any ordinary date, which is precisely why it
+survived this long.
+
+**Host tests** ([test/host/](test/host/)) — added with this rework, since it is
+almost entirely date arithmetic and the failure mode is a light that is silently
+wrong on one night months from now. `test/host/run.sh` needs no ESP-IDF, no
+device and no toolchain setup, just `cc`: it compiles the **real** `schedule.c`
+against thin stubs, with `time(NULL)` redirected to a settable fake clock via a
+macro installed before the include, and drives 28 assertions over concrete
+dates — weekday wraparound, the past-midnight window, staleness, the
+event-vs-waste tie-break, the manual fallback's cycles, and both DST
+boundaries. `./run.sh render` additionally dumps the home page's real bytes
+(see §3.11). Two real bugs were caught by writing these, one of them the DST
+bug above.
 
 **TLS trust bug hit during bring-up, fixed** — connecting to
 `*.waste-info.com.au` failed with `esp-x509-crt-bundle: No matching trusted
@@ -1526,6 +1601,8 @@ three different things that are easy to conflate.
 | Warmer yellow `(255,150,0)` (§2) | ✅ | ✅ | ⚠️ red/green/purple good; yellow deferred (§5) |
 | §3.11 Preferences UI reorganisation | ✅ | ❌ **not yet flashed** | ❌ |
 | §3.8 button rename + 30s duration | ✅ | ❌ **not yet flashed** | ❌ |
+| §3.3 next-collection rework (sticky cache, unified resolver) | ✅ | ❌ **not yet flashed** | ⚠️ 28 host tests pass; no device time |
+| DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP | ❌ not written | — | — |
 | §3.13 additional council backends | ❌ not written (research complete) | — | — |
@@ -1643,29 +1720,48 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: flash and check the §3.11 UI, then §3.3
+### ▶ Agreed next step: flash and verify, then the council backends
 
-§3.11 is **done in code** (all three parts: the Preferences section, the
-"Manual / Fallback Schedule" rename, and the CSS-only collapsible sections),
-plus §3.8's rename and 30-second duration. See §3.11's "Implementation notes"
-for the three non-obvious things that came out of it.
+**Two substantial changes are written and unflashed**, so the device is well
+behind the tree:
 
-**Next action is a flash and a look at the page**, which conveniently also
-settles the two long-standing unverified items above (LED2 independently, and
-the boot self-test) in the same boot.
+1. **§3.11 UI** — Preferences section, "Manual / Fallback Schedule" rename,
+   CSS-only collapsible sections, plus §3.8's rename and 30-second duration.
+2. **§3.3 next-collection rework** — sticky NVS-persisted cache, staleness by
+   date rather than by timer, and one unified `schedule_get_next_collection()`
+   resolver shared by the live evaluator and the Display button. Three
+   off-by-ones and a DST day-counting bug were fixed along the way; 28 host
+   tests pass (`./test/host/run.sh`) but none of it has run on hardware.
+
+**Next action is a flash and a verification pass**, which also settles the two
+long-standing unverified items above (LED2 independently, and the boot
+self-test) in the same boot.
 
 Worth a specific eye on, since none of it has run on the device:
-- The two sections expand/collapse from their own checkbox only.
+- The two UI sections expand/collapse from their own checkbox only.
 - Saving with a section **collapsed** does not wipe that section's stored
   values (it shouldn't — hidden fields still submit — but this is the one
   failure mode that would silently destroy config).
 - "Save mapping" still posts to `/api-test` and returns to `/`, now that its
   controls sit inside the `/save` form's DOM via `form='mapform'`.
 - No `web_server: home page truncated` error in the serial log.
+- **The first poll after flashing**: expect a `waste_api: poll complete: N
+  event(s) in window, next=known` line, then a `restored next-collection
+  cache` line on the *following* boot — that pair is the whole point of the
+  sticky-cache change and is the one thing host tests can't prove.
+- **"Display Next Collection" should now always do something** once anything
+  is configured. If it no-ops, the log says why
+  (`display-next requested but the next collection is unknown`).
+- Note the manual schedule's "First collection" dates now behave as labelled
+  (see §3.3 "off-by-one #2") — any existing manual rule will fire one cycle
+  earlier than it used to. Worth re-checking those dates if the manual
+  fallback is in use.
 
-After that, the ordering remains as §3.13 sets out: §3.3 rework → backend
-abstraction (Knox first) → Whitehorse → Merri-bek → Monash → LGA dropdown →
-Impact Apps list → South Australia.
+After that, the ordering remains as §3.13 sets out: backend abstraction (Knox
+first) → Whitehorse → Merri-bek → Monash → LGA dropdown → Impact Apps list →
+South Australia. The §3.3 rework that used to head this list is done, and it
+was the prerequisite: the backends now only have to fill the sticky cache, not
+reimplement any resolution logic.
 
 ### Open questions not yet resolved
 
@@ -1822,6 +1918,52 @@ flash-and-observe or a live diagnostic to catch.
     Design note: "off" is expressed by the schedule not being due, never by a
     zero multiplier — which is why a floor costs nothing and removes a whole
     class of "is it broken or just dark?" confusion.
+
+17. **DST day-counting: the light would have failed to come on twice a year.**
+    `days_between()` normalises both dates to local noon so a daylight-saving
+    change can't flip the calendar date — but the two noons are then 23 or 25
+    hours apart, not 24, and C's integer division truncates *toward zero*. A
+    −23h gap therefore evaluated to `0` days instead of `−1`. Concretely: for
+    a collection on the DST-start Sunday (first Sunday of October in
+    Melbourne), `day_diff` on the Saturday evening came out 0 rather than −1,
+    `is_window_active_for_date()` returned false, and the light stayed dark on
+    a night it should have been lit. The mirror case exists at the April
+    transition.
+
+    Predates the §3.3 rework — it was latent in the original date maths.
+    **Found by writing the host tests, not by inspection**: it is unreachable
+    on any ordinary date, and the noon-normalisation comment actively suggests
+    the case is already handled (it handles the date flipping, just not the
+    residual hour). Fixed by rounding to the nearest day rather than
+    truncating — `(secs + 43200) / 86400`, with the negative branch written
+    explicitly as `-((-secs + 43200) / 86400)` since truncation is asymmetric
+    across zero — in both `schedule.c` and `waste_api.c`.
+
+    Pinned by the `DST boundaries (Melbourne)` cases in
+    [test/host/test_resolver.c](test/host/test_resolver.c). Note the next real
+    opportunity to observe this on hardware is October 2026, which is exactly
+    why it is tested rather than trusted.
+
+18. **The recurring general-waste weekday was treated as bin night** (§3.3).
+    The API reports it the same way it reports dated events — as the
+    *collection* day — so the light came on a day late on plain waste weeks in
+    dual-colour mode. Fixed by the unified resolver, which converts every
+    source to a collection date and takes its eve.
+
+19. **A manual colour rule never fired on its own first collection** (§3.6).
+    `rule_due()` compared against bin night while the UI field is labelled
+    "First collection", so entering the collection date made `days_between()`
+    return −1 on the first occurrence and the rule was skipped until the
+    following cycle — it then worked correctly forever after, which is why it
+    went unnoticed. Fixed by evaluating rules against the collection date.
+    Note this changes when existing configured rules fire.
+
+20. **ISO-8601 vs `struct tm` weekday** (§3.3). The API's `dow` is
+    Mon=1..Sun=7; `tm_wday` is Sun=0..Sat=6. The parsed value was used
+    directly as a `tm_wday`. These agree for Mon–Sat and differ only on
+    Sunday, so Maribyrnong's Friday `dow:[5]` masked it completely — a
+    Sunday-collection council would have produced an out-of-range 7. Converted
+    at the parse site so no caller ever sees the ISO form.
 
 **Breaking NVS schema changes** (not bugs, but worth tracking since each one
 resets user-configured state on first boot after flashing): `schedule_t` went

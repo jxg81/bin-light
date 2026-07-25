@@ -70,22 +70,43 @@ esp_err_t schedule_task_start(void);
 void schedule_task_force_check(void);
 
 typedef struct {
-    bool              has_primary;
+    bool              known;
+    uint16_t          year;       // the day the bins are COLLECTED; bin night is the evening before
+    uint8_t           month;
+    uint8_t           day;
     schedule_color_t  primary;
-    bool              has_secondary;
-    schedule_color_t  secondary;
-} schedule_preview_t;
+    schedule_color_t  secondary;  // dual-colour mode only; equals primary when nothing distinguishes them
+    // True when nothing rotating is due and this is a plain general-waste
+    // collection. General waste is weekly and needs no reminder of its own, so
+    // the live evaluator lights these nights only in dual-colour mode (where
+    // LED2 *is* the general-waste indicator) - but "Display Next Collection"
+    // shows them regardless, since it answers "what's next?", not "should the
+    // light be on?".
+    bool              waste_only;
+} schedule_next_t;
 
-// Computes what the light would show at the next occasion it would actually
-// turn on - the next upcoming API event if the API is enabled and reachable,
-// else the next upcoming bin-night's due colour(s) from the manual schedule.
-// Read-only: does not touch persisted or in-RAM schedule state. Used by the
-// web UI's "Test" button (SPEC.md 3.8).
-schedule_preview_t schedule_preview_next(void);
+// The single resolver for "what is the next collection, and what colour(s)
+// does it show" - used by both the live evaluator and the "Display Next
+// Collection" button (SPEC.md 3.3/3.8) so the two can't drift apart, which is
+// exactly how they broke once before.
+//
+// Resolution order:
+//   1. The API's next known dated event (sticky cache, not stale).
+//   2. The next plain general-waste date, from the API's recurring weekday.
+//      Whichever of (1)/(2) is sooner wins; on a tie (1) wins, being the more
+//      specific answer.
+//   3. Otherwise the manual / fallback schedule's next bin night, if enabled.
+//   4. Otherwise genuinely unknown (`known == false`) - the *only* acceptable
+//      unknown state, reached only when the API is stale/disabled AND the
+//      manual fallback is disabled too.
+//
+// Read-only: touches no persisted or in-RAM state. Returns known == false if
+// the clock hasn't synced yet, since every branch needs today's date.
+schedule_next_t schedule_get_next_collection(void);
 
-// Lights both LEDs per schedule_preview_next(), respecting light_mode, for a
-// fixed 2-minute preview, then hands control back to the real evaluator via
-// schedule_task_force_check(). Safe to call again while a preview is already
-// running - restarts the 2-minute timer with a fresh preview. No-op if
-// nothing is currently due to preview.
+// Lights both LEDs with schedule_get_next_collection()'s colours, respecting
+// light_mode, for a fixed 30 seconds, then hands control back to the real
+// evaluator via schedule_task_force_check(). Safe to call again while a
+// preview is already running - restarts the timer with a fresh result. No-op
+// only when the next collection is genuinely unknown.
 void schedule_test_trigger(void);

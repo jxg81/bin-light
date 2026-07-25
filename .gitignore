@@ -79,3 +79,6 @@ Desktop.ini
 
 # Claude Code local (machine-specific) settings
 .claude/settings.local.json
+
+# Host test build output
+test/host/out/

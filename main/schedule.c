@@ -158,33 +158,9 @@ esp_err_t schedule_set(const schedule_t *new_schedule)
     return persist_schedule(&to_store);
 }
 
-// True if the on-window is active right now, given today's weekday and
-// minute-of-day, anchored on an explicit target weekday: it turns on at
-// start_minute that evening and stays on for duration_hours, which may carry
-// past midnight into the following day.
-static bool is_window_active_for_weekday(const schedule_t *s, int target_weekday, int wday, int minute_of_day)
-{
-    int end_minute = (int)s->start_minute + (int)s->duration_hours * 60; // may exceed 1440
-    int day_after = (target_weekday + 1) % 7;
-
-    if (wday == target_weekday) {
-        if (end_minute <= 1440) {
-            return minute_of_day >= s->start_minute && minute_of_day < end_minute;
-        }
-        return minute_of_day >= s->start_minute;
-    }
-    if (wday == day_after && end_minute > 1440) {
-        return minute_of_day < (end_minute - 1440);
-    }
-    return false;
-}
-
-// Same as is_window_active_for_weekday(), anchored on the manual schedule's
-// configured bin_night_weekday.
-static bool is_window_active(const schedule_t *s, int wday, int minute_of_day)
-{
-    return is_window_active_for_weekday(s, s->bin_night_weekday, wday, minute_of_day);
-}
+// (The old weekday-keyed window checks lived here. Both paths now resolve to a
+// concrete collection date first - see schedule_get_next_collection() - so
+// is_window_active_for_date() below is the only window check left.)
 
 // Whole days between two noon-normalized calendar dates via mktime(), so DST
 // transitions can't shift the count by an hour across a day boundary.
@@ -207,7 +183,17 @@ static long days_between(int from_year, int from_month, int from_day, struct tm 
     if (from_time == (time_t)-1 || to_time == (time_t)-1) {
         return 0;
     }
-    return (long)((to_time - from_time) / 86400);
+
+    // Round to the nearest whole day rather than dividing. Normalising both
+    // ends to local noon keeps the *date* from flipping, but it does not make
+    // the gap an exact multiple of 86400: across a DST change the two noons
+    // are 23 or 25 hours apart. C's integer division truncates toward zero, so
+    // a -23h gap would come out as 0 days instead of -1 - i.e. on the eve of a
+    // collection that falls on the DST-start Sunday, the light would not come
+    // on. Adding half a day before dividing (with the sign handled explicitly,
+    // since truncation is asymmetric for negatives) absorbs that +/-1h.
+    long secs = (long)(to_time - from_time);
+    return (secs >= 0) ? (secs + 43200) / 86400 : -((-secs + 43200) / 86400);
 }
 
 // True if this rule's colour applies during the calendar week containing
@@ -263,10 +249,10 @@ static struct tm date_plus_days(struct tm tm_now, int days)
     return result;
 }
 
-// Like is_window_active(), but anchored on a specific calendar date (from the
-// external API) instead of a repeating weekday. Bin night is the evening
-// before event_date; the window may still wrap past midnight into event_date
-// itself, same as the weekday-keyed version.
+// True if the light's on-window is active right now for a collection falling
+// on the given date. Bin night is the evening *before* event_date: the light
+// turns on at start_minute that evening and stays on for duration_hours, which
+// may wrap past midnight into event_date itself.
 static bool is_window_active_for_date(const schedule_t *s, uint16_t event_year, uint8_t event_month, uint8_t event_day,
                                        struct tm tm_now, int minute_of_day)
 {
@@ -285,6 +271,122 @@ static bool is_window_active_for_date(const schedule_t *s, uint16_t event_year, 
     return false;
 }
 
+// Days from today to the next occurrence of target_wday as a collection day
+// (0..7). The only subtle case is off == 0, i.e. today *is* a collection day:
+// its window opened last night, so it is either still running (when the window
+// wraps past midnight) or already finished. While it's still running today is
+// genuinely the current answer; once it closes, the honest answer is next
+// week's, so this returns 7 rather than pointing at a collection that's been
+// and gone. Getting this wrong strands the answer on a past date for a whole
+// week, which is what the host test "once closed, it rolls to next week"
+// pins down.
+static int days_to_next_collection(const schedule_t *s, int today_wday, int target_wday, int minute_of_day)
+{
+    int off = (target_wday - today_wday + 7) % 7;
+    if (off == 0) {
+        int end_minute = (int)s->start_minute + (int)s->duration_hours * 60;
+        bool wrap_still_open = (end_minute > 1440) && (minute_of_day < end_minute - 1440);
+        if (!wrap_still_open) {
+            return 7;
+        }
+    }
+    return off;
+}
+
+schedule_next_t schedule_get_next_collection(void)
+{
+    schedule_next_t result = {0};
+
+    // Every branch below needs today's date to answer "next".
+    if (!time_sync_is_valid()) {
+        return result;
+    }
+
+    schedule_t s = schedule_get();
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    int minute_of_day = tm_now.tm_hour * 60 + tm_now.tm_min;
+
+    // (1) The API's next known dated event.
+    waste_api_next_event_t ev;
+    bool have_event = waste_api_get_next_event(&ev);
+
+    // (2) The next plain general-waste collection, from the recurring weekday.
+    // Note this weekday is the *collection* day, exactly like a dated event's
+    // date - bin night is its eve in both cases. Treating it as bin night (as
+    // the old evaluator did) lit the light a day late.
+    uint8_t waste_wday = 0;
+    struct tm waste_tm = tm_now;
+    bool have_waste = waste_api_get_waste_weekday(&waste_wday);
+    if (have_waste) {
+        waste_tm = date_plus_days(tm_now, days_to_next_collection(&s, tm_now.tm_wday, waste_wday, minute_of_day));
+    }
+
+    if (have_event || have_waste) {
+        bool use_event = have_event;
+        if (have_event && have_waste) {
+            // days_between(date, today) is today-minus-date, so the *smaller*
+            // value is the later date. Negate to get "days from today", where
+            // smaller means sooner. Ties go to the dated event: it's the more
+            // specific answer, and it carries a real colour.
+            long ev_days = -days_between(ev.year, ev.month, ev.day, tm_now);
+            long waste_days = -days_between(waste_tm.tm_year + 1900, waste_tm.tm_mon + 1, waste_tm.tm_mday, tm_now);
+            use_event = (ev_days <= waste_days);
+        }
+
+        result.known = true;
+        if (use_event) {
+            result.year = ev.year;
+            result.month = ev.month;
+            result.day = ev.day;
+            result.primary = ev.color;
+            result.secondary = ev.has_secondary ? ev.secondary_color : s.secondary_default_color;
+            result.waste_only = false;
+        } else {
+            result.year = (uint16_t)(waste_tm.tm_year + 1900);
+            result.month = (uint8_t)(waste_tm.tm_mon + 1);
+            result.day = (uint8_t)waste_tm.tm_mday;
+            result.primary = s.secondary_default_color;
+            result.secondary = s.secondary_default_color;
+            result.waste_only = true;
+        }
+        return result;
+    }
+
+    // (3) Manual / fallback schedule. bin_night_weekday is the night the bins
+    // go out, so the collection is the following day - converting here is what
+    // lets one date-keyed window check serve both this and the API paths.
+    if (s.enabled) {
+        int collection_wday = (s.bin_night_weekday + 1) % 7;
+        struct tm coll = date_plus_days(tm_now,
+            days_to_next_collection(&s, tm_now.tm_wday, collection_wday, minute_of_day));
+
+        const schedule_color_rule_t *due_primary = NULL;
+        const schedule_color_rule_t *due_secondary = NULL;
+        find_due_rules(&s, coll, &due_primary, &due_secondary);
+
+        result.known = true;
+        result.year = (uint16_t)(coll.tm_year + 1900);
+        result.month = (uint8_t)(coll.tm_mon + 1);
+        result.day = (uint8_t)coll.tm_mday;
+        if (due_primary != NULL) {
+            result.primary = due_primary->color;
+            result.secondary = (due_secondary != NULL) ? due_secondary->color : s.secondary_default_color;
+            result.waste_only = false;
+        } else {
+            result.primary = s.secondary_default_color;
+            result.secondary = s.secondary_default_color;
+            result.waste_only = true;
+        }
+        return result;
+    }
+
+    // (4) API stale/disabled and the manual fallback switched off: the one
+    // genuinely-unknown case.
+    return result;
+}
+
 static void schedule_task_fn(void *arg)
 {
     for (;;) {
@@ -296,62 +398,20 @@ static void schedule_task_fn(void *arg)
 
             schedule_t snapshot = schedule_get();
             bool dual = (snapshot.light_mode == LIGHT_MODE_DUAL_COLOUR);
+            schedule_next_t next = schedule_get_next_collection();
 
-            waste_api_slot_t api_primary, api_secondary;
-            uint16_t event_year;
-            uint8_t event_month, event_day;
-            waste_api_result_t api_result =
-                waste_api_get_current(&api_primary, &api_secondary, &event_year, &event_month, &event_day);
-
-            bool light_on = false;
-            schedule_color_t primary_color = {0};
-            schedule_color_t secondary_color = {0};
-
-            if (api_result == WASTE_API_RESULT_EVENT) {
-                if (is_window_active_for_date(&snapshot, event_year, event_month, event_day, tm_now, minute_of_day)) {
-                    light_on = true;
-                    primary_color = api_primary.color;
-                    secondary_color = api_secondary.due ? api_secondary.color : snapshot.secondary_default_color;
-                }
-            } else if (api_result == WASTE_API_RESULT_NO_EVENT) {
-                // API is reachable and authoritative for "other" events: no
-                // rotating item is due. In dual-colour mode a plain
-                // general-waste night still lights both LEDs as a reminder,
-                // using the recurring waste rule's own weekday (independent
-                // of the polled "other events" cache) - see SPEC.md 3.7.
-                uint8_t waste_wday;
-                if (dual && waste_api_get_waste_weekday(&waste_wday) &&
-                    is_window_active_for_weekday(&snapshot, waste_wday, tm_now.tm_wday, minute_of_day)) {
-                    light_on = true;
-                    primary_color = snapshot.secondary_default_color;
-                    secondary_color = snapshot.secondary_default_color;
-                }
-            } else { // WASTE_API_RESULT_UNAVAILABLE: fall back to the manual schedule
-                if (snapshot.enabled && is_window_active(&snapshot, tm_now.tm_wday, minute_of_day)) {
-                    const schedule_color_rule_t *due_primary = NULL;
-                    const schedule_color_rule_t *due_secondary = NULL;
-                    find_due_rules(&snapshot, tm_now, &due_primary, &due_secondary);
-
-                    if (due_primary != NULL) {
-                        light_on = true;
-                        primary_color = due_primary->color;
-                        secondary_color = (due_secondary != NULL) ? due_secondary->color : snapshot.secondary_default_color;
-                    } else if (dual) {
-                        // Nothing rotating due, but it's still bin night for
-                        // general waste in dual-colour mode - the light turns
-                        // on every bin night when dual, unlike single mode.
-                        light_on = true;
-                        primary_color = snapshot.secondary_default_color;
-                        secondary_color = snapshot.secondary_default_color;
-                    }
-                }
-            }
-
-            led_color_t primary_led = (led_color_t){primary_color.r, primary_color.g, primary_color.b};
-            led_color_t secondary_led = dual ? (led_color_t){secondary_color.r, secondary_color.g, secondary_color.b}
-                                              : primary_led;
+            // General waste is weekly and needs no reminder of its own, so a
+            // waste-only night lights up in dual-colour mode only, where LED2
+            // *is* the general-waste indicator (SPEC.md 3.7).
+            bool worth_lighting = next.known && !(next.waste_only && !dual);
+            bool light_on = worth_lighting &&
+                is_window_active_for_date(&snapshot, next.year, next.month, next.day, tm_now, minute_of_day);
 
             if (light_on) {
+                led_color_t primary_led = {next.primary.r, next.primary.g, next.primary.b};
+                led_color_t secondary_led = dual
+                    ? (led_color_t){next.secondary.r, next.secondary.g, next.secondary.b}
+                    : primary_led;
                 led_state_set_dual(primary_led, secondary_led, snapshot.brightness);
             } else {
                 led_state_off();
@@ -375,80 +435,6 @@ void schedule_task_force_check(void)
     }
 }
 
-schedule_preview_t schedule_preview_next(void)
-{
-    schedule_preview_t preview = {0};
-    schedule_t snapshot = schedule_get();
-    waste_api_config_t api_cfg = waste_api_get_config();
-
-    waste_api_slot_t api_primary, api_secondary;
-    uint16_t event_year;
-    uint8_t event_month, event_day;
-    waste_api_result_t api_result =
-        waste_api_get_current(&api_primary, &api_secondary, &event_year, &event_month, &event_day);
-
-    if (api_result == WASTE_API_RESULT_EVENT) {
-        preview.has_primary = true;
-        preview.primary = api_primary.color;
-        preview.has_secondary = true;
-        preview.secondary = api_secondary.due ? api_secondary.color : snapshot.secondary_default_color;
-        return preview;
-    }
-    if (api_result == WASTE_API_RESULT_NO_EVENT) {
-        // API is configured and reachable, just nothing rotating due right
-        // now - Test's promise is "once configured, pressing this lights
-        // both LEDs" (not a strict preview of tonight's real outcome), so
-        // this doesn't depend on whether the general-waste weekday happens
-        // to be known too. Real operation is stricter about this - see
-        // schedule_task_fn()'s dual-colour NO_EVENT branch.
-        preview.has_primary = true;
-        preview.has_secondary = true;
-        preview.primary = snapshot.secondary_default_color;
-        preview.secondary = snapshot.secondary_default_color;
-        return preview;
-    }
-
-    // WASTE_API_RESULT_UNAVAILABLE: preview the manual schedule's next
-    // upcoming bin night, not necessarily tonight.
-    if (snapshot.enabled) {
-        time_t now = time(NULL);
-        struct tm tm_now;
-        localtime_r(&now, &tm_now);
-        int days_ahead = ((int)snapshot.bin_night_weekday - tm_now.tm_wday + 7) % 7;
-        struct tm target = date_plus_days(tm_now, days_ahead);
-
-        const schedule_color_rule_t *due_primary = NULL;
-        const schedule_color_rule_t *due_secondary = NULL;
-        find_due_rules(&snapshot, target, &due_primary, &due_secondary);
-
-        preview.has_primary = true;
-        preview.has_secondary = true;
-        if (due_primary != NULL) {
-            preview.primary = due_primary->color;
-            preview.secondary = (due_secondary != NULL) ? due_secondary->color : snapshot.secondary_default_color;
-        } else {
-            // Nothing rotating due on the next bin night - still a
-            // general-waste night, matching the live evaluator's
-            // dual-colour-mode behaviour.
-            preview.primary = snapshot.secondary_default_color;
-            preview.secondary = snapshot.secondary_default_color;
-        }
-        return preview;
-    }
-
-    // Neither a specific API event nor a manual fallback to preview - but if
-    // the API is at least configured (just momentarily unavailable, e.g. not
-    // yet polled since boot), still guarantee something rather than a silent
-    // no-op, since "configured" is the only promise Test makes.
-    if (api_cfg.enabled) {
-        preview.has_primary = true;
-        preview.has_secondary = true;
-        preview.primary = snapshot.secondary_default_color;
-        preview.secondary = snapshot.secondary_default_color;
-    }
-    return preview;
-}
-
 static void test_timer_callback(TimerHandle_t timer)
 {
     schedule_task_force_check();
@@ -457,15 +443,24 @@ static void test_timer_callback(TimerHandle_t timer)
 void schedule_test_trigger(void)
 {
     schedule_t snapshot = schedule_get();
-    schedule_preview_t preview = schedule_preview_next();
-    if (!preview.has_primary) {
+    schedule_next_t next = schedule_get_next_collection();
+    // Unlike the live evaluator, this deliberately does NOT skip waste-only
+    // nights in single-colour mode - it answers "what's the next collection?",
+    // not "should the light be on right now?". The only no-op case is a
+    // genuinely unknown next collection.
+    if (!next.known) {
+        ESP_LOGW(TAG, "display-next requested but the next collection is unknown");
         return;
     }
 
-    led_color_t primary = (led_color_t){preview.primary.r, preview.primary.g, preview.primary.b};
+    ESP_LOGI(TAG, "displaying next collection: %04u-%02u-%02u%s",
+             (unsigned)next.year, (unsigned)next.month, (unsigned)next.day,
+             next.waste_only ? " (general waste)" : "");
+
+    led_color_t primary = (led_color_t){next.primary.r, next.primary.g, next.primary.b};
     led_color_t secondary = primary;
-    if (snapshot.light_mode == LIGHT_MODE_DUAL_COLOUR && preview.has_secondary) {
-        secondary = (led_color_t){preview.secondary.r, preview.secondary.g, preview.secondary.b};
+    if (snapshot.light_mode == LIGHT_MODE_DUAL_COLOUR) {
+        secondary = (led_color_t){next.secondary.r, next.secondary.g, next.secondary.b};
     }
     led_state_set_dual(primary, secondary, snapshot.brightness);
 
