@@ -1552,6 +1552,33 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
+### ▶ Agreed next step: §3.11 Preferences UI reorganisation
+
+Decided with the owner: **do the UI work next, before the larger §3.3
+next-collection rework and the §3.13 backends.** Rationale — it's
+self-contained, touches only [web_server.c](main/web_server.c) rendering and
+the `POST /save` parser, has no bearing on the risky backend refactor, and
+makes the device materially easier to use while the harder work is in flight.
+
+Scope for that step, all from §3.11:
+1. New **"Preferences"** section, first on the page, holding Brightness, On
+   From, Turn off After, Light mode, Second LED default colour, and Timezone —
+   moved out of "Manual schedule" and the standalone Timezone section, because
+   they apply to API-driven and manual schedules alike.
+2. Rename "Manual schedule" → **"Manual / Fallback Schedule"**, with text
+   stating it is optional and only used when the API is unreachable or its
+   data is stale (§3.6).
+3. **Checkbox-gated collapsible detail** for the API and Manual sections,
+   driven by the *existing* `api_enabled` / `enabled` toggles — CSS-only
+   (`input:checked ~ .details`), no JavaScript, preserving the project's
+   no-JS property.
+
+Already done ahead of that step: the default-brightness fix (§6 bug 16).
+
+The ordering after this remains as §3.13 sets out: §3.3 rework → backend
+abstraction (Knox first) → Whitehorse → Merri-bek → Monash → LGA dropdown →
+Impact Apps list → South Australia.
+
 ### Open questions not yet resolved
 
 1. **§3.13.2 (SA)**: how the user supplies lat/lon with no map or geocoder on
