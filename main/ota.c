@@ -181,6 +181,23 @@ static void ota_task_fn(void *arg)
         // expires in about an hour, so it must be followed promptly and
         // cannot be cached or hardcoded. esp_http_client follows redirects by
         // default; this must not be disabled.
+        //
+        // **Both buffer sizes must be set, and the TX one is why.** After the
+        // redirect, esp_http_client composes the request line as
+        // "GET <path>?<query> HTTP/1.1" into a buffer of buffer_size_tx and
+        // fails with a bare `HTTP_CLIENT: Out of buffer` if it doesn't fit
+        // (esp_http_client.c, http_client_prepare_first_line). The default is
+        // CONFIG_ESP_HTTP_CLIENT_MAX_TX_BUFFER_SIZE = 512, and almost all of
+        // that ~900-character URL is *query string* - the signature. So every
+        // GitHub-hosted OTA fails at the redirect, with an error that names
+        // neither the URL nor the buffer. See SPEC.md 6 bug 23.
+        //
+        // 4096 is deliberate headroom, not a measured minimum: the URL length
+        // is GitHub's to change and this failure is invisible until an update
+        // is actually published. RX only needs to hold the 302's headers (the
+        // Location line being the long one), so 2048 is ample there.
+        .buffer_size = 2048,
+        .buffer_size_tx = 4096,
         .keep_alive_enable = true,
     };
     esp_https_ota_config_t ota_config = {

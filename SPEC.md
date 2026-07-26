@@ -2302,7 +2302,9 @@ three different things that are easy to conflate.
 | §3.4 "Forget this network" | ✅ | ✅ | ✅ **verified 2026-07-27** — reaches AutoAP, confirming §6 bug 21 is fixed on this path too (it uses `wifi_manager_forget_credentials()`, not `factory_reset_erase()`) |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
-| §3.5 OTA (GitHub-hosted, auto-update, rollback) | ✅ | ✅ | ❌ **not tested** — no 1.0.1 published yet |
+| §3.5 OTA — manifest fetch + version compare | ✅ | ✅ | ✅ **verified 2026-07-27** — fetched over TLS from `raw.githubusercontent.com`, detected 1.0.1 against a running 1.0.0 |
+| §3.5 OTA — image download + install | ✅ | ✅ (fix in 1.0.2, **needs USB flash**) | ❌ **failed on first attempt** — §6 bug 23, fixed but unproven |
+| §3.5 OTA — rollback safety net | ✅ | ✅ | ❌ **not tested** |
 
 **Everything is written, flashed and — with the exceptions below — verified on
 hardware** (owner's reports, 2026-07-26 and 2026-07-27).
@@ -2328,11 +2330,21 @@ what makes automatic updates safe is rollback, and rollback is itself untested.
 wrong-password rejection at provisioning, and "forget this network" — were all
 cleared on 2026-07-27.
 
-**⚠️ OTA is blocked, not merely untested.** The repo is **private**, so
-`raw.githubusercontent.com` returns **404** to an unauthenticated client, which
-is exactly what the device is. Confirmed by fetching the configured manifest
-URL. No amount of publishing releases will work until the manifest and the
-image asset are reachable without credentials — see "▶ Agreed next step".
+**OTA is half proven.** The repo was made public and 1.0.1 published on
+2026-07-27. The device fetched the manifest over TLS and correctly detected the
+new version — so the CA bundle, the HTTPS path and the version compare all
+work. **The download then failed on every attempt** (§6 bug 23: the request
+line for GitHub's 880-byte signed redirect URL didn't fit a 512-byte default
+TX buffer). Fixed in 1.0.2.
+
+**⚠️ 1.0.2 must be installed over USB.** OTA is the thing that is broken, so it
+cannot deliver its own fix. Nothing about §3.5 beyond the manifest check can be
+retested until that flash happens.
+
+**⚠️ Never publish 1.0.0 or 1.0.1 in the manifest again.** Neither can perform
+an OTA, so a device that lands on one is stuck until someone visits it with a
+cable. 1.0.2 is the oldest safe rollback target — see
+[firmware/README.md](firmware/README.md).
 
 See "▶ Agreed next step" below.
 
@@ -2849,6 +2861,53 @@ flash-and-observe or a live diagnostic to catch.
     Exact hang mechanism was not confirmed from a serial log (none captured),
     so this is a fix for a demonstrable defect on that path rather than a
     proven root cause. If a reset ever hangs again, capture the UART.
+
+23. **Every GitHub-hosted OTA failed at the redirect: `HTTP_CLIENT: Out of
+    buffer`** (§3.5). Found by the first real OTA attempt, 2026-07-27. The
+    manifest fetch worked, the new version was detected, the download never
+    started:
+
+    ```
+    I ota: manifest: version=1.0.1 running=1.0.0 available=1
+    W ota: starting OTA from https://github.com/.../v1.0.1/bin-light.bin
+    E HTTP_CLIENT: Out of buffer
+    E esp_https_ota: Failed to open HTTP connection: ESP_FAIL
+    ```
+
+    A GitHub release URL 302s to `release-assets.githubusercontent.com` with a
+    signed URL. **Measured: 909 characters, of which 864 are path+query** — the
+    bulk being the signature — giving an **880-byte request line**. After a
+    redirect `esp_http_client` composes that line into a buffer of
+    `buffer_size_tx`, which defaults to
+    `CONFIG_ESP_HTTP_CLIENT_MAX_TX_BUFFER_SIZE` = **512**, and bails
+    (`http_client_prepare_first_line`, esp_http_client.c:1750). Fixed by
+    setting `.buffer_size_tx = 4096` and `.buffer_size = 2048` explicitly.
+
+    **Two things worth keeping from this one.**
+
+    The error names neither the URL nor the buffer nor the redirect, and it is
+    logged by a component nobody was looking at. It is only findable if you
+    already know `esp_https_ota` follows a redirect to a signed URL.
+
+    More uncomfortable: **the comment directly above the failing config already
+    said the URL was "~900 characters"**. The fact was written down, correctly,
+    by whoever wrote that comment — and the code beside it was never made to
+    act on it. Knowing a number is not the same as having configured for it.
+
+    **This is also the exact failure OTA exists to prevent, arriving early
+    enough to be free.** The only way to deliver the fix was a USB cable —
+    which, had these devices already been in other people's houses, would have
+    meant collecting every one of them. §1.1's whole argument for OTA, made
+    concrete. It is the strongest possible argument for the §4 rule that OTA
+    must be proven before any device leaves the house.
+
+24. **`GET /update` answered 405 Method Not Allowed** (§3.5). Only the POST
+    handler was registered, so reloading the firmware page — the obvious thing
+    to do while a download runs, and the first thing anyone does after one
+    fails — produced an error page. Seen in the same log as bug 23, where it
+    made a confusing situation worse. `update_post_handler()` already treats an
+    empty body as "just check and report", so a GET is precisely the no-action
+    case; registered on the same handler, with `max_uri_handlers` raised 12→14.
 
 **Breaking NVS schema changes** (not bugs, but worth tracking since each one
 resets user-configured state on first boot after flashing): `schedule_t` went

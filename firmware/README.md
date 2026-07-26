@@ -43,6 +43,17 @@ Publish the *older* version in `latest.json`. The device compares for
 the fastest way to recover a bad release across devices you don't have
 physical access to.
 
+> **⚠️ Never point `latest.json` at 1.0.0 or 1.0.1.** Those builds cannot
+> perform an OTA at all — their HTTP client's TX buffer is too small for
+> GitHub's signed redirect URL (SPEC.md §6 bug 23), so the download fails at
+> the redirect every time. A device that rolls back to one is stuck there and
+> needs a USB cable. **1.0.2 is the oldest safe rollback target.**
+>
+> The general rule this is an instance of: a release can only be rolled *back*
+> to if it is itself capable of rolling forward. Anything that breaks OTA is a
+> one-way door, which is exactly why the automatic bootloader rollback below
+> matters more than the manual kind.
+
 There is also an automatic safety net: a freshly-flashed image is marked
 valid only once it has booted, joined Wi-Fi and started serving. An update
 that breaks any of that gets rolled back by the bootloader on the next

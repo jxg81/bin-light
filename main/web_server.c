@@ -1740,7 +1740,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 12; // 11 in use, small headroom for future additions
+    config.max_uri_handlers = 14; // 12 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -1798,6 +1798,17 @@ esp_err_t web_server_start(void)
         .method = HTTP_POST,
         .handler = update_post_handler,
     };
+    // GET too, on the same handler. The handler already treats "no body" as
+    // "just check and report", so a GET is exactly the no-action case. Without
+    // this, reloading the firmware page - the obvious thing to do while
+    // waiting on a download, and the first thing anyone does after a failed
+    // one - answers 405 Method Not Allowed. Observed on real hardware while
+    // the OTA of bug 23 was failing, which made a confusing situation worse.
+    static const httpd_uri_t update_get_uri = {
+        .uri = "/update",
+        .method = HTTP_GET,
+        .handler = update_post_handler,
+    };
     static const httpd_uri_t reboot_uri = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -1818,6 +1829,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &test_uri);
     httpd_register_uri_handler(server, &wifi_forget_uri);
     httpd_register_uri_handler(server, &update_uri);
+    httpd_register_uri_handler(server, &update_get_uri);
     httpd_register_uri_handler(server, &reboot_uri);
     httpd_register_uri_handler(server, &factory_reset_uri);
 
