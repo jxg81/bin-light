@@ -2128,8 +2128,8 @@ three different things that are easy to conflate.
 | §3.1–3.3, 3.6 core + Impact Apps API | ✅ | ✅ | ✅ working |
 | §3.9 mDNS (`binlight.local`) | ✅ | ✅ | ✅ user browsed via it |
 | `/favicon.ico` (§6 bug 15) | ✅ | ✅ | ✅ console 404 gone |
-| §3.7 second LED / dual-colour | ✅ | ✅ | ⚠️ LED2 not *separately* confirmed — see note |
-| §3.10 boot self-test | ✅ | ✅ | ⚠️ not explicitly confirmed |
+| §3.7 second LED / dual-colour | ✅ | ✅ | ✅ verified |
+| §3.10 boot self-test | ✅ | ✅ | ✅ verified |
 | §3.8 "Display Next Collection" button | ✅ | ✅ | ✅ **works** — confirmed on hardware |
 | §3.11 brightness default fix (§6 bug 16) | ✅ | ✅ | ✅ **works** — see below |
 | Warmer yellow `(255,150,0)` (§2) | ✅ | ✅ | ⚠️ red/green/purple good; yellow deferred (§5) |
@@ -2141,30 +2141,34 @@ three different things that are easy to conflate.
 | waste_api config v2→v3 migration | ✅ | ✅ | ✅ verified (existing setup survived) |
 | Merri-bek cpage self-discovery + year-derived URLs | ✅ | ✅ | ⚠️ normal path verified; the *rediscovery* branch only fires on failure, so still host-tested only |
 | DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
-| §3.12 factory reset + restart (shared functions, UI actions) | ✅ | ❌ **not yet flashed** | ❌ |
-| §3.12 reset button (3s restart / 10s factory reset, armed-colour feedback) | ✅ | ❌ **not yet flashed** | ❌ needs an external button on GPIO 2 |
-| §3.12 action button (capacitive tap: dismiss / show next) | ✅ | ❌ **not yet flashed** | ❌ needs the touch module wired |
-| §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ✅ | ❌ **the one untested item** — needs a deliberate setup, see below |
+| §3.12 **restart** (web UI + shared function) | ✅ | ✅ | ✅ verified |
+| §3.12 **factory reset** (web UI, two-step confirm) | ✅ | ✅ | ❌ **not tested** |
+| §3.12 reset button, 3s hold → restart | ✅ | ✅ | ✅ verified (GPIO 2 confirmed) |
+| §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ❌ **not tested** |
+| §3.12 action button (tap: dismiss / show next) | ✅ | ✅ | ✅ verified (GPIO 1 confirmed) |
+| §3.4 AutoAP onboarding | ✅ | ✅ | ❌ **not tested** |
+| §3.4 "Forget this network" | ✅ | ✅ | ⚠️ untested — it is the easiest way to reach AutoAP |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
 
-**The §3.11 UI build is committed but NOT yet flashed** — the working tree is
-ahead of the device. Everything before it (yellow/brightness) is flashed and in
-step. Build is clean (`idf.py build`, 0x130b60 bytes, 60% of the app partition
-free) and the collapsible CSS + form-attribute wiring were verified in a real
-browser against a static render of the generated markup, but nothing here has
-been exercised on the device yet.
+**Everything is flashed and, with two exceptions, tested on hardware**
+(owner's report, 2026-07-26). The two untested features are:
 
-**Two things still worth an explicit look**, both cheap and both currently
-assumed-but-unverified:
-- **LED2** has never been confirmed to light *independently*. Colours have
-  been judged through the enclosure, but nobody has stated that the second
-  pixel works — a two-pixel chain fails silently to one pixel if the data
-  link between them is bad. The boot self-test (§3.10) drives LED1 solo, then
-  LED2 solo, then both, so watching one boot settles it conclusively.
-- **The boot self-test itself** has not been explicitly reported as seen. The
-  same single boot confirms both.
+1. **Factory reset** — neither the web UI's confirmed action nor the reset
+   button's 10-second hold.
+2. **AutoAP onboarding** — the whole first-run provisioning flow.
+
+They are related: both are hard to exercise casually because both *destroy
+working configuration*, which is exactly why they have been left. See
+"▶ Agreed next step" below for how to test them without losing a working
+setup, and note that testing factory reset lands you in AutoAP anyway — so
+one deliberate session covers both.
+
+Everything else in the table above has been exercised on the device,
+**including both buttons** — which confirms the GPIO 1 / GPIO 2 assignments
+and the touch module's active-HIGH polarity, previously flagged as unverified
+guesses from the published pinout.
 
 ### ⚠️ Likely second cause of the Test-button failure — check this first
 
@@ -2262,42 +2266,50 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: exercise AutoAP, then the physical buttons
+### ▶ Agreed next step: one session to test factory reset + AutoAP
 
-**§1.2 is met.** All five working-group councils were verified on real
-hardware on 2026-07-26 — the flash carried the §3.11 UI, the §3.3 resolver
-rework, the four bespoke backends, the council dropdown and the v2→v3 config
-migration, and all of it checked out. That was the acceptance criterion for
-the API feature.
+**§1.2 is met and the device is fully exercised bar two features.** Everything
+built to date is flashed and working on hardware, including both buttons —
+which retires the GPIO 1 / GPIO 2 and touch-polarity guesses.
 
-**One thing from that build remains untested: AutoAP (§3.4).** It won't
-exercise itself, because a device with Wi-Fi in `sdkconfig` keeps using the
-Kconfig fallback. To try it, either blank `CONFIG_BINLIGHT_WIFI_SSID` and
-reflash, or press **Forget this network** (or **Factory reset**) on the home
-page. Then check:
-- Both LEDs breathe white, and a `binlight-XXXX` network appears.
-- Joining it and browsing to `http://192.168.4.1/` lists nearby networks.
-- A wrong password reports failure *on the page* and does not get stored.
-- A correct one shows "Connected", the AP disappears, and `binlight.local`
-  works again.
-- Nothing else was lost (Forget) or everything was (Factory reset).
+**The two untested features are factory reset and AutoAP onboarding**, and
+they are best done together in one deliberate session, because a factory reset
+lands the device in AutoAP anyway. Both destroy working configuration, so do
+this when you are willing to set the device up again.
 
-Also unflashed: the **§3.12 work** — factory reset and restart (both as UI
-actions and as shared functions), and the reset button itself.
+Suggested run, which tests both and ends with a working device:
 
-**Both buttons need wiring before they can be tested**, and neither has run
-against real hardware. A press on either is logged on serial as soon as it
-debounces, so wiring problems show up immediately.
+1. **Note what you'll have to re-enter**: Wi-Fi, council + address, colour
+   mapping, and any manual schedule. Everything else is defaults.
+2. **Factory reset from the web UI.** Confirm the "Are you sure?" page lists
+   what is lost, that the *first* POST does not wipe, and that "No, take me
+   back" works. Then confirm.
+3. **Watch the LEDs**: they should start breathing white within a few seconds,
+   and a Wi-Fi network named `binlight-XXXX` should appear (last 4 hex of the
+   station MAC).
+4. **AutoAP onboarding**: join that network, browse to `http://192.168.4.1/`.
+   Check the network list is populated. **Deliberately enter a wrong password
+   first** — it must report failure *on the page* and must not store anything.
+   Then the correct one: it should report success, the AP should disappear,
+   and `binlight.local` should work again.
+5. **Re-set-up the council** and confirm the light works as before.
+6. **Factory reset via the button** (10-second hold) is then worth one more
+   pass, since it is a different entry point into the same function: watch for
+   the LEDs going blue at 3s and red at 10s, and confirm releasing at, say,
+   5 seconds restarts rather than wipes.
 
-| | Pin | Wiring | Test |
-|---|---|---|---|
-| **Reset** (push button) | GPIO 2 / `D2` | momentary button to **GND**; internal pull-up, no resistor | hold ~3s → LEDs blue; past 10s → red; release to act; release under 3s → nothing. A jumper to GND stands in for the button. |
-| **Action** (capacitive) | GPIO 1 / `D1` | TTP223-style module, 3V3 + GND + OUT to the pin, set **momentary** not latching | tap with the light on → it goes out and stays out for that collection; tap with it off → next collection shows for 30s. A jumper to **3V3** stands in (this one is active HIGH). |
+Two things to watch for specifically, being the parts host tests cannot prove:
 
-The on-board BOOT button (GPIO 9) is deliberately no longer used: it's
-unreachable once the board is in a sealed enclosure, and it's a strapping pin.
+- **Nothing should survive the reset.** In particular the timezone lives in a
+  *separate* NVS namespace (`binlight_cfg`) from everything else, and the
+  Wi-Fi driver keeps its own copy of the last credentials — both are handled,
+  but this is the one chance to confirm it rather than trust it.
+- **A wrong Wi-Fi password must not be persisted.** Provisioning verifies
+  credentials by actually joining before saving, so a typo should leave the
+  device still in AutoAP rather than rebooting into a network it cannot reach.
 
 After that, in priority order:
+
 1. **§3.5 OTA** — needs a partition-table rework (one 3MB `factory` slot →
    two OTA slots + `otadata`), so it means an `erase-flash`. **Best done
    before devices are handed out**, since after that a firmware fix means
@@ -2313,10 +2325,10 @@ After that, in priority order:
 
 1. **§3.13.2 (SA)**: how the user supplies lat/lon with no map or geocoder on
    the device — paste coordinates, add a geocoding dependency, or skip SA.
-2. **§3.12**: both button pins are chosen (reset GPIO 2 / `D2`, action
-   GPIO 1 / `D1`) but **neither has been tested against real hardware** — the
-   touch module in particular needs confirming for polarity and momentary
-   (not latching) configuration.
+2. ~~**§3.12**: both button pins are chosen but neither has been tested
+   against real hardware.~~ **Resolved 2026-07-26** — both buttons work on
+   GPIO 2 (reset) and GPIO 1 (action), confirming the pin choices and the
+   touch module's active-HIGH polarity.
 3. **§3.14 (battery)**: nothing can be designed properly until the four
    currents in §3.14.5 are measured. Beyond that, two are the owner's calls
    rather than technical: whether the default 20-hour light window should
