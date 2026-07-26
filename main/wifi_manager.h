@@ -10,9 +10,13 @@
 // stored network can't be reached at boot, the device enters **AutoAP mode**:
 // it raises an open SoftAP named "binlight-XXXX" (last 4 hex digits of its
 // station MAC), breathes both LEDs white, and serves a no-JS page at
-// http://192.168.4.1/ to pick a network and enter its password. Credentials
-// are verified by actually joining before they are persisted, so a typo never
+// http://binlight.local/ (or http://192.168.4.1/ where mDNS doesn't resolve -
+// notably Android) to pick a network and enter its password. Credentials are
+// verified by actually joining before they are persisted, so a typo never
 // gets stored.
+//
+// mDNS answers on the setup AP only because main() starts it *before* this
+// function, which blocks for the whole AutoAP session - see the note there.
 //
 // **Blocks until the device is on a network** - in AutoAP mode that means
 // blocking until someone provisions it (or the stored network reappears; it

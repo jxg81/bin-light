@@ -790,8 +790,9 @@ static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
         "</head><body><h1>Wi-Fi reset</h1>"
         "<p>The saved network has been forgotten and the light is restarting.</p>"
         "<p>In a few seconds both LEDs will start breathing white, and a Wi-Fi network "
-        "named <b>binlight-XXXX</b> will appear. Join it and a setup page will open at "
-        "<b>http://192.168.4.1/</b>.</p>"
+        "named <b>binlight-XXXX</b> will appear. Join it, then open "
+        "<b>http://binlight.local/</b> &mdash; or <b>http://192.168.4.1/</b> if your "
+        "phone or browser can't find that name.</p>"
         "<p>Your schedule and council settings have been kept.</p>"
         "</body></html>";
 
@@ -1051,8 +1052,9 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req)
         "<h1>Reset</h1>"
         "<p>Everything has been erased and the light is restarting.</p>"
         "<p>In a few seconds both LEDs will start breathing white and a Wi-Fi network "
-        "named <b>binlight-XXXX</b> will appear. Join it, and a setup page will open at "
-        "<b>http://192.168.4.1/</b>.</p>"
+        "named <b>binlight-XXXX</b> will appear. Join it, then open "
+        "<b>http://binlight.local/</b> &mdash; or <b>http://192.168.4.1/</b> if your "
+        "phone or browser can't find that name.</p>"
         "</body></html>";
 
     char *page = malloc(sizeof(HEAD) + sizeof(DONE_PAGE));

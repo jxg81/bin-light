@@ -56,11 +56,22 @@ void app_main(void)
 
     ESP_ERROR_CHECK(settings_init());
 
-    if (wifi_manager_start() != ESP_OK) {
-        ESP_LOGW(TAG, "starting without a confirmed Wi-Fi connection, will keep retrying in the background");
-    }
+    // Before wifi, not after. wifi_manager_start() blocks for the whole AutoAP
+    // session (SPEC.md 3.4), so starting mDNS afterwards left the responder
+    // dead during setup - exactly when a memorable name is most useful, since
+    // that is the one time the user has nothing written down. Started here it
+    // is already listening when AutoAP raises the SoftAP, and the predefined
+    // AP interface (CONFIG_MDNS_PREDEF_NETIF_AP) attaches it on AP_START, so
+    // binlight.local resolves on the setup network as well as on the LAN.
+    //
+    // Safe this early: mdns_init() only needs esp_netif_init() and the default
+    // event loop, both done above. It binds interfaces as they appear rather
+    // than requiring one to exist already.
     if (mdns_start() != ESP_OK) {
         ESP_LOGW(TAG, "mDNS failed to start, device will only be reachable by IP");
+    }
+    if (wifi_manager_start() != ESP_OK) {
+        ESP_LOGW(TAG, "starting without a confirmed Wi-Fi connection, will keep retrying in the background");
     }
     if (time_sync_start() != ESP_OK) {
         ESP_LOGW(TAG, "starting without a confirmed time sync, schedule will activate once time becomes valid");

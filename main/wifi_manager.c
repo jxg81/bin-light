@@ -482,7 +482,8 @@ static void run_autoap(void)
         // at least visible, and keep retrying stored creds below.
     }
 
-    ESP_LOGI(TAG, "AutoAP up: join \"%s\" and browse to http://192.168.4.1/", (char *)ap_config.ap.ssid);
+    ESP_LOGI(TAG, "AutoAP up: join \"%s\" and browse to http://binlight.local/ (or http://192.168.4.1/)",
+             (char *)ap_config.ap.ssid);
 
     xEventGroupClearBits(s_wifi_event_group, BIT_AUTOAP_EXIT);
     for (;;) {

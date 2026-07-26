@@ -1043,19 +1043,43 @@ this document at some point and was re-added, not a new ask.
   new `mdns_start()` helper — not user-configurable via the web UI, consistent
   with how the LED GPIO pin is a fixed Kconfig value rather than a runtime
   setting.
-- **Started from `app_main()`**, right after `wifi_manager_start()`, alongside
-  the same non-fatal warn-and-continue pattern already used there and for
-  `time_sync_start()` — the mDNS responder attaches to the netif and doesn't
-  need to block on an established IP.
+- **Started from `app_main()` *before* `wifi_manager_start()`**, with the same
+  non-fatal warn-and-continue pattern used for `time_sync_start()`. Safe that
+  early because `mdns_init()` needs only `esp_netif_init()` and the default
+  event loop, and binds interfaces as they appear rather than requiring one to
+  exist.
+
+  **The order is load-bearing, do not "tidy" it back.** It was originally
+  *after* `wifi_manager_start()`, which blocks for the entire AutoAP session
+  (§3.4) — so mDNS was dead during setup, the one moment a memorable name is
+  most valuable, because it's the only time the user has nothing written down
+  and no DHCP lease to look up. Started first, the responder is already
+  listening when AutoAP raises the SoftAP.
+- **Answers on the setup AP too, not just the LAN.**
+  `CONFIG_MDNS_PREDEF_NETIF_AP` defaults to `y` (verified in
+  `build/config/sdkconfig.h`), so the component attaches to the SoftAP netif on
+  `AP_START` with no explicit `mdns_register_netif()` call. This is what lets
+  the provisioning page be reached at `http://binlight.local/` while joined to
+  `binlight-XXXX`.
+- **Always quote the IP as a fallback in user-facing copy.** `.local` is native
+  on Apple platforms and Windows 10+, but **Android's browser support is
+  unreliable**, and the setup flow is the worst possible place for a dead end.
+  Every message that names `binlight.local` also names `http://192.168.4.1/`
+  — `/wifi-forget`, the factory-reset done page, and the AutoAP log line.
 - **Also advertises the web UI as an mDNS service** —
   `mdns_service_add(NULL, "_http", "_tcp", 80, NULL, 0)` alongside the
   hostname, since the device already runs `esp_http_server` on port 80 — shows
   up correctly in mDNS-browsing tools (e.g. `dns-sd -B _http._tcp`), not just
   bare-hostname resolution.
 
-**Not yet build-verified** — `idf.py build` needs to be run to confirm the
-`espressif/mdns` managed component resolves cleanly and the image still fits
-the factory partition; not yet flashed/tested on real hardware either.
+**Verified on the LAN** (the owner browses the device by name). **The AutoAP
+path is not yet verified on hardware** — it builds and the config is confirmed,
+but whether `binlight.local` actually resolves while joined to the setup AP
+needs a real client, and the answer will differ by phone OS. Test it as part
+of the AutoAP session in §4's next step; if it doesn't resolve, the IP
+fallback already in the copy is the answer, and the fix worth considering is a
+captive portal (DNS hijack to 192.168.4.1 + OS probe responses), which would
+also make the page open by itself.
 
 ### 3.10 Boot-time LED self-test (implemented)
 
@@ -2366,9 +2390,13 @@ automatic updates (§3.5), factory reset (§3.12), and the restart/action button
    a factory reset lands you in AutoAP anyway, so they test together. Detail:
    - UI reset: the *first* POST must only warn; "take me back" must work.
    - LEDs breathe white; a `binlight-XXXX` network appears.
-   - Join it, browse `http://192.168.4.1/`, **deliberately enter a wrong
-     password first** — it must fail *on the page* and store nothing.
-   - Correct password → AP disappears, `binlight.local` works.
+   - Join it, then **try `http://binlight.local/` first and record whether it
+     resolved on that phone** — that is the open question in §3.9, and the
+     answer is client-dependent. Fall back to `http://192.168.4.1/`, which
+     always works, rather than treating a failure as a blocker.
+   - **Deliberately enter a wrong password first** — it must fail *on the
+     page* and store nothing.
+   - Correct password → AP disappears, `binlight.local` works on the LAN.
    - Re-set-up the council; confirm the light works.
    - Then the reset button's 10s hold as a second entry point, and release at
      ~5s to confirm it restarts rather than wipes.
