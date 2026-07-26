@@ -6,6 +6,7 @@
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "nvs.h"
+#include "wifi_manager.h"
 
 static const char *TAG = "factory_reset";
 
@@ -50,6 +51,14 @@ static esp_err_t erase_namespace(const char *ns)
 esp_err_t factory_reset_erase(void)
 {
     ESP_LOGW(TAG, "factory reset: erasing all persisted settings");
+
+    // Take Wi-Fi down *before* touching any of its configuration. This used to
+    // run with the driver live and the auto-reconnect handler armed, so
+    // esp_wifi_restore() below pulled the config out from under a handler that
+    // immediately tried to reconnect with it - on the event task, while this
+    // one raced toward esp_restart(). The result was a reset that erased
+    // everything and then hung, needing a power cycle.
+    wifi_manager_shutdown();
 
     esp_err_t first_err = ESP_OK;
     for (size_t i = 0; i < sizeof(NVS_NAMESPACES) / sizeof(NVS_NAMESPACES[0]); i++) {

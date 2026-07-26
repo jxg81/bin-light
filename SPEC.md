@@ -2208,22 +2208,34 @@ three different things that are easy to conflate.
 | Merri-bek cpage self-discovery + year-derived URLs | ✅ | ✅ | ⚠️ normal path verified; the *rediscovery* branch only fires on failure, so still host-tested only |
 | DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
 | §3.12 **restart** (web UI + shared function) | ✅ | ✅ | ✅ verified |
-| §3.12 **factory reset** (web UI, two-step confirm) | ✅ | ✅ | ❌ **not tested** |
+| §3.12 **factory reset** (web UI, two-step confirm) | ✅ | ✅ | ⚠️ **tested 2026-07-27, found two bugs (§6 21, 22)** — erase works; hang + Wi-Fi persistence fixed, **fixes not yet flashed** |
 | §3.12 reset button, 3s hold → restart | ✅ | ✅ | ✅ verified (GPIO 2 confirmed) |
 | §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ❌ **not tested** |
 | §3.12 action button (tap: dismiss / show next) | ✅ | ✅ | ✅ verified (GPIO 1 confirmed) |
-| §3.4 AutoAP onboarding | ✅ | ✅ | ❌ **not tested** |
-| §3.4 "Forget this network" | ✅ | ✅ | ⚠️ untested — it is the easiest way to reach AutoAP |
+| §3.4 AutoAP onboarding | ✅ | ✅ | ❌ **not tested** — was unreachable on the flashed build (§6 bug 21) |
+| §3.4 "Forget this network" | ✅ | ✅ | ⚠️ **tested 2026-07-27, did not reach AutoAP** — §6 bug 21, fixed, not yet flashed |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA (GitHub-hosted, auto-update, rollback) | ✅ | ✅ | ❌ **not tested** — no 1.0.1 published yet |
 
-**Everything is flashed and, with two exceptions, tested on hardware**
-(owner's report, 2026-07-26). The two untested features are:
+**Everything is flashed and, with the exceptions below, tested on hardware**
+(owner's reports, 2026-07-26 and 2026-07-27).
 
-1. **Factory reset** — neither the web UI's confirmed action nor the reset
-   button's 10-second hold.
-2. **AutoAP onboarding** — the whole first-run provisioning flow.
+**⚠️ The build currently on the device is one commit behind.** Factory reset
+was exercised on 2026-07-27 and found two real bugs — §6 **21** (the compiled-in
+Wi-Fi fallback defeating both factory reset and "forget Wi-Fi") and §6 **22**
+(the reset hanging after a successful erase). Both are fixed and build clean,
+but **the fixes have not been flashed**, so the device still exhibits both.
+Bug 21 also means AutoAP was *unreachable* on the flashed build — it was never
+the onboarding flow failing.
+
+Still untested:
+
+1. **Factory reset, end to end** — the erase half is confirmed working; the
+   restart half needs a re-test on the fixed build. The reset button's
+   10-second hold has never been tried at all.
+2. **AutoAP onboarding** — the whole first-run provisioning flow. Now actually
+   reachable once the fix is flashed.
 
 They are related: both are hard to exercise casually because both *destroy
 working configuration*, which is exactly why they have been left. See
@@ -2253,13 +2265,25 @@ guesses from the published pinout.
   real `schedule.c` / `waste_api.c` / `web_server.c` / `buttons.c` against thin
   stubs, so it catches far more than its size suggests.
 - **`sdkconfig` is gitignored and caches Kconfig values.** A changed Kconfig
-  *default* does NOT reach an existing build — the stored value wins. This
-  already bit once (the reset-button GPIO stayed at 9 after the default moved
-  to 2). Change both, or `idf.py menuconfig`.
-- **Wi-Fi credentials are no longer compiled in.** `Kconfig.projbuild`'s
-  SSID/password default to `""`, real values live only in the gitignored
-  `sdkconfig`, and AutoAP (§3.4) is the real path. **Verified: no credential
-  has ever been committed.**
+  *default* does NOT reach an existing build — the stored value wins. This has
+  now bitten **twice**: the reset-button GPIO stayed at 9 after the default
+  moved to 2, and a stale SSID/password silently defeated factory reset and
+  "forget Wi-Fi" (bug 21). Change both, or `idf.py menuconfig`. **When a
+  symptom contradicts the tracked source, check `sdkconfig` before anything
+  else.**
+- **Wi-Fi credentials are not compiled in.** `Kconfig.projbuild`'s
+  SSID/password default to `""`, and since bug 21 the fallback additionally
+  requires `CONFIG_BINLIGHT_WIFI_COMPILED_FALLBACK=y` (default `n`) — setting
+  an SSID alone no longer overrides provisioning. AutoAP (§3.4) is the real
+  path. **Verified: no credential has ever been committed** (`sdkconfig` is
+  gitignored; `git log -S` across all refs is clean).
+- **Kconfig strings become literals in the image, and §3.5 publishes that
+  image.** Release assets go to a public GitHub repo, so anything compiled in
+  is published. Bug 21 caught a real SSID/password this way. **Grep the built
+  `.bin`, not just the tree, before cutting a release:**
+  ```
+  strings build/sample_project.bin | grep -iE 'your-ssid|password'
+  ```
 - **Network probing.** The assistant's sandbox has internet but runs from a
   datacenter IP, and both it and the owner's Mac were behind a Zscaler
   TLS-intercepting client agent for part of this work — which produced *two*
@@ -2642,6 +2666,52 @@ flash-and-observe or a live diagnostic to catch.
     Sunday, so Maribyrnong's Friday `dow:[5]` masked it completely — a
     Sunday-collection council would have produced an out-of-range 7. Converted
     at the parse site so no caller ever sees the ISO form.
+
+21. **The compiled-in Wi-Fi fallback silently defeated both factory reset and
+    "forget Wi-Fi"** (§3.4, §3.12). Reported from hardware: after a factory
+    reset the device came back with *no* config but still joined the owner's
+    home network, and `/wifi-forget` never raised AutoAP.
+
+    Both paths worked exactly as written. `wifi_manager_start()` treats a
+    non-empty `CONFIG_BINLIGHT_WIFI_SSID` as a fallback whenever NVS holds no
+    credentials — which is precisely the state a reset creates. So the reset
+    erased everything, rebooted, found the build-time pair and rejoined. The
+    Kconfig *defaults* were correctly empty; the values were stale in the
+    developer's gitignored `sdkconfig`, so nothing in the tracked tree looked
+    wrong. **This is a second instance of the §4 sdkconfig-caches-Kconfig
+    trap** (the first cost a day on the reset-button GPIO).
+
+    Fixed in two places, deliberately. The values were cleared, **and** the
+    fallback now requires an explicit `CONFIG_BINLIGHT_WIFI_COMPILED_FALLBACK`
+    bool (default `n`). Clearing alone would have left the same landmine armed
+    for the next person who sets an SSID for bench convenience: no build-time
+    string should be able to override a user's explicit "forget this network".
+
+    **Also a credential-exposure finding.** Those Kconfig strings are compiled
+    into the image as literals — `strings sample_project.bin` printed the
+    owner's real home SSID and password. Not in git (`sdkconfig` is gitignored,
+    and `git log -S` on the password across all refs was clean), but §3.5 now
+    publishes the built `.bin` as a **public GitHub Release asset**, so the
+    next release would have shipped it. Verified 0 hits in the rebuilt image.
+    **Before every release, grep the artefact, not just the tree.**
+
+22. **Factory reset hung after erasing, needing a power cycle** (§3.12).
+    `factory_reset_erase()` called `esp_wifi_restore()` with the driver live
+    and the auto-reconnect handler armed. Tearing the config out from under it
+    raised `STA_DISCONNECTED`, whose `WIFI_STATE_RUNNING` branch ("never
+    permanently give up") called `esp_wifi_connect()` against credentials that
+    had just ceased to exist — on the event task, while the HTTP task raced
+    toward `esp_restart()` behind a 200 ms delay. The erase always completed;
+    it was the restart that didn't.
+
+    Fixed with `wifi_manager_shutdown()`, called first: it disarms the handler
+    via `s_shutting_down` **before** stopping the driver, so stopping can't
+    raise the event that triggers a reconnect. Order matters — the flag must
+    be set first, or `esp_wifi_stop()` itself starts the race.
+
+    Exact hang mechanism was not confirmed from a serial log (none captured),
+    so this is a fix for a demonstrable defect on that path rather than a
+    proven root cause. If a reset ever hangs again, capture the UART.
 
 **Breaking NVS schema changes** (not bugs, but worth tracking since each one
 resets user-configured state on first boot after flashing): `schedule_t` went

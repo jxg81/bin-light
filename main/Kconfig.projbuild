@@ -20,6 +20,24 @@ menu "Bin Light Configuration"
             See BINLIGHT_WIFI_SSID. Optional; provisioned credentials in NVS
             always take priority over anything compiled in.
 
+    config BINLIGHT_WIFI_COMPILED_FALLBACK
+        bool "Fall back to the compiled-in Wi-Fi credentials above"
+        default n
+        help
+            Off by default, and leave it off unless you are actively working
+            on a bench device.
+
+            When on, a device with nothing provisioned in NVS joins the
+            network named by BINLIGHT_WIFI_SSID instead of raising AutoAP.
+            That makes an explicit "forget Wi-Fi" or factory reset look
+            broken: the device wipes its credentials, reboots, silently picks
+            up the build-time pair and rejoins the old network, never showing
+            a setup AP.
+
+            Setting the SSID string alone is deliberately not enough to turn
+            this on - a value left behind in a gitignored sdkconfig should
+            not be able to defeat provisioning by accident. See SPEC.md 6.
+
     config BINLIGHT_WIFI_MAXIMUM_RETRY
         int "Wi-Fi connect attempts at boot before falling back to AutoAP setup mode"
         default 10

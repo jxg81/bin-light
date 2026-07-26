@@ -31,3 +31,18 @@ const char *wifi_manager_current_ssid(void);
 // its confirmation page first, then reboots). Everything else in NVS (the
 // schedule, council setup) is untouched.
 esp_err_t wifi_manager_forget_credentials(void);
+
+// Disarms the auto-reconnect logic and stops the Wi-Fi driver, in that order.
+//
+// Call before anything that tears down the Wi-Fi configuration and then
+// restarts - specifically factory_reset_erase(), which calls
+// esp_wifi_restore(). Without this, the STA_DISCONNECTED handler is still
+// armed when the config is pulled out from under it and immediately calls
+// esp_wifi_connect() against credentials that no longer exist, on the event
+// task, while the caller is racing toward esp_restart() on another. That race
+// is what left a factory reset hung and needing a power cycle.
+//
+// Idempotent, and safe to call whatever state Wi-Fi is in (including never
+// started). After this the device has no network until it reboots - which is
+// the only thing callers do next.
+void wifi_manager_shutdown(void);

@@ -47,6 +47,22 @@ typedef struct {
     char    password[65];  // 64 + NUL
 } wifi_cred_t;
 
+// Kconfig bools emit no #define when false, so normalise to a constant the
+// compiler can fold - same pattern as buttons.c.
+//
+// Defaults **off**, and that default is load-bearing rather than tidy. A
+// compiled-in SSID silently outranking "no stored credentials" means an
+// explicit Wi-Fi forget or factory reset appears to do nothing: the device
+// wipes NVS, reboots, finds the build-time pair and rejoins the old network
+// instead of raising AutoAP. Requiring a second, deliberate opt-in means a
+// stale string left in a developer's gitignored sdkconfig cannot defeat
+// provisioning by accident. See SPEC.md 6.
+#ifdef CONFIG_BINLIGHT_WIFI_COMPILED_FALLBACK
+#define WIFI_COMPILED_FALLBACK true
+#else
+#define WIFI_COMPILED_FALLBACK false
+#endif
+
 typedef enum {
     WIFI_STATE_BOOT_CONNECTING, // first attempt with stored/Kconfig creds; bounded retries
     WIFI_STATE_AUTOAP,          // SoftAP up, provisioning page live; no automatic STA retries
@@ -65,6 +81,11 @@ static bool s_connected = false;
 static wifi_cred_t s_creds;          // the credentials currently being used
 static bool s_have_creds = false;
 static httpd_handle_t s_prov_server; // provisioning httpd, AutoAP mode only
+
+// Set once the device is deliberately on its way down (factory reset). The
+// event handler checks it before any esp_wifi_connect(), so tearing the
+// config down can't trigger a reconnect storm on the way to esp_restart().
+static volatile bool s_shutting_down = false;
 
 // ---------------------------------------------------------------- creds ----
 
@@ -118,6 +139,13 @@ static void apply_sta_config(const wifi_cred_t *creds)
 
 static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
 {
+    // On the way down every reconnect path is wrong: the credentials are being
+    // erased underneath us and the device is about to restart.
+    if (s_shutting_down) {
+        s_connected = false;
+        return;
+    }
+
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         // In AutoAP mode connects are driven explicitly (by the provisioning
         // handler or the stored-creds retry), never by the start event - with
@@ -513,7 +541,7 @@ esp_err_t wifi_manager_start(void)
     if (load_creds(&s_creds)) {
         s_have_creds = true;
         ESP_LOGI(TAG, "using stored credentials for \"%s\"", s_creds.ssid);
-    } else if (CONFIG_BINLIGHT_WIFI_SSID[0] != '\0') {
+    } else if (WIFI_COMPILED_FALLBACK && CONFIG_BINLIGHT_WIFI_SSID[0] != '\0') {
         s_creds.version = WIFI_CRED_VERSION;
         snprintf(s_creds.ssid, sizeof(s_creds.ssid), "%s", CONFIG_BINLIGHT_WIFI_SSID);
         snprintf(s_creds.password, sizeof(s_creds.password), "%s", CONFIG_BINLIGHT_WIFI_PASSWORD);
@@ -582,4 +610,15 @@ esp_err_t wifi_manager_forget_credentials(void)
         ESP_LOGW(TAG, "stored Wi-Fi credentials erased - next boot will enter AutoAP setup");
     }
     return err;
+}
+
+void wifi_manager_shutdown(void)
+{
+    // Order matters: disarm first, or stopping the driver raises the very
+    // disconnect event that would kick off a reconnect.
+    s_shutting_down = true;
+    s_connected = false;
+    esp_wifi_disconnect();
+    esp_wifi_stop();
+    ESP_LOGW(TAG, "wifi stopped for restart");
 }
