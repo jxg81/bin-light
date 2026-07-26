@@ -1863,7 +1863,8 @@ three different things that are easy to conflate.
 | DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
 | §3.12 physical buttons | ❌ not written | — | — |
 | §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ❌ **not yet flashed** | ❌ needs a device |
-| §3.13 additional council backends | ❌ not written (research complete) | — | — |
+| §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
+| §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
 
 **The §3.11 UI build is committed but NOT yet flashed** — the working tree is
 ahead of the device. Everything before it (yellow/brightness) is flashed and in
