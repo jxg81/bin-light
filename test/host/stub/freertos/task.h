@@ -5,3 +5,4 @@ static inline BaseType_t xTaskCreate(void (*fn)(void *), const char *n, uint32_t
 static inline void xTaskNotifyGive(TaskHandle_t h) { (void)h; }
 static inline uint32_t ulTaskNotifyTake(BaseType_t c, TickType_t t) { (void)c; (void)t; return 0; }
 static inline void vTaskDelay(TickType_t t) { (void)t; }
+static inline void vTaskDelete(TaskHandle_t h) { (void)h; }

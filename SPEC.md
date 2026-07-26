@@ -458,6 +458,57 @@ issues hit and fixed this session.
 
 ### 3.4 Wi-Fi setup without Matter ("AutoAP" mode, implemented)
 
+#### 3.4.0 Captive portal (implemented — the setup page opens by itself)
+
+Added after the first real AutoAP attempt showed the flow depended on the user
+typing an address. Two halves, both live only while the SoftAP is up:
+
+- **DNS hijack** — [captive_dns.c](main/captive_dns.c) binds UDP :53 and
+  answers *every* A query with the SoftAP's own address (read from the netif,
+  not hardcoded). Non-A queries — AAAA above all, which every phone asks
+  alongside A — get an **empty NOERROR rather than silence**, because silence
+  costs the client a multi-second timeout.
+- **HTTP redirect** — `prov_redirect_err_handler` in
+  [wifi_manager.c](main/wifi_manager.c) is registered as the prov server's
+  `HTTPD_404_NOT_FOUND` handler and 302s everything unknown to the setup page.
+
+Together these mean the phone's connectivity probe (`/generate_204` on
+Android, `/hotspot-detect.html` on Apple, `/connecttest.txt` on Windows)
+arrives here instead of at Google/Apple/Microsoft. Each OS wants a very
+specific success response; a 302 isn't it, so the OS concludes it is behind a
+captive portal and **opens the setup page automatically**.
+
+It also fixes `binlight.local` for clients with no working mDNS — Android's
+browser being the one that matters. The name now resolves through the hijack
+rather than through multicast DNS, so it no longer depends on Bonjour support.
+
+**Three things that must not be "tidied":**
+1. **`captive_dns_stop()` is called first and unconditionally in the AutoAP
+   teardown**, before `httpd_stop()`. A DNS server answering every query with
+   one address is indistinguishable from an attack if it outlives the AP.
+2. **Answers carry TTL 0.** A phone that cached `binlight.local → 192.168.4.1`
+   and then joined the home network would fail to reach the device by name
+   until the entry expired.
+3. **The 302 points at the literal IP, not `binlight.local`.** The sandboxed
+   browser an OS opens for a captive portal is exactly where name resolution is
+   least dependable.
+
+**Host-tested** — `test_captive_dns.c`, built with UBSan. `build_reply()`
+parses packets from anything that can associate to an *open* AP, so every
+length field in its input is attacker-controlled and the failure mode is a
+read off the end of the buffer, not a wrong answer. Coverage is mostly hostile
+input: truncation at every length, compression pointers in the question
+(rejected — a query has nothing to compress against), non-QUERY opcodes,
+responses submitted as queries, zero-question packets, an oversized name that
+would push the answer past the buffer, and a byte-level mutation sweep.
+**AddressSanitizer would be the better tool and is deliberately not used**:
+an `-fsanitize=address` binary hangs before `main()` on this Mac, confirmed
+both inside and outside the tool sandbox. See the note in `run.sh` — enable it
+if you are ever on a machine where it works.
+
+**Not yet verified on hardware.** Whether the portal actually auto-opens is
+per-OS behaviour that can only be confirmed with a real phone.
+
 **Reclassified from "stretch goal" to prerequisite for giving a device to
 anyone else — see §1.1.** Currently Wi-Fi credentials are Kconfig-only
 (compiled in, changing them means reflashing) — a deliberate simplification
@@ -2237,6 +2288,7 @@ three different things that are easy to conflate.
 | §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ❌ **not tested** |
 | §3.12 action button (tap: dismiss / show next) | ✅ | ✅ | ✅ verified (GPIO 1 confirmed) |
 | §3.4 AutoAP onboarding | ✅ | ✅ | ❌ **not tested** — was unreachable on the flashed build (§6 bug 21) |
+| §3.4.0 captive portal (DNS hijack + 302) | ✅ | ✅ host-tested (UBSan) | ❌ **not tested** — auto-open is per-OS, needs a real phone |
 | §3.4 "Forget this network" | ✅ | ✅ | ⚠️ **tested 2026-07-27, did not reach AutoAP** — §6 bug 21, fixed, not yet flashed |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
@@ -2283,7 +2335,7 @@ guesses from the published pinout.
   The assistant can build (and has, all session). It cannot flash or observe
   hardware — every flash/verify step is the owner's.
 - **Host tests**: `./test/host/run.sh` — no ESP-IDF, no device, just `cc`.
-  Five suites, 128 assertions. `./test/host/run.sh render` additionally writes
+  Six suites, 155 assertions. `./test/host/run.sh render` additionally writes
   every web page to `test/host/out/*.html` and prints their sizes, which is how
   `HTML_BUF_SIZE` is checked. **Run this before committing**; it compiles the
   real `schedule.c` / `waste_api.c` / `web_server.c` / `buttons.c` against thin
@@ -2390,10 +2442,12 @@ automatic updates (§3.5), factory reset (§3.12), and the restart/action button
    a factory reset lands you in AutoAP anyway, so they test together. Detail:
    - UI reset: the *first* POST must only warn; "take me back" must work.
    - LEDs breathe white; a `binlight-XXXX` network appears.
-   - Join it, then **try `http://binlight.local/` first and record whether it
-     resolved on that phone** — that is the open question in §3.9, and the
-     answer is client-dependent. Fall back to `http://192.168.4.1/`, which
-     always works, rather than treating a failure as a blocker.
+   - Join it and **wait a moment without touching the browser** — the captive
+     portal (§3.4.0) should open the setup page by itself. Record whether it
+     did; that is per-OS behaviour and the whole reason it was built.
+   - If it doesn't, try `http://binlight.local/`, then `http://192.168.4.1/`.
+     Record which of the three worked — that distinguishes "portal detection
+     didn't fire" from "DNS hijack isn't working" from "both are broken".
    - **Deliberately enter a wrong password first** — it must fail *on the
      page* and store nothing.
    - Correct password → AP disappears, `binlight.local` works on the LAN.

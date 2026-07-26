@@ -9,10 +9,12 @@
 #include "esp_http_server.h"
 #include "esp_log.h"
 #include "esp_mac.h"
+#include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs.h"
 #include "sdkconfig.h"
 
+#include "captive_dns.h"
 #include "led_state.h"
 
 static const char *TAG = "wifi_manager";
@@ -420,6 +422,40 @@ static esp_err_t prov_provision_post_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// Any path we don't serve gets bounced to the setup page. This is the other
+// half of the captive portal (see captive_dns.h): with DNS hijacked, a phone's
+// connectivity probe - /generate_204 on Android, /hotspot-detect.html on
+// Apple, /connecttest.txt on Windows - arrives here instead of at Google,
+// Apple or Microsoft. Each OS expects a very specific success response, so
+// anything else, this 302 included, is read as "a captive portal is holding
+// me" and the setup page is opened automatically.
+//
+// Redirects to the literal AP address, not binlight.local: the sandboxed
+// browser an OS opens for a captive portal is exactly where name resolution
+// is least dependable, and this is the one URL guaranteed to work.
+static esp_err_t prov_redirect_err_handler(httpd_req_t *req, httpd_err_code_t error)
+{
+    char url[40];
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t *ap = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap != NULL && esp_netif_get_ip_info(ap, &ip_info) == ESP_OK && ip_info.ip.addr != 0) {
+        snprintf(url, sizeof(url), "http://" IPSTR "/", IP2STR(&ip_info.ip));
+    } else {
+        snprintf(url, sizeof(url), "http://192.168.4.1/");
+    }
+
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", url);
+    // Some probes look at the body as well as the status, so don't leave it
+    // empty - a link is also the manual way out if the OS shows the page
+    // without following the redirect.
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_sendstr(req, "<!DOCTYPE html><html><body>"
+                             "<p>Bin light setup: <a href='/'>continue</a></p>"
+                             "</body></html>");
+    return ESP_OK; // handled; keep the connection usable
+}
+
 static esp_err_t prov_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -439,6 +475,7 @@ static esp_err_t prov_server_start(void)
     const httpd_uri_t provision = { .uri = "/provision", .method = HTTP_POST, .handler = prov_provision_post_handler };
     httpd_register_uri_handler(s_prov_server, &root);
     httpd_register_uri_handler(s_prov_server, &provision);
+    httpd_register_err_handler(s_prov_server, HTTPD_404_NOT_FOUND, prov_redirect_err_handler);
     return ESP_OK;
 }
 
@@ -482,6 +519,12 @@ static void run_autoap(void)
         // at least visible, and keep retrying stored creds below.
     }
 
+    // Captive portal (captive_dns.h). Non-fatal: without it the setup page
+    // still works, it just has to be reached by typing the address.
+    if (captive_dns_start() != ESP_OK) {
+        ESP_LOGW(TAG, "captive DNS unavailable - setup needs a typed-in address");
+    }
+
     ESP_LOGI(TAG, "AutoAP up: join \"%s\" and browse to http://binlight.local/ (or http://192.168.4.1/)",
              (char *)ap_config.ap.ssid);
 
@@ -505,6 +548,11 @@ static void run_autoap(void)
 
     // Give the success page time to reach the phone before the AP vanishes.
     vTaskDelay(pdMS_TO_TICKS(AUTOAP_LINGER_MS));
+    // Stop the hijack first and unconditionally. A DNS server still answering
+    // every query with one address once the device is on the home network
+    // would be indistinguishable from an attack, so it must not outlive the
+    // AP by even the moment httpd_stop() takes.
+    captive_dns_stop();
     if (s_prov_server != NULL) {
         httpd_stop(s_prov_server);
         s_prov_server = NULL;

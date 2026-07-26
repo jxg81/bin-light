@@ -52,6 +52,22 @@ echo
 "$OUT/test_buttons" 2>/dev/null || status=1
 
 echo
+echo "building test_captive_dns..."
+# Parses packets from anything that can associate to an open AP, so this one is
+# built with UBSan on - the bugs that matter here are memory-safety bugs, which
+# a plain assertion pass would sail straight past.
+#
+# AddressSanitizer would be the better tool and is deliberately NOT used: on
+# this Mac an -fsanitize=address binary hangs before main() (confirmed both
+# inside and outside the tool sandbox, so it is the local toolchain, not the
+# harness). If you are on a machine where it works, add `address,` below - the
+# test is written to be worth it, and the loops at the end exist precisely to
+# give a sanitizer something to catch.
+cc -o "$OUT/test_captive_dns" test_captive_dns.c $CFLAGS -fsanitize=undefined -g
+echo
+"$OUT/test_captive_dns" 2>/dev/null || status=1
+
+echo
 echo "building test_backends..."
 # Compiles the real waste_api.c against captured council payloads (fixtures/).
 # cJSON comes straight from the managed component - same code as the device.
