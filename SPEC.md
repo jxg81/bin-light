@@ -2283,41 +2283,55 @@ three different things that are easy to conflate.
 | Merri-bek cpage self-discovery + year-derived URLs | ✅ | ✅ | ⚠️ normal path verified; the *rediscovery* branch only fires on failure, so still host-tested only |
 | DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
 | §3.12 **restart** (web UI + shared function) | ✅ | ✅ | ✅ verified |
-| §3.12 **factory reset** (web UI, two-step confirm) | ✅ | ✅ | ⚠️ **tested 2026-07-27, found two bugs (§6 21, 22)** — erase works; hang + Wi-Fi persistence fixed, **fixes not yet flashed** |
+| §3.12 **factory reset** (web UI, two-step confirm) | ✅ | ✅ | ✅ **verified 2026-07-27** — erases, restarts cleanly, lands in AutoAP (§6 bugs 21, 22 fixed and confirmed) |
 | §3.12 reset button, 3s hold → restart | ✅ | ✅ | ✅ verified (GPIO 2 confirmed) |
-| §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ❌ **not tested** |
+| §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ❌ **not tested** — the UI path is confirmed, this second entry point never has been |
 | §3.12 action button (tap: dismiss / show next) | ✅ | ✅ | ✅ verified (GPIO 1 confirmed) |
-| §3.4 AutoAP onboarding | ✅ | ✅ | ❌ **not tested** — was unreachable on the flashed build (§6 bug 21) |
-| §3.4.0 captive portal (DNS hijack + 302) | ✅ | ✅ host-tested (UBSan) | ❌ **not tested** — auto-open is per-OS, needs a real phone |
-| §3.4 "Forget this network" | ✅ | ✅ | ⚠️ **tested 2026-07-27, did not reach AutoAP** — §6 bug 21, fixed, not yet flashed |
+| §3.4 AutoAP onboarding | ✅ | ✅ | ✅ **verified 2026-07-27** — full first-run provisioning works |
+| §3.4.0 captive portal (DNS hijack + 302) | ✅ | ✅ host-tested (UBSan) | ✅ **verified 2026-07-27** — the setup page auto-opened |
+| §3.4 mDNS *during* AutoAP (§3.9 reorder) | ✅ | ✅ | ✅ **verified 2026-07-27** — dismissing the portal and browsing `binlight.local` still reached the setup page, so the hijack and the pre-wifi `mdns_start()` both work |
+| §3.4 wrong-password rejection at provisioning | ✅ | ✅ | ❓ **not confirmed** — credentials are verified by joining *before* being persisted; a typo must fail on the page and store nothing |
+| §3.4 "Forget this network" | ✅ | ✅ | ❓ **not confirmed on the fixed build** — this is the path that failed as §6 bug 21, and it uses `wifi_manager_forget_credentials()`, *not* the `factory_reset_erase()` path that was just verified |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA (GitHub-hosted, auto-update, rollback) | ✅ | ✅ | ❌ **not tested** — no 1.0.1 published yet |
 
-**Everything is flashed and, with the exceptions below, tested on hardware**
-(owner's reports, 2026-07-26 and 2026-07-27).
+**Everything is written, flashed and — with the exceptions below — verified on
+hardware** (owner's reports, 2026-07-26 and 2026-07-27).
 
-**⚠️ The build currently on the device is one commit behind.** Factory reset
-was exercised on 2026-07-27 and found two real bugs — §6 **21** (the compiled-in
-Wi-Fi fallback defeating both factory reset and "forget Wi-Fi") and §6 **22**
-(the reset hanging after a successful erase). Both are fixed and build clean,
-but **the fixes have not been flashed**, so the device still exhibits both.
-Bug 21 also means AutoAP was *unreachable* on the flashed build — it was never
-the onboarding flow failing.
+The 2026-07-27 session closed out the two features that had been outstanding
+longest. Factory reset via the web UI erases, restarts cleanly and lands in
+AutoAP; AutoAP then provisions successfully, with the captive portal opening
+the setup page by itself. Dismissing the portal and browsing `binlight.local`
+also reached the page, which independently confirms the DNS hijack *and* the
+§3.9 reordering that starts mDNS before `wifi_manager_start()`. §6 bugs 21 and
+22, found earlier the same day, are fixed and confirmed fixed.
 
-Still untested:
+**The one substantial gap left is §3.5 OTA**, which has never been exercised
+end to end — no release has been published, so the manifest fetch, the image
+download, the GitHub TLS chain against the CA bundle, and the rollback path
+have all only ever been reasoned about. Per §1.1 this is the feature the whole
+deployment story rests on: without it, a council API change means physically
+collecting devices. It is also the riskiest thing to leave untested, because
+what makes automatic updates safe is rollback, and rollback is itself untested.
 
-1. **Factory reset, end to end** — the erase half is confirmed working; the
-   restart half needs a re-test on the fixed build. The reset button's
-   10-second hold has never been tried at all.
-2. **AutoAP onboarding** — the whole first-run provisioning flow. Now actually
-   reachable once the fix is flashed.
+Three smaller gaps, all cheap:
 
-They are related: both are hard to exercise casually because both *destroy
-working configuration*, which is exactly why they have been left. See
-"▶ Agreed next step" below for how to test them without losing a working
-setup, and note that testing factory reset lands you in AutoAP anyway — so
-one deliberate session covers both.
+1. **The reset button's 10-second hold.** The UI factory reset is confirmed;
+   this second entry point into the *same* function never has been. The 3s
+   restart branch is verified, so what is unproven is specifically the
+   3s-vs-10s discrimination — and getting that wrong turns "restart" into
+   "wipe everything".
+2. **Wrong-password rejection at provisioning.** Credentials are verified by
+   joining before they are persisted, so a typo should fail *on the page* and
+   store nothing. Untested; the failure mode is a device that stores a bad
+   password and reboots into a loop.
+3. **"Forget this network".** Distinct from factory reset — it calls
+   `wifi_manager_forget_credentials()`, not `factory_reset_erase()` — and it is
+   the exact path that failed as §6 bug 21. Verifying the reset path does not
+   verify this one.
+
+See "▶ Agreed next step" below.
 
 Everything else in the table above has been exercised on the device,
 **including both buttons** — which confirms the GPIO 1 / GPIO 2 assignments
@@ -2423,40 +2437,55 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: flash, then one session for the three untested features
+### ▶ Agreed next step: prove the OTA round trip
 
-**§1.2 is met** — all five working-group councils verified on hardware. Since
-that test, three further features have landed and **none is flashed**: OTA with
-automatic updates (§3.5), factory reset (§3.12), and the restart/action buttons
-(§3.12, partly tested — see the table).
+**§1.2 is met** — all five working-group councils verified on hardware.
+**Factory reset and AutoAP are now closed out too** (2026-07-27), including the
+captive portal. What remains is one substantial item and three cheap ones.
 
-1. ~~**Flash.**~~ **Done 2026-07-26** — the OTA partition table is live and the
-   device is running 1.0.0.
-2. **Prove the OTA round trip.** Bump `version.txt` to 1.0.1, build, tag, cut a
-   GitHub Release with the `.bin`, update `firmware/latest.json`
-   ([firmware/README.md](firmware/README.md) has the checklist), then let the
-   device find it. This is also the **first genuine test of GitHub's TLS chain
-   against the CA bundle** — the chain validates offline (§3.5) but has never
-   run on the device.
-3. **Factory reset and AutoAP, in one session.** Both destroy configuration and
-   a factory reset lands you in AutoAP anyway, so they test together. Detail:
-   - UI reset: the *first* POST must only warn; "take me back" must work.
-   - LEDs breathe white; a `binlight-XXXX` network appears.
-   - Join it and **wait a moment without touching the browser** — the captive
-     portal (§3.4.0) should open the setup page by itself. Record whether it
-     did; that is per-OS behaviour and the whole reason it was built.
-   - If it doesn't, try `http://binlight.local/`, then `http://192.168.4.1/`.
-     Record which of the three worked — that distinguishes "portal detection
-     didn't fire" from "DNS hijack isn't working" from "both are broken".
-   - **Deliberately enter a wrong password first** — it must fail *on the
-     page* and store nothing.
-   - Correct password → AP disappears, `binlight.local` works on the LAN.
-   - Re-set-up the council; confirm the light works.
-   - Then the reset button's 10s hold as a second entry point, and release at
-     ~5s to confirm it restarts rather than wipes.
-   - Watch that **nothing** survives: the timezone lives in a separate NVS
-     namespace, and the Wi-Fi driver keeps its own credential copy. Both are
-     handled; this is the chance to confirm it.
+1. ~~**Flash.**~~ **Done 2026-07-26**, and again 2026-07-27 with the bug 21/22
+   fixes and the captive portal.
+2. ~~**Factory reset and AutoAP.**~~ **Done 2026-07-27** — see the status
+   table. Found and fixed §6 bugs 21 and 22 along the way.
+3. **Prove the OTA round trip.** ← *the only large piece left.* Bump
+   `version.txt` to 1.0.1, build, tag, cut a GitHub Release with the `.bin`,
+   update `firmware/latest.json` ([firmware/README.md](firmware/README.md) has
+   the checklist), then let the device find it.
+
+   Three things get their first real exercise here, none of which has ever run
+   on the device:
+   - **GitHub's TLS chain against the CA bundle.** It validates offline (§3.5)
+     but has never been attempted from the ESP32. This is what
+     `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY` exists for.
+   - **The download and flash into the spare slot**, at ~1.3 MB over TLS.
+   - **Rollback.** `ota_mark_valid()` is what stops the bootloader reverting on
+     the next boot. Worth deliberately proving by publishing a build that
+     *cannot* reach Wi-Fi and confirming the device reverts itself — that is
+     the entire safety net under automatic updates, and it is unproven.
+
+   **Do this before the repo goes public or any device leaves the house.**
+   Auto-update is on by default (§3.5), so the first published release ships
+   itself to every device automatically. A broken one with an untested
+   rollback is the one failure that needs a USB cable to fix — the exact
+   outcome OTA exists to prevent.
+
+   Also grep the built `.bin` for credentials first — see §6 bug 21.
+
+4. **Three cheap gaps**, worth ten minutes in any session that touches the
+   device:
+   - **Reset button, 10s hold** → factory reset, and release at ~5s to confirm
+     it restarts rather than wipes. The UI path is proven; the button path into
+     the same function is not, and this boundary is where the asymmetry bites.
+   - **Wrong password at provisioning** — must fail on the page and store
+     nothing.
+   - **"Forget this network"** — the §6 bug 21 path, and *not* the same code
+     as the factory reset that was just verified. Note it should keep the
+     schedule and council setup, unlike a factory reset.
+
+   One thing to watch on the next factory reset: confirm the **timezone** is
+   gone too. It lives in the separate `binlight_cfg` namespace, which is
+   handled, but a device claiming to be factory-fresh while still in
+   Australia/Melbourne would be the tell that it isn't.
 
 After that, in priority order:
 
