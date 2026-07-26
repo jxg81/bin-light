@@ -36,6 +36,18 @@ asset. Nothing to host, nothing to keep running.
 **Do steps 3 and 4 in that order.** Publishing the manifest before the asset
 exists means every device that checks in the gap gets a failed download.
 
+> **⚠️ The asset filename must be exactly `bin-light.bin`, and don't fetch the
+> URL before it is.** `gh release create file#label` sets the *display label*,
+> not the filename — the download URL always uses the real filename, so upload
+> a file actually named `bin-light.bin` (copy it, don't rely on `#`).
+>
+> And GitHub **caches the 404**. Requesting the download URL before the asset
+> is in place under that name poisons it for a few minutes, so the URL keeps
+> 404ing after you fix the upload. `?cb=1` on the end proves whether it is
+> really fixed. Both of these were hit for real publishing 1.0.2.
+>
+> Always confirm the plain URL returns 200 *before* committing `latest.json`.
+
 ## Rolling back
 
 Publish the *older* version in `latest.json`. The device compares for
