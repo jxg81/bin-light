@@ -670,7 +670,7 @@ for the council APIs may also be load-bearing for OTA.
 and the first flash of this build is also the first test of the new partition
 table.
 
-### 3.6 Alternating multi-week manual / fallback schedule (implemented; rename + reframing planned)
+### 3.6 Alternating multi-week manual / fallback schedule (implemented)
 
 **Requirement**: the bin night (the evening bins go out — not the collection day
 itself) is always the same single weekday, and that night's colour cycles through
@@ -914,7 +914,7 @@ lighting rules, colour precedence) is unchanged; only where that logic lives
 is moving, specifically so the live evaluator and "Display Next Collection"
 (§3.8) can no longer diverge the way they just did in real testing.
 
-### 3.8 On-demand "Display Next Collection" button on the home page (implemented as "Test"; rename + rework planned)
+### 3.8 On-demand "Display Next Collection" button on the home page (implemented)
 
 **Requirement**: once the light is configured (manual/fallback schedule or
 API), a button on the home page should light both LEDs immediately — using
@@ -1174,7 +1174,7 @@ catches buffer truncation before the device does.
   rework): the button is renamed to **"Display Next Collection (30 seconds)"**
   and `TEST_PREVIEW_DURATION_MS` dropped from 2 minutes to 30 seconds.
 
-### 3.12 Physical buttons (planned; the factory-reset action is built and exposed in the UI)
+### 3.12 Physical buttons, restart and factory reset (implemented)
 
 **Factory reset — implemented as a shared function + web UI action
 (2026-07-26).** [factory_reset.h](main/factory_reset.h)/[factory_reset.c](main/factory_reset.c)
@@ -1381,7 +1381,7 @@ off, pressing it displays the next scheduled collection for 30 seconds.*
 - `buttons_init()`/`buttons_task_start()` called from `main.c` alongside the
   other module inits.
 
-### 3.13 Multi-council API coverage — research findings (planned, not yet implemented)
+### 3.13 Multi-council API coverage (implemented for the working group; SA outstanding)
 
 Prompted by [mampfes/hacs_waste_collection_schedule](https://github.com/mampfes/hacs_waste_collection_schedule),
 a Home Assistant integration with **224 Australian council entries**. Its value
@@ -2229,63 +2229,54 @@ Everything else in the table above has been exercised on the device,
 and the touch module's active-HIGH polarity, previously flagged as unverified
 guesses from the published pinout.
 
-### ⚠️ Likely second cause of the Test-button failure — check this first
-
-`default_schedule()` in [schedule.c](main/schedule.c) does **not** set
-`brightness`, so the zero-initialised default is **0**. Both
-`schedule_task_fn()` and `schedule_test_trigger()` pass that value straight to
-`led_state_set_dual(..., brightness)`, which scales every channel by
-`brightness/255` — **so at brightness 0 the LEDs are black no matter what colour
-was resolved.**
-
-The §3.7 work bumped the NVS schema to v5, which forced a one-time reset to
-those defaults on the user's device. Unless brightness was manually moved off 0
-in the web UI afterwards, **the device has been sitting at brightness 0 ever
-since** — which would make the Test button appear to do nothing regardless of
-whether the preview logic was right.
-
-**RESOLVED — flashed and confirmed working on hardware.** The button now
-lights the LEDs. Since the light was previously black and nothing else about
-the colour resolution changed, **the brightness-0 bug was the real cause**,
-and the earlier `schedule_preview_next()` relaxation (flashed at the same
-time) was fixing a secondary issue at most. The self-heal path in
-`schedule_init()` is therefore also confirmed working — the device repaired
-its stored zero-brightness blob without a factory reset, exactly as designed.
-
-Retained as a worked example: the reported symptom ("Test button does
-nothing") pointed at the feature that was just written, while the actual
-defect was a zero default in unrelated, older code. The discriminator that
-would have found it faster is the boot self-test, which runs at hard-coded
-brightness 255 and so isolates the LED path from all stored state.
-
-**Useful discriminator**: the §3.10 boot self-test runs at hard-coded brightness
-255, deliberately ignoring the stored setting. So if the LEDs cycle colours at
-boot but the Test button does nothing, that is near-conclusive evidence of the
-brightness-0 bug rather than a colour-resolution bug — the hardware and the LED
-path are demonstrably fine.
-
 ### Environment facts that aren't visible from the source
 
-- **Not a git repository.** No version control, no history, no branches — every
-  edit is destructive, and there is no "revert" available. Worth initialising
-  before the large §3.3/§3.13 refactor; also a prerequisite if GitHub Releases
-  is ever chosen for OTA hosting (§3.5).
-- **No ESP-IDF toolchain in the assistant's environment.** `idf.py build` has
-  never been run by the assistant and cannot be. Every build/flash/verify step
-  is the user's, and nothing below the "Code" column above should be assumed to
-  compile until they say so.
-- **Wi-Fi credentials live in `main/Kconfig.projbuild` as plaintext defaults.**
-  This is a real publication hazard given §3.5 contemplates GitHub-hosted OTA
-  images and §1.1 contemplates giving devices away: **if this project is ever
-  pushed to a public repository, those credentials go with it** (and remain in
-  git history even if later removed). Resolve by moving them to a
-  git-ignored `sdkconfig.defaults.local`, or by landing §3.4 AutoAP first so
-  compiled-in credentials stop existing altogether — the latter is the real
-  fix, and is already a §1.1 prerequisite for distribution.
-- **Assistant network probes run from a datacenter IP.** Council endpoints may
-  return 403 here and work fine from the user's home connection — this already
-  produced one wrong conclusion about Monash (§3.13.4). Never conclude "blocked"
-  without a residential re-test.
+- **Build**: the ESP-IDF environment is NOT on the default PATH, and
+  `~/esp/esp-idf/export.sh` does not exist. The working activation is the EIM
+  script:
+  ```
+  . /Users/julian/.espressif/tools/activate_idf_v6.0.2.sh && idf.py build
+  ```
+  The assistant can build (and has, all session). It cannot flash or observe
+  hardware — every flash/verify step is the owner's.
+- **Host tests**: `./test/host/run.sh` — no ESP-IDF, no device, just `cc`.
+  Five suites, 128 assertions. `./test/host/run.sh render` additionally writes
+  every web page to `test/host/out/*.html` and prints their sizes, which is how
+  `HTML_BUF_SIZE` is checked. **Run this before committing**; it compiles the
+  real `schedule.c` / `waste_api.c` / `web_server.c` / `buttons.c` against thin
+  stubs, so it catches far more than its size suggests.
+- **`sdkconfig` is gitignored and caches Kconfig values.** A changed Kconfig
+  *default* does NOT reach an existing build — the stored value wins. This
+  already bit once (the reset-button GPIO stayed at 9 after the default moved
+  to 2). Change both, or `idf.py menuconfig`.
+- **Wi-Fi credentials are no longer compiled in.** `Kconfig.projbuild`'s
+  SSID/password default to `""`, real values live only in the gitignored
+  `sdkconfig`, and AutoAP (§3.4) is the real path. **Verified: no credential
+  has ever been committed.**
+- **Network probing.** The assistant's sandbox has internet but runs from a
+  datacenter IP, and both it and the owner's Mac were behind a Zscaler
+  TLS-intercepting client agent for part of this work — which produced *two*
+  wrong diagnoses about Monash (§3.13.4) and initially made GitHub's
+  certificate chain unverifiable (§3.5). The owner can disable Zscaler on
+  request, and has authorised running probes from their machine
+  (`dangerouslyDisableSandbox`) when a residential path matters. **Never
+  conclude "blocked" from a sandbox result alone.**
+
+### Repository and history
+
+- **`https://github.com/jxg81/bin-light`, private.** `main` only.
+- **History was rewritten on 2026-07-26** to remove the owner's real home
+  address from four commits, and the repo was **deleted and recreated** so the
+  old objects are gone from GitHub's servers rather than merely unreferenced.
+  **Every commit SHA changed** (tip `607415d`, previously `f102501`).
+  Consequence worth remembering: **any older clone has a divergent history and
+  would push the address back** if used.
+- Verified by fresh clone afterwards: 25 commits, zero occurrences of the
+  address in file contents or commit messages, `sdkconfig` never tracked, no
+  Wi-Fi credential ever committed.
+- **Before making the repo public**: nothing sensitive remains, but SPEC.md
+  does name Maribyrnong as "(home)" and the council set narrows the owner to a
+  Melbourne suburb. That is a judgement call, not a leak.
 
 ### ⚠️ Palette changes do not reach already-saved rules (known wrinkle)
 
@@ -2325,62 +2316,44 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: one session to test factory reset + AutoAP
+### ▶ Agreed next step: flash, then one session for the three untested features
 
-**§1.2 is met and the device is fully exercised bar two features.** Everything
-built to date is flashed and working on hardware, including both buttons —
-which retires the GPIO 1 / GPIO 2 and touch-polarity guesses.
+**§1.2 is met** — all five working-group councils verified on hardware. Since
+that test, three further features have landed and **none is flashed**: OTA with
+automatic updates (§3.5), factory reset (§3.12), and the restart/action buttons
+(§3.12, partly tested — see the table).
 
-**The two untested features are factory reset and AutoAP onboarding**, and
-they are best done together in one deliberate session, because a factory reset
-lands the device in AutoAP anyway. Both destroy working configuration, so do
-this when you are willing to set the device up again.
-
-Suggested run, which tests both and ends with a working device:
-
-1. **Note what you'll have to re-enter**: Wi-Fi, council + address, colour
-   mapping, and any manual schedule. Everything else is defaults.
-2. **Factory reset from the web UI.** Confirm the "Are you sure?" page lists
-   what is lost, that the *first* POST does not wipe, and that "No, take me
-   back" works. Then confirm.
-3. **Watch the LEDs**: they should start breathing white within a few seconds,
-   and a Wi-Fi network named `binlight-XXXX` should appear (last 4 hex of the
-   station MAC).
-4. **AutoAP onboarding**: join that network, browse to `http://192.168.4.1/`.
-   Check the network list is populated. **Deliberately enter a wrong password
-   first** — it must report failure *on the page* and must not store anything.
-   Then the correct one: it should report success, the AP should disappear,
-   and `binlight.local` should work again.
-5. **Re-set-up the council** and confirm the light works as before.
-6. **Factory reset via the button** (10-second hold) is then worth one more
-   pass, since it is a different entry point into the same function: watch for
-   the LEDs going blue at 3s and red at 10s, and confirm releasing at, say,
-   5 seconds restarts rather than wipes.
-
-Two things to watch for specifically, being the parts host tests cannot prove:
-
-- **Nothing should survive the reset.** In particular the timezone lives in a
-  *separate* NVS namespace (`binlight_cfg`) from everything else, and the
-  Wi-Fi driver keeps its own copy of the last credentials — both are handled,
-  but this is the one chance to confirm it rather than trust it.
-- **A wrong Wi-Fi password must not be persisted.** Provisioning verifies
-  credentials by actually joining before saving, so a typo should leave the
-  device still in AutoAP rather than rebooting into a network it cannot reach.
+1. **Flash.** This is also the first test of the **new OTA partition table**.
+   `nvs` did not move, so the config *should* survive — confirm it does rather
+   than assume. Expect the Firmware section to report **1.0.0**.
+2. **Prove the OTA round trip.** Bump `version.txt` to 1.0.1, build, tag, cut a
+   GitHub Release with the `.bin`, update `firmware/latest.json`
+   ([firmware/README.md](firmware/README.md) has the checklist), then let the
+   device find it. This is also the **first genuine test of GitHub's TLS chain
+   against the CA bundle** — the chain validates offline (§3.5) but has never
+   run on the device.
+3. **Factory reset and AutoAP, in one session.** Both destroy configuration and
+   a factory reset lands you in AutoAP anyway, so they test together. Detail:
+   - UI reset: the *first* POST must only warn; "take me back" must work.
+   - LEDs breathe white; a `binlight-XXXX` network appears.
+   - Join it, browse `http://192.168.4.1/`, **deliberately enter a wrong
+     password first** — it must fail *on the page* and store nothing.
+   - Correct password → AP disappears, `binlight.local` works.
+   - Re-set-up the council; confirm the light works.
+   - Then the reset button's 10s hold as a second entry point, and release at
+     ~5s to confirm it restarts rather than wipes.
+   - Watch that **nothing** survives: the timezone lives in a separate NVS
+     namespace, and the Wi-Fi driver keeps its own credential copy. Both are
+     handled; this is the chance to confirm it.
 
 After that, in priority order:
 
-1. **Flash the OTA build** (§3.5) — it is written but unflashed, and the
-   flash itself is the test of the new partition table. Confirm the config
-   survives (it should: `nvs` did not move), then check the Firmware section
-   reports 1.0.0, and do one real end-to-end update by publishing a 1.0.1.
-   That last step is also the first genuine test of GitHub's TLS chain
-   against the CA bundle.
-2. **§3.14 battery life** — design recorded, not started. Gated on four
-   current measurements (§3.14.5), the most important being what the board
-   actually draws with Wi-Fi connected and idle. Needs no new hardware and no
-   rewiring; the radar idea was dropped.
-3. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated
-   on its lat/lon UX question. Zero value to the working group.
+1. **§3.14 battery life** — design recorded, not started. Gated on the four
+   current measurements in §3.14.5, the most important being what the board
+   draws with Wi-Fi connected and idle. No new hardware, no rewiring.
+2. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated on
+   its lat/lon UX question. Zero value to the working group.
+3. **Make the repo public**, if still wanted (see "Repository and history").
 
 ### Open questions not yet resolved
 
