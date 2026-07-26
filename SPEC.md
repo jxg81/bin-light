@@ -1153,8 +1153,47 @@ built:
   Wi-Fi and keeps everything else. The home page describes each by what it
   **keeps**, since that difference is the whole reason both exist.
 
-The button-specific parts below (GPIO choice, long-press debouncing, the
-action button) remain unimplemented.
+**Reset button — implemented (2026-07-26).** [buttons.h](main/buttons.h)/[buttons.c](main/buttons.c),
+with the press durations the owner specified:
+
+| Hold | Action |
+|---|---|
+| < 3s | nothing, deliberately |
+| 3s – 10s | **restart** (nothing is lost) |
+| ≥ 10s | **factory reset** (everything is lost) |
+
+- **This supersedes the 5-second long-press proposal below.** One button now
+  carries two actions rather than one, separated by hold time.
+- **The action fires on release, not on reaching the threshold.** Letting go
+  early is therefore always a safe cancel, and the 3s→10s span gives seven
+  full seconds to change your mind after restart arms.
+- **The LEDs say which action is armed while you hold** — added because
+  nobody can time a ten-second hold by feel, and the failure mode of guessing
+  is wiping a configured device. Nothing below 3s, then steady **blue** for
+  restart, then steady **red** for factory reset. Deliberately not the bin
+  palette (these are device states, not collections) and deliberately steady
+  rather than flashing, so it reads as "waiting for you" rather than "busy".
+  On release without an action the LEDs are handed straight back to the
+  schedule via `schedule_task_force_check()`.
+- **Polled at 50ms, not interrupt-driven**: the entire job is measuring a
+  multi-second hold, so an ISR would buy nothing and would split the timing
+  across two places. Debounce is two agreeing samples (100ms) — far longer
+  than switch bounce, imperceptible to the presser.
+- **GPIO is a Kconfig option** (`CONFIG_BINLIGHT_RESET_BUTTON_GPIO`, default
+  **9**, `-1` disables). 9 is the **existing BOOT button on the Seeed XIAO
+  ESP32-C6**, so the feature needs no extra hardware — worth knowing that it
+  is a strapping pin: holding it *while the device powers up* enters serial
+  download mode instead. That affects only power-on, never presses during
+  normal running, and is also how you would deliberately enter flashing mode.
+  **Not yet confirmed against the board in hand** — this is the one thing to
+  check when it's flashed.
+- **Thresholds are host-tested** (`test/host/test_buttons.c`) including the
+  exact boundary milliseconds and a sweep asserting that *no* tick in
+  [3s, 10s) can resolve to a factory reset — the asymmetry that matters is
+  arming the destructive action too early.
+
+The remaining button work is the **second (action) button**: display-next /
+cancel-tonight, which still needs `schedule_suppress_current()`.
 
 **Requirement**: three physical button actions, without needing the web UI:
 1. **Factory reset.**
@@ -1174,7 +1213,10 @@ off, pressing it displays the next scheduled collection for 30 seconds.*
 - **Two physical buttons total**, not three: a dedicated **factory reset**
   button, and one combined **action button** covering both (2) and (3) via
   the state-dependent logic above.
-- **Factory reset requires a long press** (proposed: hold 5 seconds) rather
+- ~~**Factory reset requires a long press** (proposed: hold 5 seconds)~~
+  **Superseded — now 10 seconds, with 3 seconds giving a restart instead**
+  (see "Reset button — implemented" above). The reasoning below still holds,
+  and applies more strongly at 10s. Original note: a long press rather
   than a single tap — not explicitly requested, but added deliberately since
   this is a destructive, hard-to-undo action (wipes NVS config back to
   defaults) sitting behind a bare GPIO with no confirmation dialog the way
@@ -1904,8 +1946,9 @@ three different things that are easy to conflate.
 | waste_api config v2→v3 migration | ✅ | ✅ | ✅ verified (existing setup survived) |
 | Merri-bek cpage self-discovery + year-derived URLs | ✅ | ✅ | ⚠️ normal path verified; the *rediscovery* branch only fires on failure, so still host-tested only |
 | DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
-| §3.12 factory reset (shared function + UI, two-step confirm) | ✅ | ❌ **not yet flashed** | ❌ |
-| §3.12 physical buttons (GPIO wiring, long-press, action button) | ❌ not written | — | — |
+| §3.12 factory reset + restart (shared functions, UI actions) | ✅ | ❌ **not yet flashed** | ❌ |
+| §3.12 reset button (3s restart / 10s factory reset, armed-colour feedback) | ✅ | ❌ **not yet flashed** | ❌ **GPIO 9 assumption unconfirmed** |
+| §3.12 action button (display-next / cancel-tonight) | ❌ not written | — | — |
 | §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ✅ | ❌ **the one untested item** — needs a deliberate setup, see below |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
@@ -2043,15 +2086,22 @@ page. Then check:
   works again.
 - Nothing else was lost (Forget) or everything was (Factory reset).
 
-Also unflashed: the **factory reset** work itself (§3.12) — the shared
-`factory_reset_perform()` and its two-step confirmation page.
+Also unflashed: the **§3.12 work** — factory reset and restart (both as UI
+actions and as shared functions), and the reset button itself.
+
+**When flashing that, confirm the button GPIO.** It defaults to **9**, the
+XIAO ESP32-C6's existing BOOT button, which was chosen from the board's
+documented pinout but **not verified against the board in hand**. If holding
+it does nothing, change `CONFIG_BINLIGHT_RESET_BUTTON_GPIO` — the code is
+otherwise pin-agnostic. Check: hold ~3s and both LEDs turn blue, hold past
+10s and they turn red, release to act, release before 3s and nothing happens.
 
 After that, in priority order:
-1. **§3.12 physical buttons** — the reset action already exists as a shared
-   function, so what's left is the GPIO work: pin choice on the XIAO
-   ESP32-C6 (strapping pins not yet checked — an open question below),
-   debouncing, the 5-second long-press guard, and the state-dependent action
-   button (display-next / cancel-tonight) with `schedule_suppress_current()`.
+1. **§3.12 action button** — the second button: display-next when the light
+   is off, cancel-tonight when it's on. Needs `schedule_suppress_current()`
+   in `schedule.c` (records the collection date currently lighting the light
+   and stays off for it, self-clearing once the resolved next-collection date
+   advances past it).
 2. **§3.5 OTA** — needs a partition-table rework (one 3MB `factory` slot →
    two OTA slots + `otadata`), so it means an `erase-flash`. **Best done
    before devices are handed out**, since after that a firmware fix means
@@ -2063,8 +2113,9 @@ After that, in priority order:
 
 1. **§3.13.2 (SA)**: how the user supplies lat/lon with no map or geocoder on
    the device — paste coordinates, add a geocoding dependency, or skip SA.
-2. **§3.12**: which GPIOs the two buttons use on the XIAO ESP32-C6 — pins not
-   yet chosen, and the board's usable/strapping pins not yet checked.
+2. **§3.12**: the reset button defaults to GPIO 9 (the XIAO ESP32-C6's BOOT
+   button) — taken from the documented pinout, **not yet confirmed on the
+   board in hand**. The second (action) button's pin is still unchosen.
 3. **§3.5 OTA**: image hosting, manual vs auto-check, and real partition sizes
    once an image with TLS is actually measured.
 4. **§3.7**: the `glass` → Purple default is inferred from the platform-wide

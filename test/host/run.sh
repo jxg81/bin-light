@@ -46,6 +46,12 @@ echo
 "$OUT/test_dates" 2>/dev/null || status=1
 
 echo
+echo "building test_buttons..."
+cc -o "$OUT/test_buttons" test_buttons.c $CFLAGS
+echo
+"$OUT/test_buttons" 2>/dev/null || status=1
+
+echo
 echo "building test_backends..."
 # Compiles the real waste_api.c against captured council payloads (fixtures/).
 # cJSON comes straight from the managed component - same code as the device.

@@ -603,12 +603,20 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         wifi_manager_current_ssid());
 
     off = safe_append(html, HTML_BUF_SIZE, off,
+        "<div class='sect'><h2>Restart</h2>"
+        "<form method='POST' action='/reboot'>"
+        "<button type='submit'>Restart the light</button></form>"
+        "<p class='note'><b>Nothing is lost</b> &mdash; the light just reboots. Same as "
+        "holding the reset button for 3 seconds.</p>"
+        "</div>");
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
         "<div class='sect'><h2>Factory reset</h2>"
         "<form method='POST' action='/factory-reset'>"
         "<button type='submit'>Factory reset&hellip;</button></form>"
         "<p class='note'>Erases <b>everything</b>, including the Wi-Fi network, and "
         "returns the light to how it left the workbench. You'll be asked to confirm "
-        "first.</p>"
+        "first. Same as holding the reset button for 10 seconds.</p>"
         "</div>");
 
     off = safe_append(html, HTML_BUF_SIZE, off, "</body></html>");
@@ -782,6 +790,37 @@ static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
 
     // Let the response actually flush before the reset.
     vTaskDelay(pdMS_TO_TICKS(1500));
+    esp_restart();
+    return ESP_OK; // not reached
+}
+
+// Restart the device (SPEC.md 3.12). Unlike the two resets below this loses
+// nothing - it's the "have you tried turning it off and on again" action for
+// a device that's misbehaving but still serving pages - so it goes straight
+// through with no confirmation step.
+static esp_err_t reboot_post_handler(httpd_req_t *req)
+{
+    static const char PAGE[] =
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<meta http-equiv='refresh' content='12; url=/'>"
+        "<title>Restarting</title>"
+        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
+        ".note{color:#888;}</style></head><body>"
+        "<h1>Restarting</h1>"
+        "<p>The light is restarting. Nothing has been changed &mdash; your Wi-Fi, "
+        "council setup and schedule are all still there.</p>"
+        "<p class='note'>You'll see the LEDs run their startup colour test. This page "
+        "will try to come back on its own in a few seconds; if it doesn't, browse to "
+        "<b>http://binlight.local</b> again.</p>"
+        "</body></html>";
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, PAGE, HTTPD_RESP_USE_STRLEN);
+
+    ESP_LOGW(TAG, "reboot requested from the web UI");
+    vTaskDelay(pdMS_TO_TICKS(1500)); // let the response reach the browser
     esp_restart();
     return ESP_OK; // not reached
 }
@@ -1545,7 +1584,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 10; // 9 in use, small headroom for future additions
+    config.max_uri_handlers = 11; // 10 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -1598,6 +1637,11 @@ esp_err_t web_server_start(void)
         .method = HTTP_POST,
         .handler = wifi_forget_post_handler,
     };
+    static const httpd_uri_t reboot_uri = {
+        .uri = "/reboot",
+        .method = HTTP_POST,
+        .handler = reboot_post_handler,
+    };
     static const httpd_uri_t factory_reset_uri = {
         .uri = "/factory-reset",
         .method = HTTP_POST,
@@ -1612,6 +1656,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &test_uri);
     httpd_register_uri_handler(server, &wifi_forget_uri);
+    httpd_register_uri_handler(server, &reboot_uri);
     httpd_register_uri_handler(server, &factory_reset_uri);
 
     ESP_LOGI(TAG, "HTTP server started");

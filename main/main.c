@@ -5,6 +5,7 @@
 #include "mdns.h"
 #include "nvs_flash.h"
 
+#include "buttons.h"
 #include "led_state.h"
 #include "schedule.h"
 #include "settings.h"
@@ -69,6 +70,7 @@ void app_main(void)
     ESP_ERROR_CHECK(web_server_start());
     ESP_ERROR_CHECK(schedule_task_start());
     ESP_ERROR_CHECK(waste_api_task_start());
+    ESP_ERROR_CHECK(buttons_start());
 
     ESP_LOGI(TAG, "bin light ready");
 }
