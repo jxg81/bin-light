@@ -1180,13 +1180,23 @@ with the press durations the owner specified:
   across two places. Debounce is two agreeing samples (100ms) — far longer
   than switch bounce, imperceptible to the presser.
 - **GPIO is a Kconfig option** (`CONFIG_BINLIGHT_RESET_BUTTON_GPIO`, default
-  **9**, `-1` disables). 9 is the **existing BOOT button on the Seeed XIAO
-  ESP32-C6**, so the feature needs no extra hardware — worth knowing that it
-  is a strapping pin: holding it *while the device powers up* enters serial
-  download mode instead. That affects only power-on, never presses during
-  normal running, and is also how you would deliberately enter flashing mode.
-  **Not yet confirmed against the board in hand** — this is the one thing to
-  check when it's flashed.
+  **2** — the pad marked `D2` on the XIAO ESP32-C6, `-1` disables). Wire a
+  momentary push button between the pin and GND; the internal pull-up means
+  no external resistor.
+
+  **The default was 9 (the on-board BOOT button) and has been changed**: the
+  board lives inside a sealed enclosure, so an on-board button is unreachable
+  and the button must be a panel-mounted one on its own pin. GPIO 2 was
+  chosen because it is broken out, has no special function, and — unlike 9 —
+  is **not a strapping pin**, which also removes the "don't hold it during
+  power-up" caveat entirely. **Avoid GPIO 4, 5, 8, 9 and 15** on the
+  ESP32-C6 for any panel button, since a button held across a power-up would
+  change how the chip boots.
+
+  Current pin allocation: GPIO 0 (`D0`) WS2812 data, GPIO 2 (`D2`) reset
+  button, `D1`/GPIO 1 reserved for the capacitive touch module (below).
+  Verify the pad-to-GPIO silkscreen on the actual board — the firmware takes
+  raw GPIO numbers, not `D` numbers.
 - **Thresholds are host-tested** (`test/host/test_buttons.c`) including the
   exact boundary milliseconds and a sweep asserting that *no* tick in
   [3s, 10s) can resolve to a factory reset — the asymmetry that matters is
@@ -1214,11 +1224,9 @@ is built:
 
 **Bench testing with no button attached**: the reset input is active-low with
 the internal pull-up on, so a bare jumper from the GPIO to GND is a working
-button — touch to press, pull away to release. On the XIAO ESP32-C6 the
-default GPIO 9 is the BOOT button, so it can be tested with no wiring at all.
-A press is logged as soon as it debounces, so wiring can be confirmed over
-serial without waiting for the 3-second LED feedback. Do not hold the pin low
-*through a power-up*: GPIO 9 is a strapping pin and that enters download mode.
+button — touch to press, pull away to release. A press is logged as soon as it
+debounces, so wiring can be confirmed over serial without waiting for the
+3-second LED feedback.
 
 The remaining button work is the **second (action) button**: display-next /
 cancel-tonight, which still needs `schedule_suppress_current()`.
@@ -1975,7 +1983,7 @@ three different things that are easy to conflate.
 | Merri-bek cpage self-discovery + year-derived URLs | ✅ | ✅ | ⚠️ normal path verified; the *rediscovery* branch only fires on failure, so still host-tested only |
 | DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
 | §3.12 factory reset + restart (shared functions, UI actions) | ✅ | ❌ **not yet flashed** | ❌ |
-| §3.12 reset button (3s restart / 10s factory reset, armed-colour feedback) | ✅ | ❌ **not yet flashed** | ❌ **GPIO 9 assumption unconfirmed** |
+| §3.12 reset button (3s restart / 10s factory reset, armed-colour feedback) | ✅ | ❌ **not yet flashed** | ❌ needs an external button on GPIO 2 |
 | §3.12 action button (display-next / cancel-tonight) | ❌ not written | — | — |
 | §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ✅ | ❌ **the one untested item** — needs a deliberate setup, see below |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
@@ -2117,12 +2125,13 @@ page. Then check:
 Also unflashed: the **§3.12 work** — factory reset and restart (both as UI
 actions and as shared functions), and the reset button itself.
 
-**When flashing that, confirm the button GPIO.** It defaults to **9**, the
-XIAO ESP32-C6's existing BOOT button, which was chosen from the board's
-documented pinout but **not verified against the board in hand**. If holding
-it does nothing, change `CONFIG_BINLIGHT_RESET_BUTTON_GPIO` — the code is
-otherwise pin-agnostic. Check: hold ~3s and both LEDs turn blue, hold past
-10s and they turn red, release to act, release before 3s and nothing happens.
+**The reset button needs wiring before it can be tested.** It defaults to
+**GPIO 2** (`D2`), expecting a momentary push button to GND — the on-board
+BOOT button is no longer used, since the board ends up inside a sealed
+enclosure. On a breadboard, a jumper from GPIO 2 to GND stands in for the
+button. Check: hold ~3s and both LEDs turn blue, hold past 10s and they turn
+red, release to act, release before 3s and nothing happens. A press is logged
+on serial as soon as it debounces, so wiring problems show up immediately.
 
 After that, in priority order:
 1. **§3.12 action button** — the second button: display-next when the light
@@ -2141,9 +2150,8 @@ After that, in priority order:
 
 1. **§3.13.2 (SA)**: how the user supplies lat/lon with no map or geocoder on
    the device — paste coordinates, add a geocoding dependency, or skip SA.
-2. **§3.12**: the reset button defaults to GPIO 9 (the XIAO ESP32-C6's BOOT
-   button) — taken from the documented pinout, **not yet confirmed on the
-   board in hand**. The second (action) button's pin is still unchosen.
+2. **§3.12**: the action button's pin is still unchosen (`D1`/GPIO 1 is the
+   pencilled-in reservation). The reset button is settled at GPIO 2.
 3. **§3.5 OTA**: image hosting, manual vs auto-check, and real partition sizes
    once an image with TLS is actually measured.
 4. **§3.7**: the `glass` → Purple default is inferred from the platform-wide

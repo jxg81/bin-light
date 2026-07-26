@@ -14,10 +14,11 @@
 // until 3s, then blue for restart, then red for factory reset. Letting go
 // below 3s is always a safe no-op.
 //
-// The input is active-low with the internal pull-up on, so on a breadboard a
-// bare jumper from the GPIO to GND *is* the button: touch to press, pull away
-// to release (which is what fires the action). On the Seeed XIAO ESP32-C6 the
-// default GPIO 9 is the existing BOOT button, so no wiring is needed at all.
+// Wiring: a momentary push button between the pin and GND. The input is
+// active-low with the internal pull-up on, so no external resistor is needed
+// - and on a breadboard a bare jumper from the pin to GND is a working stand-
+// in for the button (touch to press, pull away to release, which is what
+// fires the action).
 //
 // No-op (and logs) if CONFIG_BINLIGHT_RESET_BUTTON_GPIO is negative.
 // Call after led_state_init() and schedule_task_start().

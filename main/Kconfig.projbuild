@@ -41,19 +41,24 @@ menu "Bin Light Configuration"
 
     config BINLIGHT_RESET_BUTTON_GPIO
         int "Reset button GPIO (-1 to disable)"
-        default 9
+        default 2
         help
             Hold 3s to restart, 10s to factory reset (SPEC.md 3.12). The LEDs
             show which action is armed while you hold, so it needs no timing
             by feel.
 
-            Defaults to 9, which on the Seeed XIAO ESP32-C6 is the existing
-            BOOT button - no extra hardware needed. Note GPIO9 is a strapping
-            pin: holding it down *while the device powers up* puts the chip
-            into serial download mode instead. That only affects power-on, not
-            presses during normal running, and is also how you'd deliberately
-            enter flashing mode. Set to -1 to disable the button entirely, or
-            change it if you wire a dedicated button to another pin.
+            Wire a momentary push button between this pin and GND - the
+            internal pull-up is enabled, so no external resistor is needed.
+
+            Defaults to 2 (the pad marked D2 on the Seeed XIAO ESP32-C6),
+            chosen because it is broken out, has no special function, and is
+            NOT a strapping pin. Avoid GPIO 4, 5, 8, 9 and 15: those are
+            strapping pins on the ESP32-C6, and a button held across a
+            power-up would change how the chip boots (GPIO 9 in particular is
+            the BOOT button - fine for bench testing, useless once the board
+            is inside an enclosure).
+
+            Set to -1 to disable the button entirely.
 
     config BINLIGHT_RESET_BUTTON_ACTIVE_LOW
         bool "Reset button reads low when pressed"
