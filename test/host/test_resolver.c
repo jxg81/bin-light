@@ -126,19 +126,19 @@ static void expect_unknown(const char *name)
     check(name, !n.known, n.known ? "got a date, wanted unknown" : "unknown as expected");
 }
 
-static void expect_lit(const char *name, bool want_lit)
+// One pass of the REAL evaluator, so these tests exercise the shipping
+// decision (including suppression) rather than a copy of it that could drift.
+static void tick_evaluator(void)
 {
     g_lit = false;
-    // One pass of the live evaluator's decision, mirroring schedule_task_fn.
-    struct tm tm_now; localtime_r(&g_now, &tm_now);
-    int mod = tm_now.tm_hour * 60 + tm_now.tm_min;
-    schedule_t s = schedule_get();
-    bool dual = (s.light_mode == LIGHT_MODE_DUAL_COLOUR);
-    schedule_next_t n = schedule_get_next_collection();
-    bool worth = n.known && !(n.waste_only && !dual);
-    bool lit = worth && is_window_active_for_date(&s, n.year, n.month, n.day, tm_now, mod);
-    char d[80]; snprintf(d, sizeof(d), "lit=%d", lit);
-    check(name, lit == want_lit, d);
+    schedule_evaluate_once();
+}
+
+static void expect_lit(const char *name, bool want_lit)
+{
+    tick_evaluator();
+    char d[80]; snprintf(d, sizeof(d), "lit=%d", g_lit);
+    check(name, g_lit == want_lit, d);
 }
 
 static schedule_t base_schedule(void)
@@ -159,6 +159,12 @@ static void reset(void)
 {
     memset(g_nvs, 0, sizeof(g_nvs));
     g_have_event = false; g_have_waste_dow = false; g_time_valid = true;
+    g_lit = false;
+    // schedule.c's live state isn't in NVS, so clearing the fake NVS isn't
+    // enough - without this a dismissal from one block would leak into the
+    // next and quietly mask a regression.
+    s_suppress_active = false;
+    s_light_on = false;
     schedule_init();
     schedule_t s = base_schedule();
     schedule_set(&s);
@@ -275,6 +281,66 @@ int main(void)
     schedule_set(&s);
     set_now(2026, 4, 1, 10, 0);
     expect_next("4-week cycle counted across a DST change", 2026, 4, 3, false);
+
+    printf("\n== action button: dismiss tonight (SPEC 3.12) ==\n");
+    // The light is on for a real collection; a tap should turn it off and
+    // keep it off for that collection - but not for the next one.
+    reset();
+    s = schedule_get();
+    s.enabled = true;
+    s.light_mode = LIGHT_MODE_DUAL_COLOUR;
+    s.rules[0] = (schedule_color_rule_t){true, {255,150,0}, 2026, 7, 31, 1};  // weekly Friday
+    schedule_set(&s);
+
+    set_now(2026, 7, 30, 19, 0);   // Thu night, window open
+    tick_evaluator();
+    check("light is on before the tap", g_lit, g_lit ? "lit" : "dark");
+
+    schedule_action_press();       // light on -> dismiss
+    tick_evaluator();
+    check("tap dismisses it", !g_lit, g_lit ? "still lit" : "dark");
+
+    set_now(2026, 7, 30, 23, 0);   // later the same night
+    tick_evaluator();
+    check("stays dismissed later that night", !g_lit, g_lit ? "relit" : "still dark");
+
+    set_now(2026, 7, 31, 8, 0);    // into the wrap window, same collection
+    tick_evaluator();
+    check("stays dismissed through the wrap window", !g_lit, g_lit ? "relit" : "still dark");
+
+    set_now(2026, 8, 6, 19, 0);    // the NEXT week's bin night
+    tick_evaluator();
+    check("self-clears for the next collection", g_lit, g_lit ? "lit again" : "still dark");
+
+    printf("\n== action button: show next when the light is off ==\n");
+    reset();
+    s = schedule_get();
+    s.enabled = true;
+    s.rules[0] = (schedule_color_rule_t){true, {0,255,0}, 2026, 7, 31, 1};
+    schedule_set(&s);
+    set_now(2026, 7, 27, 10, 0);   // Monday, nothing due
+    tick_evaluator();
+    check("light is off to start with", !g_lit, "");
+    g_lit = false;
+    schedule_action_press();       // light off -> preview
+    check("tap previews the next collection", g_lit, g_lit ? "lit" : "nothing shown");
+
+    printf("\n== dismissing when already off does nothing ==\n");
+    reset();
+    set_now(2026, 7, 27, 10, 0);
+    tick_evaluator();              // settles g_lit to the real state (off)
+    schedule_suppress_current();   // no light on, no API, no manual - a no-op
+    tick_evaluator();
+    check("suppress with the light off is harmless", !g_lit, "");
+    // And it must not have armed a suppression that would swallow a real
+    // collection later.
+    reset();
+    s = schedule_get();
+    s.enabled = true;
+    s.rules[0] = (schedule_color_rule_t){true, {255,0,0}, 2026, 7, 31, 1};
+    schedule_set(&s);
+    set_now(2026, 7, 30, 19, 0);
+    expect_lit("no stray suppression left behind", true);
 
     printf("\n== nothing configured ==\n");
     reset();

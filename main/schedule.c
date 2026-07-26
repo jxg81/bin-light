@@ -36,6 +36,21 @@ static SemaphoreHandle_t s_mutex;
 static TaskHandle_t s_task_handle;
 static TimerHandle_t s_test_timer;
 
+// What the evaluator last decided, so the action button can tell "the light
+// is on for a collection" from "the light is off". Written only by
+// schedule_task_fn.
+static bool s_light_on;
+static uint16_t s_light_year;
+static uint8_t s_light_month;
+static uint8_t s_light_day;
+
+// The collection currently dismissed, if any (SPEC.md 3.12). Self-clearing:
+// once the resolver's answer moves to a different date, this is dropped.
+static bool s_suppress_active;
+static uint16_t s_suppress_year;
+static uint8_t s_suppress_month;
+static uint8_t s_suppress_day;
+
 static schedule_t default_schedule(void)
 {
     schedule_t s = {0};
@@ -387,9 +402,13 @@ schedule_next_t schedule_get_next_collection(void)
     return result;
 }
 
-static void schedule_task_fn(void *arg)
+// One pass of the evaluator: work out what the light should be doing right
+// now and drive it. Split out of the task loop so the host tests can step it
+// deterministically (test/host/test_resolver.c) instead of re-deriving the
+// decision and drifting from it.
+static void schedule_evaluate_once(void)
 {
-    for (;;) {
+    {
         if (time_sync_is_valid()) {
             time_t now = time(NULL);
             struct tm tm_now;
@@ -400,12 +419,35 @@ static void schedule_task_fn(void *arg)
             bool dual = (snapshot.light_mode == LIGHT_MODE_DUAL_COLOUR);
             schedule_next_t next = schedule_get_next_collection();
 
+            // A dismissal applies to one specific collection; as soon as the
+            // resolver's answer moves on, it has served its purpose and is
+            // dropped. Doing this here (rather than on a timer) is what makes
+            // the feature self-clearing.
+            if (s_suppress_active && next.known &&
+                !(next.year == s_suppress_year && next.month == s_suppress_month &&
+                  next.day == s_suppress_day)) {
+                ESP_LOGI(TAG, "dismissal of %04u-%02u-%02u cleared - next collection is now %04u-%02u-%02u",
+                         (unsigned)s_suppress_year, (unsigned)s_suppress_month, (unsigned)s_suppress_day,
+                         (unsigned)next.year, (unsigned)next.month, (unsigned)next.day);
+                s_suppress_active = false;
+            }
+            bool suppressed = s_suppress_active && next.known &&
+                              next.year == s_suppress_year && next.month == s_suppress_month &&
+                              next.day == s_suppress_day;
+
             // General waste is weekly and needs no reminder of its own, so a
             // waste-only night lights up in dual-colour mode only, where LED2
             // *is* the general-waste indicator (SPEC.md 3.7).
-            bool worth_lighting = next.known && !(next.waste_only && !dual);
+            bool worth_lighting = next.known && !(next.waste_only && !dual) && !suppressed;
             bool light_on = worth_lighting &&
                 is_window_active_for_date(&snapshot, next.year, next.month, next.day, tm_now, minute_of_day);
+
+            s_light_on = light_on;
+            if (light_on) {
+                s_light_year = next.year;
+                s_light_month = next.month;
+                s_light_day = next.day;
+            }
 
             if (light_on) {
                 led_color_t primary_led = {next.primary.r, next.primary.g, next.primary.b};
@@ -417,7 +459,15 @@ static void schedule_task_fn(void *arg)
                 led_state_off();
             }
         }
+    }
+}
 
+static void schedule_task_fn(void *arg)
+{
+    for (;;) {
+        if (time_sync_is_valid()) {
+            schedule_evaluate_once();
+        }
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(SCHEDULE_POLL_MS));
     }
 }
@@ -432,6 +482,33 @@ void schedule_task_force_check(void)
 {
     if (s_task_handle != NULL) {
         xTaskNotifyGive(s_task_handle);
+    }
+}
+
+void schedule_suppress_current(void)
+{
+    if (!s_light_on) {
+        ESP_LOGI(TAG, "dismiss requested but the light is already off - ignoring");
+        return;
+    }
+    s_suppress_active = true;
+    s_suppress_year = s_light_year;
+    s_suppress_month = s_light_month;
+    s_suppress_day = s_light_day;
+    ESP_LOGI(TAG, "dismissed the light for the %04u-%02u-%02u collection",
+             (unsigned)s_suppress_year, (unsigned)s_suppress_month, (unsigned)s_suppress_day);
+
+    led_state_off();
+    s_light_on = false;
+    schedule_task_force_check(); // re-evaluate now, so the state is consistent immediately
+}
+
+void schedule_action_press(void)
+{
+    if (s_light_on) {
+        schedule_suppress_current();
+    } else {
+        schedule_test_trigger();
     }
 }
 

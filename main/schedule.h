@@ -104,6 +104,27 @@ typedef struct {
 // the clock hasn't synced yet, since every branch needs today's date.
 schedule_next_t schedule_get_next_collection(void);
 
+// One press of the action button (SPEC.md 3.12), which does one of two things
+// depending on what the light is doing right now:
+//
+//   light on  -> dismiss it for tonight (see schedule_suppress_current)
+//   light off -> show the next collection, same as the web button
+//
+// The decision lives here rather than in buttons.c because "is the light on?"
+// is this module's state; the button layer only reports that a press happened.
+void schedule_action_press(void);
+
+// Turn the light off for the collection it is currently showing, and keep it
+// off until a *different* collection comes round - for when the bins are
+// already out and the reminder has done its job.
+//
+// Not a one-shot led_state_off(): the evaluator's next tick (~30s) would
+// simply light it again. This records the specific collection date being
+// suppressed and clears itself once the resolved next collection moves past
+// that date, so there is no timer to expire and no "resume" action to forget.
+// No-op if the light isn't currently on.
+void schedule_suppress_current(void);
+
 // Lights both LEDs with schedule_get_next_collection()'s colours, respecting
 // light_mode, for a fixed 30 seconds, then hands control back to the real
 // evaluator via schedule_task_force_check(). Safe to call again while a

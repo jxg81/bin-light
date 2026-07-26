@@ -22,6 +22,19 @@ static const char *TAG = "buttons";
 #define REBOOT_HOLD_MS     (3UL * 1000)
 #define FACTORY_HOLD_MS    (10UL * 1000)
 
+// A Kconfig bool that is false emits no #define at all, so these can't be
+// used directly as C expressions - only in #if. Normalise them once here.
+#ifdef CONFIG_BINLIGHT_RESET_BUTTON_ACTIVE_LOW
+#define RESET_ACTIVE_LOW  true
+#else
+#define RESET_ACTIVE_LOW  false
+#endif
+#ifdef CONFIG_BINLIGHT_ACTION_BUTTON_ACTIVE_LOW
+#define ACTION_ACTIVE_LOW true
+#else
+#define ACTION_ACTIVE_LOW false
+#endif
+
 // Feedback while held. Deliberately not the bin palette: these are device
 // states, not collections. Blue reads as benign, red as destructive, and both
 // are steady rather than flashing so it's obvious the device is waiting on
@@ -45,6 +58,18 @@ static bool button_is_pressed(void)
     return level != 0;
 #endif
 }
+
+#if CONFIG_BINLIGHT_ACTION_BUTTON_GPIO >= 0
+static bool action_is_pressed(void)
+{
+    int level = gpio_get_level(CONFIG_BINLIGHT_ACTION_BUTTON_GPIO);
+#if CONFIG_BINLIGHT_ACTION_BUTTON_ACTIVE_LOW
+    return level == 0;
+#else
+    return level != 0;
+#endif
+}
+#endif
 
 static armed_t armed_for_hold(uint32_t held_ms)
 {
@@ -71,6 +96,35 @@ static void show_armed(armed_t armed)
     }
 }
 
+// The action button is a plain tap: no hold semantics, so it only needs edge
+// detection. Fires on press rather than release - unlike the reset button
+// there is nothing to arm, nothing to cancel, and nothing destructive, so
+// responding the instant it debounces feels better than waiting for release.
+#if CONFIG_BINLIGHT_ACTION_BUTTON_GPIO >= 0
+static void poll_action_button(void)
+{
+    static bool stable = false;
+    static int agree = 0;
+
+    bool raw = action_is_pressed();
+    if (raw == stable) {
+        agree = 0;
+        return;
+    }
+    if (++agree < DEBOUNCE_SAMPLES) {
+        return;
+    }
+    agree = 0;
+    stable = raw;
+    if (stable) {
+        ESP_LOGI(TAG, "action button tapped");
+        // schedule.c decides what this means from the light's own state -
+        // dismiss it if lit, otherwise show the next collection.
+        schedule_action_press();
+    }
+}
+#endif
+
 static void buttons_task_fn(void *arg)
 {
     bool stable_pressed = false;
@@ -80,6 +134,9 @@ static void buttons_task_fn(void *arg)
     bool led_taken = false;
 
     for (;;) {
+#if CONFIG_BINLIGHT_ACTION_BUTTON_GPIO >= 0
+        poll_action_button();
+#endif
         bool raw = button_is_pressed();
 
         if (raw == stable_pressed) {
@@ -139,41 +196,63 @@ static void buttons_task_fn(void *arg)
     }
 }
 
-esp_err_t buttons_start(void)
+static esp_err_t configure_input(int gpio, bool active_low)
 {
-    if (CONFIG_BINLIGHT_RESET_BUTTON_GPIO < 0) {
-        ESP_LOGI(TAG, "reset button disabled by configuration");
-        return ESP_OK;
-    }
-
     gpio_config_t io_conf = {
-        .pin_bit_mask = 1ULL << CONFIG_BINLIGHT_RESET_BUTTON_GPIO,
+        .pin_bit_mask = 1ULL << gpio,
         .mode = GPIO_MODE_INPUT,
-#if CONFIG_BINLIGHT_RESET_BUTTON_ACTIVE_LOW
-        .pull_up_en = GPIO_PULLUP_ENABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-#else
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_ENABLE,
-#endif
+        // Pull toward the *idle* level, so an unconnected or intermittent
+        // input reads as "not pressed" rather than floating into phantom
+        // presses.
+        .pull_up_en = active_low ? GPIO_PULLUP_ENABLE : GPIO_PULLUP_DISABLE,
+        .pull_down_en = active_low ? GPIO_PULLDOWN_DISABLE : GPIO_PULLDOWN_ENABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
     esp_err_t err = gpio_config(&io_conf);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "failed to configure GPIO %d: %s",
-                 CONFIG_BINLIGHT_RESET_BUTTON_GPIO, esp_err_to_name(err));
-        return err;
+        ESP_LOGE(TAG, "failed to configure GPIO %d: %s", gpio, esp_err_to_name(err));
+    }
+    return err;
+}
+
+esp_err_t buttons_start(void)
+{
+    bool any = false;
+
+    if (CONFIG_BINLIGHT_RESET_BUTTON_GPIO >= 0) {
+        esp_err_t err = configure_input(CONFIG_BINLIGHT_RESET_BUTTON_GPIO, RESET_ACTIVE_LOW);
+        if (err != ESP_OK) {
+            return err;
+        }
+        ESP_LOGI(TAG, "reset button on GPIO %d (hold 3s restart, 10s factory reset)",
+                 CONFIG_BINLIGHT_RESET_BUTTON_GPIO);
+        any = true;
+    } else {
+        ESP_LOGI(TAG, "reset button disabled by configuration");
     }
 
-    // Polling rather than an interrupt: the whole job is measuring a
-    // multi-second hold, so a 50ms tick is plenty and it keeps all the timing
-    // in one readable place instead of split across an ISR and a task.
+#if CONFIG_BINLIGHT_ACTION_BUTTON_GPIO >= 0
+    {
+        esp_err_t err = configure_input(CONFIG_BINLIGHT_ACTION_BUTTON_GPIO, ACTION_ACTIVE_LOW);
+        if (err != ESP_OK) {
+            return err;
+        }
+        ESP_LOGI(TAG, "action button on GPIO %d (tap to dismiss the light, or show the next collection)",
+                 CONFIG_BINLIGHT_ACTION_BUTTON_GPIO);
+        any = true;
+    }
+#else
+    ESP_LOGI(TAG, "action button disabled by configuration");
+#endif
+
+    if (!any) {
+        return ESP_OK;
+    }
+
+    // Polling rather than interrupts: the reset button's whole job is
+    // measuring a multi-second hold, so a 50ms tick is plenty, and one task
+    // keeps all the timing in one readable place instead of split across
+    // two ISRs and a task.
     BaseType_t ok = xTaskCreate(buttons_task_fn, "buttons", 3072, NULL, tskIDLE_PRIORITY + 2, NULL);
-    if (ok != pdPASS) {
-        return ESP_ERR_NO_MEM;
-    }
-
-    ESP_LOGI(TAG, "reset button on GPIO %d (hold 3s restart, 10s factory reset)",
-             CONFIG_BINLIGHT_RESET_BUTTON_GPIO);
-    return ESP_OK;
+    return (ok == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
 }

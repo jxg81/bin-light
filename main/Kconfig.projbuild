@@ -64,7 +64,33 @@ menu "Bin Light Configuration"
         bool "Reset button reads low when pressed"
         default y
         help
-            True for a button wired to ground with a pull-up, which is how the
-            XIAO's BOOT button (and most such buttons) work.
+            True for a momentary button wired between the pin and ground with
+            a pull-up, which is how this one is wired.
+
+    config BINLIGHT_ACTION_BUTTON_GPIO
+        int "Action button GPIO (-1 to disable)"
+        default 1
+        help
+            The capacitive touch pad on the outside of the enclosure
+            (SPEC.md 3.12). A tap dismisses tonight's light if it is on, or
+            shows the next collection for 30 seconds if it is off.
+
+            Defaults to 1 (pad D1 on the Seeed XIAO ESP32-C6). Like the reset
+            button, keep off the strapping pins: GPIO 4, 5, 8, 9 and 15.
+
+            The ESP32-C6 has no capacitive-touch peripheral, so this expects a
+            self-contained touch module (TTP223 or similar) presenting a plain
+            digital level. Configure the module as MOMENTARY, not latching -
+            the firmware decides what a tap means from the light's current
+            state, so a module that latches would fight it.
+
+    config BINLIGHT_ACTION_BUTTON_ACTIVE_LOW
+        bool "Action button reads low when pressed"
+        default n
+        help
+            Defaults to false: TTP223-style touch modules idle LOW and drive
+            HIGH while touched - the opposite of the reset button. Set true if
+            you use a plain push button to ground instead, or a module
+            jumpered to invert its output.
 
 endmenu

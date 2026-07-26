@@ -1228,8 +1228,39 @@ button — touch to press, pull away to release. A press is logged as soon as it
 debounces, so wiring can be confirmed over serial without waiting for the
 3-second LED feedback.
 
-The remaining button work is the **second (action) button**: display-next /
-cancel-tonight, which still needs `schedule_suppress_current()`.
+**Action button — implemented (2026-07-26).** The capacitive pad, in
+`buttons.c` + `schedule_action_press()`/`schedule_suppress_current()`:
+
+- **A tap, not a hold.** It fires on press rather than release (unlike the
+  reset button there is nothing to arm and nothing destructive to cancel), and
+  exactly once however long a finger lingers — a repeat would toggle
+  dismiss/show back and forth under a resting touch.
+- **`schedule.c` decides what the tap means, not `buttons.c`.** "Is the light
+  on?" is the schedule's own state, so the button layer only reports that a
+  press happened. `schedule_action_press()` dismisses if lit, previews the
+  next collection if not.
+- **Dismissal is keyed to a collection date, not a timer.**
+  `schedule_suppress_current()` records the date the light is currently
+  showing; the evaluator skips that date and **drops the suppression by
+  itself** as soon as the resolved next collection moves on. Nothing to
+  expire, no "resume" to forget, and it survives the wrap-past-midnight
+  window (a dismissal at 7pm still holds at 8am, which a naive "off until
+  midnight" would not).
+- **Active HIGH by default** (`CONFIG_BINLIGHT_ACTION_BUTTON_ACTIVE_LOW=n`),
+  the opposite of the reset button, matching TTP223-style modules. The GPIO's
+  internal pull is set toward the *idle* level either way, so a disconnected
+  input reads as untouched rather than floating into phantom taps.
+- **One shared 50ms poll task** covers both buttons.
+- Tested in `test_buttons.c` (polarity, single-fire under a long touch,
+  glitch rejection) and `test_resolver.c` (dismiss holds for the night,
+  self-clears next week, no-op when already off, and leaves no stray
+  suppression behind).
+
+**Testability change made here**: the evaluator's body moved out of the task
+loop into `schedule_evaluate_once()`. The host tests previously *re-derived*
+the light decision to check it, which meant they could silently drift from the
+shipping logic — they now step the real function, which is what let the
+suppression behaviour be tested at all.
 
 **Requirement**: three physical button actions, without needing the web UI:
 1. **Factory reset.**
@@ -1984,7 +2015,7 @@ three different things that are easy to conflate.
 | DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
 | §3.12 factory reset + restart (shared functions, UI actions) | ✅ | ❌ **not yet flashed** | ❌ |
 | §3.12 reset button (3s restart / 10s factory reset, armed-colour feedback) | ✅ | ❌ **not yet flashed** | ❌ needs an external button on GPIO 2 |
-| §3.12 action button (display-next / cancel-tonight) | ❌ not written | — | — |
+| §3.12 action button (capacitive tap: dismiss / show next) | ✅ | ❌ **not yet flashed** | ❌ needs the touch module wired |
 | §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ✅ | ❌ **the one untested item** — needs a deliberate setup, see below |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
@@ -2125,33 +2156,34 @@ page. Then check:
 Also unflashed: the **§3.12 work** — factory reset and restart (both as UI
 actions and as shared functions), and the reset button itself.
 
-**The reset button needs wiring before it can be tested.** It defaults to
-**GPIO 2** (`D2`), expecting a momentary push button to GND — the on-board
-BOOT button is no longer used, since the board ends up inside a sealed
-enclosure. On a breadboard, a jumper from GPIO 2 to GND stands in for the
-button. Check: hold ~3s and both LEDs turn blue, hold past 10s and they turn
-red, release to act, release before 3s and nothing happens. A press is logged
-on serial as soon as it debounces, so wiring problems show up immediately.
+**Both buttons need wiring before they can be tested**, and neither has run
+against real hardware. A press on either is logged on serial as soon as it
+debounces, so wiring problems show up immediately.
+
+| | Pin | Wiring | Test |
+|---|---|---|---|
+| **Reset** (push button) | GPIO 2 / `D2` | momentary button to **GND**; internal pull-up, no resistor | hold ~3s → LEDs blue; past 10s → red; release to act; release under 3s → nothing. A jumper to GND stands in for the button. |
+| **Action** (capacitive) | GPIO 1 / `D1` | TTP223-style module, 3V3 + GND + OUT to the pin, set **momentary** not latching | tap with the light on → it goes out and stays out for that collection; tap with it off → next collection shows for 30s. A jumper to **3V3** stands in (this one is active HIGH). |
+
+The on-board BOOT button (GPIO 9) is deliberately no longer used: it's
+unreachable once the board is in a sealed enclosure, and it's a strapping pin.
 
 After that, in priority order:
-1. **§3.12 action button** — the second button: display-next when the light
-   is off, cancel-tonight when it's on. Needs `schedule_suppress_current()`
-   in `schedule.c` (records the collection date currently lighting the light
-   and stays off for it, self-clearing once the resolved next-collection date
-   advances past it).
-2. **§3.5 OTA** — needs a partition-table rework (one 3MB `factory` slot →
+1. **§3.5 OTA** — needs a partition-table rework (one 3MB `factory` slot →
    two OTA slots + `otadata`), so it means an `erase-flash`. **Best done
    before devices are handed out**, since after that a firmware fix means
    physically collecting them.
-3. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated
+2. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated
    on its lat/lon UX question. Zero value to the working group.
 
 ### Open questions not yet resolved
 
 1. **§3.13.2 (SA)**: how the user supplies lat/lon with no map or geocoder on
    the device — paste coordinates, add a geocoding dependency, or skip SA.
-2. **§3.12**: the action button's pin is still unchosen (`D1`/GPIO 1 is the
-   pencilled-in reservation). The reset button is settled at GPIO 2.
+2. **§3.12**: both button pins are chosen (reset GPIO 2 / `D2`, action
+   GPIO 1 / `D1`) but **neither has been tested against real hardware** — the
+   touch module in particular needs confirming for polarity and momentary
+   (not latching) configuration.
 3. **§3.5 OTA**: image hosting, manual vs auto-check, and real partition sizes
    once an image with TLS is actually measured.
 4. **§3.7**: the `glass` → Purple default is inferred from the platform-wide

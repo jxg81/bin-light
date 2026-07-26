@@ -22,6 +22,11 @@ void schedule_task_force_check(void) {}
 void factory_reset_perform(void) { for (;;) {} }
 esp_err_t factory_reset_erase(void) { return ESP_OK; }
 
+static int g_action_presses;
+void schedule_action_press(void) { g_action_presses++; }
+void schedule_suppress_current(void) {}
+void schedule_test_trigger(void) {}
+
 #include "buttons.c"
 
 static int g_fail;
@@ -106,11 +111,54 @@ int main(void)
     show_armed(ARMED_NONE);
     check("no feedback before 3s (LEDs left to the schedule)", g_led_calls == 0, "");
 
-    printf("\n== button polarity ==\n");
+    printf("\n== reset button polarity (active low, button to GND) ==\n");
     stub_gpio_level = 0;
-    check("active-low: level 0 reads as pressed", button_is_pressed(), "");
+    check("level 0 reads as pressed", button_is_pressed(), "");
     stub_gpio_level = 1;
-    check("active-low: level 1 reads as released", !button_is_pressed(), "");
+    check("level 1 reads as released", !button_is_pressed(), "");
+
+    printf("\n== action button (capacitive touch, active HIGH) ==\n");
+    // Opposite polarity to the reset button - TTP223-style modules idle LOW
+    // and drive HIGH while touched. Getting this backwards would read as
+    // "permanently pressed", so it's asserted explicitly.
+    stub_gpio_level = 1;
+    check("level 1 reads as touched", action_is_pressed(), "");
+    stub_gpio_level = 0;
+    check("level 0 reads as idle", !action_is_pressed(), "");
+
+    // A tap must fire exactly once, however long the finger rests there -
+    // the action is state-dependent, so a repeat would toggle dismiss/show
+    // back and forth under a lingering touch.
+    g_action_presses = 0;
+    stub_gpio_level = 0;
+    for (int i = 0; i < 5; i++) poll_action_button();   // settle idle
+    g_action_presses = 0;
+    stub_gpio_level = 1;                                 // touch...
+    for (int i = 0; i < 40; i++) poll_action_button();   // ...held for 2 seconds
+    snprintf(detail, sizeof(detail), "%d press(es) over a 2s touch", g_action_presses);
+    check("one tap fires exactly once, however long it's held", g_action_presses == 1, detail);
+
+    stub_gpio_level = 0;                                 // release
+    for (int i = 0; i < 5; i++) poll_action_button();
+    snprintf(detail, sizeof(detail), "%d total", g_action_presses);
+    check("releasing fires nothing extra", g_action_presses == 1, detail);
+
+    stub_gpio_level = 1;                                 // second, separate tap
+    for (int i = 0; i < 5; i++) poll_action_button();
+    snprintf(detail, sizeof(detail), "%d total", g_action_presses);
+    check("a second tap fires again", g_action_presses == 2, detail);
+
+    // A single-sample glitch must not register - the input is a bare pad on
+    // a wire, so noise is expected.
+    stub_gpio_level = 0;
+    for (int i = 0; i < 5; i++) poll_action_button();
+    int before = g_action_presses;
+    stub_gpio_level = 1;
+    poll_action_button();          // one sample only, then it's gone
+    stub_gpio_level = 0;
+    for (int i = 0; i < 5; i++) poll_action_button();
+    snprintf(detail, sizeof(detail), "%d -> %d", before, g_action_presses);
+    check("a one-sample glitch is debounced away", g_action_presses == before, detail);
 
     printf("\n%s (%d failure%s)\n", g_fail ? "FAILURES" : "all passed", g_fail, g_fail == 1 ? "" : "s");
     return g_fail ? 1 : 0;
