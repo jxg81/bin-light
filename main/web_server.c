@@ -1310,7 +1310,14 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
                 "<a href='%s' target='_blank'>the council's waste calendar page</a>, start "
                 "typing your address there and let it autocomplete, then copy the completed "
                 "address and paste it into the search box above.</p>"
-                "<p class='note'>Example: <b>3/85 DAVIES STREET BRUNSWICK 3056</b></p>",
+                // A format template, not a real address. The council's dataset
+                // is residential-only, so any example that actually returned a
+                // match would be someone's home - published in a public repo
+                // and shown on every device. The shape is what the user needs
+                // anyway; the autocomplete above supplies the content.
+                "<p class='note'>It will look like: "
+                "<b>3/85 EXAMPLE STREET BRUNSWICK 3056</b> &mdash; unit number, "
+                "street type spelled out, suburb and postcode, all in capitals.</p>",
                 cal_url);
         }
     } else if (strcmp(step, "bsearch") == 0 && council != NULL && query[0] != '\0') {

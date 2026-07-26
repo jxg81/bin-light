@@ -56,7 +56,7 @@ priority for implementation, and the acceptance criteria for the API feature:
 
 | # | Council | Backend | Status | Detail |
 |---|---|---|---|---|
-| 1 | **Maribyrnong** (home) | Impact Apps | ✅ **done** — verified on hardware | §3.3 |
+| 1 | **Maribyrnong** | Impact Apps | ✅ **done** — verified on hardware | §3.3 |
 | 2 | **Merri-bek** | bespoke (ArcGIS + council API) | ✅ **done** — verified on hardware | §3.13.3 |
 | 3 | **Knox** | bespoke (2 JSON calls) | ✅ **done** — verified on hardware | §3.13.4 |
 | 4 | **Whitehorse** | bespoke (Weave GIS) | ✅ **done** — verified on hardware | §3.13.4 |
@@ -1793,8 +1793,16 @@ now self-healing rather than a maintenance item:
 one exact canonical form (uppercase, street type in full, no commas), the
 Merri-bek search page shows a tip with a **year-derived link to the council's
 own calendar page**: type your address there, let it autocomplete, then copy
-the completed string into the device's search. Worked example (verified to
-return exactly one match): `3/85 DAVIES STREET BRUNSWICK 3056`.
+the completed string into the device's search. The tip shows the *format*
+—  `3/85 EXAMPLE STREET BRUNSWICK 3056` — rather than a working address.
+
+**Deliberately a template, not a real address.** It was a real one (verified to
+return exactly one match) until the repo was made public. The ArcGIS layer is
+residential-only — a public building such as the civic centre returns no
+features, checked — so any example that actually resolves is necessarily
+somebody's home, which would then be published in the repo *and* rendered on
+every device. The format is what the user needs; the council's own autocomplete
+supplies the content. Don't "improve" this back into a live example.
 
 **Maintenance risk, restated**: this is a single council's own CMS endpoint
 with no versioning and no stability guarantee. The cpage rotation is now
@@ -2390,9 +2398,20 @@ guesses from the published pinout.
 - Verified by fresh clone afterwards: 25 commits, zero occurrences of the
   address in file contents or commit messages, `sdkconfig` never tracked, no
   Wi-Fi credential ever committed.
-- **Before making the repo public**: nothing sensitive remains, but SPEC.md
-  does name Maribyrnong as "(home)" and the council set narrows the owner to a
-  Melbourne suburb. That is a judgement call, not a leak.
+- **Made public on 2026-07-27**, to unblock OTA (§3.5 needs the manifest and
+  the release asset fetchable without credentials — the device has no token).
+
+  Cleaned in the working tree first, by the owner's decision, **without
+  rewriting history again**:
+  - `Maribyrnong (home)` in §1.2 → plain `Maribyrnong`. The council set still
+    implies a Melbourne suburb; that was accepted as a judgement call.
+  - The Merri-bek worked example, a real dwelling, → a format template. See
+    §3.13.3.
+
+  **The old commits still contain both.** That was the owner's call — the
+  earlier scrub (below) was about a full street address, and these are much
+  weaker signals. Worth knowing rather than rediscovering: `git log -S` will
+  still find them.
 
 ### ⚠️ Palette changes do not reach already-saved rules (known wrinkle)
 
@@ -2487,21 +2506,12 @@ So OTA cannot be tested, and would not work in the field, until both the
 manifest and the image are fetchable anonymously. Publishing a release into
 the private repo changes nothing. Three ways out:
 
-1. **Make `bin-light` public.** Simplest, and already the stated intent. The
-   history scrub is done and verified (see "Repository and history"), so the
-   remaining consideration is the judgement call noted there: SPEC.md names
-   Maribyrnong as "(home)" and the council set narrows the owner to a
-   Melbourne suburb.
-2. **A separate public repo for firmware only** — e.g. `bin-light-firmware`
-   holding `latest.json` and the release assets, source staying private. Keeps
-   OTA fully working without publishing any code, at the cost of a second repo
-   and a one-line Kconfig change. Good if the source should stay private for
-   now.
-3. **Any other anonymous static host** for the two files. Works, but
-   reintroduces exactly the infrastructure §3.5 was designed to avoid.
-
-**This decision is the gate on OTA. Nothing else about §3.5 can be verified
-until it is made.**
+**Resolved 2026-07-27: the repo was made public**, after the working tree was
+cleaned of the "(home)" annotation and the real example address (see
+"Repository and history"). The alternatives considered and not taken were a
+separate public firmware-only repo, or another anonymous static host — both
+rejected as more moving parts than publishing a repo that was going public
+anyway.
 
 After that, in priority order:
 
