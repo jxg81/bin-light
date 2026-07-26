@@ -7,6 +7,7 @@
 
 #include "buttons.h"
 #include "led_state.h"
+#include "ota.h"
 #include "schedule.h"
 #include "settings.h"
 #include "time_sync.h"
@@ -72,5 +73,11 @@ void app_main(void)
     ESP_ERROR_CHECK(waste_api_task_start());
     ESP_ERROR_CHECK(buttons_start());
 
-    ESP_LOGI(TAG, "bin light ready");
+    // Everything is up and the device has proved it can serve pages, so a
+    // freshly-OTA'd image is healthy. Until this runs, the bootloader will
+    // roll back to the previous image on the next reboot - which is what
+    // saves a physical visit if an update ever bricks the network path.
+    ota_mark_valid();
+
+    ESP_LOGI(TAG, "bin light ready (firmware %s)", ota_running_version());
 }

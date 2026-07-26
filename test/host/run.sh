@@ -71,6 +71,9 @@ if [ "$1" = "render" ]; then
     "$OUT/render_page" --setup   "$OUT/api-setup.html"
     "$OUT/render_page" --merribek "$OUT/api-setup-merribek.html"
     "$OUT/render_page" --reset-confirm "$OUT/factory-reset-confirm.html"
+    "$OUT/render_page" --update-uptodate  "$OUT/update-uptodate.html"
+    "$OUT/render_page" --update-available "$OUT/update-available.html"
+    "$OUT/render_page" --update-progress  "$OUT/update-progress.html"
     echo "page sizes (HTML_BUF_SIZE must exceed the largest home-*;"
     echo "SETUP_HTML_BUF_SIZE must exceed api-setup):"
     wc -c "$OUT"/*.html

@@ -35,6 +35,17 @@ menu "Bin Light Configuration"
             Melbourne, Australia: AEDT starts first Sunday of October,
             ends first Sunday of April.
 
+    config BINLIGHT_OTA_MANIFEST_URL
+        string "OTA update manifest URL"
+        default "https://raw.githubusercontent.com/jxg81/bin-light/main/firmware/latest.json"
+        help
+            A small JSON file giving the published version, the image URL and
+            a one-line note (SPEC.md 3.5). Served straight from the repo, so
+            publishing an update is a git push plus a GitHub Release - there
+            is no backend to run.
+
+            Point this at your own fork if you maintain your own builds.
+
     config BINLIGHT_LED_GPIO
         int "WS2812 data GPIO"
         default 0

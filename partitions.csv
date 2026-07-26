@@ -1,5 +1,23 @@
-# Name,   Type, SubType, Offset,  Size,    Flags
-# Note: if you have increased the bootloader size, make sure to update the offsets to avoid overlap
-nvs,      data, nvs,     ,        0x8000,
-phy_init, data, phy,     ,        0x1000,
-factory,  app,  factory, ,        3M,
+# Two-slot OTA layout on 4MB flash (SPEC.md 3.5).
+#
+# Offsets are explicit rather than auto so the effect of the change from the
+# old single-`factory` table is visible and checkable:
+#
+#   nvs stays at 0x9000 with the same 32KB size, so all persisted config -
+#   schedule, council setup, Wi-Fi credentials, next-collection cache -
+#   SURVIVES the switch to OTA. Only the app moves (factory -> ota_0, same
+#   0x20000 start), and phy_init shifts to make room for otadata.
+#
+# ota_0 and ota_1 are 0x1F0000 (1.9375MB) each: the current image is ~1.3MB,
+# so there is roughly 50% headroom for growth. 0x20000 + 2*0x1F0000 = 0x400000,
+# i.e. the table fills the 4MB part exactly with nothing stranded.
+#
+# App partitions must start on a 64KB boundary, which is why there is a gap
+# between phy_init (ends 0x14000) and ota_0 (starts 0x20000).
+#
+# Name,     Type, SubType, Offset,   Size,     Flags
+nvs,        data, nvs,     0x9000,   0x8000,
+otadata,    data, ota,     0x11000,  0x2000,
+phy_init,   data, phy,     0x13000,  0x1000,
+ota_0,      app,  ota_0,   0x20000,  0x1F0000,
+ota_1,      app,  ota_1,   0x210000, 0x1F0000,

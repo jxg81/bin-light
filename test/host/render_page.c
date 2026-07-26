@@ -9,6 +9,7 @@
 #include "settings.h"
 #include "waste_api.h"
 #include "web_server.h"
+#include "ota.h"
 #include "esp_http_server.h"
 
 static schedule_t s_sched;
@@ -43,6 +44,28 @@ void waste_api_merribek_calendar_url(char *buf, size_t buf_size)
     snprintf(buf, buf_size, "https://www.merri-bek.vic.gov.au/living-in-merri-bek/"
              "waste-and-recycling/bins-and-collection-services/waste-calendar26/");
 }
+
+// OTA stubs. The harness can plant a manifest to render each state of the
+// update page without a network.
+const char *stub_ota_version = "1.0.0";
+bool stub_ota_update_available = false;
+ota_state_t stub_ota_state = OTA_STATE_IDLE;
+
+const char *ota_running_version(void) { return stub_ota_version; }
+esp_err_t ota_check(ota_manifest_t *out)
+{
+    memset(out, 0, sizeof(*out));
+    snprintf(out->version, sizeof(out->version), "%s", stub_ota_update_available ? "1.1.0" : "1.0.0");
+    snprintf(out->url, sizeof(out->url),
+             "https://github.com/jxg81/bin-light/releases/download/v1.1.0/bin-light.bin");
+    snprintf(out->notes, sizeof(out->notes), "Adds Knox & Whitehorse backends.");
+    out->available = stub_ota_update_available;
+    return ESP_OK;
+}
+esp_err_t ota_start(const char *url) { (void)url; return ESP_OK; }
+ota_state_t ota_get_state(void) { return stub_ota_state; }
+const char *ota_get_message(void) { return "downloading 45%"; }
+void ota_mark_valid(void) {}
 
 const char *stub_query_string = NULL;
 const char *stub_post_body = NULL;
@@ -103,6 +126,12 @@ int main(int argc, char **argv)
         s_sched.light_mode = LIGHT_MODE_SINGLE_COLOUR;
     }
 
+    bool update_page = false;
+    if (argc > 1 && strncmp(argv[1], "--update", 8) == 0) {
+        update_page = true;
+        if (strcmp(argv[1], "--update-available") == 0) stub_ota_update_available = true;
+        if (strcmp(argv[1], "--update-progress") == 0)  stub_ota_state = OTA_STATE_RUNNING;
+    }
     bool reset_confirm = (argc > 1 && strcmp(argv[1], "--reset-confirm") == 0);
     bool setup_page = (argc > 1 && strcmp(argv[1], "--setup") == 0);
     if (argc > 1 && strcmp(argv[1], "--merribek") == 0) {
@@ -114,7 +143,10 @@ int main(int argc, char **argv)
     httpd_req_t req = {0};
     // No query string is stubbed, so /api-setup renders its first step - the
     // state + council pickers, which is the page worth eyeballing.
-    if (reset_confirm) {
+    if (update_page) {
+        req.content_len = 0;
+        update_post_handler(&req);
+    } else if (reset_confirm) {
         req.content_len = 0;         // first POST: no confirm field
         factory_reset_post_handler(&req);
     } else if (setup_page) {

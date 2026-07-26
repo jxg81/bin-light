@@ -543,73 +543,89 @@ onto a device whose Wi-Fi is currently compiled into `sdkconfig` will keep
 working via the Kconfig fallback, so *testing* AutoAP means either blanking
 the Kconfig SSID or using "Forget this network" from the UI.
 
-### 3.5 Over-the-air (OTA) firmware updates
+### 3.5 Over-the-air (OTA) firmware updates (implemented)
 
 **Priority raised — see §1.1**: with devices deployed to other households, an
 expected council-API break otherwise means physically visiting each one with a
-USB cable. The open questions at the end of this section (hosting, manual vs
-auto-check, partition sizing) are now worth resolving properly rather than
-deferring.
+USB cable.
 
-**Confirmed available**: ESP-IDF v6.0.2 ships both `app_update` (OTA partition
-management, rollback) and `esp_https_ota` (HTTPS-based image download + flash) —
-checked their headers exist in the local toolchain.
+**Backend: none.** The owner's requirement was a file store and nothing to
+keep running, which GitHub satisfies exactly:
 
-**Partition table collision with the current design**: OTA needs at least two app
-slots (`ota_0`, `ota_1`) plus an `otadata` partition (tracks which slot is active/
-valid). A single `factory` app partition — which is what [partitions.csv](partitions.csv)
-currently defines — **cannot receive an OTA update at all**: there's no second slot
-to write a new image into while the running one keeps serving. This needs a
-partition table rework, not just an addition:
-- ESP-IDF's stock two-OTA reference layout (`partitions_two_ota.csv`): `nvs` 16KB,
-  `otadata` 8KB, `phy_init` 4KB, `ota_0` 1MB, `ota_1` 1MB — no `factory` slot at all
-  in the pure-OTA scheme.
-- On our 4MB flash, two OTA slots would each need to be smaller than the current
-  single 3MB factory partition to leave room for the same nvs/otadata/phy_init
-  allocations — e.g. roughly 1.5MB each, **not yet verified against a real build**.
-  Current image size (before any HTTPS/OTA code is added, which will grow it
-  further) was estimated at 900KB–1.3MB when the partition table was first sized —
-  needs re-measuring once HTTPS is wired in, not assumed.
-- This changes the on-flash layout already built this session (§3.1), so adopting
-  it means a re-flash (`idf.py erase-flash` or similar) — not a drop-in addition
-  alongside the existing table.
+- A small JSON manifest at
+  `raw.githubusercontent.com/<owner>/<repo>/main/firmware/latest.json`, giving
+  `version`, `url` and a one-line `notes`.
+- The image itself as a **GitHub Release asset**.
+- Publishing an update is therefore a tag, a release, and a one-line commit.
+  See [firmware/README.md](firmware/README.md) for the checklist.
 
-**HTTPS requirement**: `esp_https_ota` expects an HTTPS URL by default. It can be
-forced to accept plain HTTP by skipping certificate validation, but that means
-firmware images arrive unauthenticated — not recommended even for a hobby device,
-since it means anything that can spoof the update server can run arbitrary code on
-it. This is the same "no TLS/mbedtls wired up yet" gap already flagged for the
-external bin-collection API (§3.3) — worth building that plumbing once and sharing
-it between both features rather than twice.
+**As built** ([ota.h](main/ota.h)/[ota.c](main/ota.c)):
 
-**Rollback safety** (confirmed API in `app_update`):
-`esp_ota_mark_app_valid_cancel_rollback()` / `esp_ota_mark_app_invalid_rollback()`.
-Standard pattern: after flashing a new image and rebooting into it, the new
-firmware must explicitly confirm it's healthy (e.g. once Wi-Fi connects and the web
-server starts) or ESP-IDF automatically rolls back to the previous slot on the next
-boot. Worth having from day one — this is a physical fixture that isn't always
-convenient to walk up to with a USB cable, so a botched update shouldn't strand it.
+- **Partition table reworked** ([partitions.csv](partitions.csv)): one 3MB
+  `factory` slot to `ota_0` + `ota_1` at 0x1F0000 (1.94MB) each. The current
+  image is ~1.29MB, leaving 35% headroom.
+  **`nvs` deliberately stays at 0x9000 with the same 32KB size**, so all
+  persisted config - schedule, council setup, Wi-Fi credentials, the
+  next-collection cache - survives the switch. The app moves from `factory` to
+  `ota_0` but keeps the same 0x20000 start. An `erase-flash` should *not* be
+  needed; a normal `idf.py flash` writes the new table, the bootloader,
+  `ota_data_initial.bin` and the app, leaving NVS alone. **Worth confirming
+  rather than trusting on the first flash.**
+- **Version comes from [version.txt](version.txt)**, which ESP-IDF compiles
+  into `esp_app_desc_t`. Verified by reading the string back out of the built
+  binary rather than assuming the plumbing works. `version.txt` takes
+  precedence over `git describe`, making the version explicit and reviewable
+  instead of a function of tag state.
+- **Comparison is inequality, not ordering.** Any published version different
+  from the running one counts as an update. That makes **downgrade the
+  recovery mechanism**: publish the old version in the manifest and every
+  device walks backwards. For a fleet you cannot physically reach, that
+  matters far more than refusing to go backwards.
+- **Rollback is enabled** (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). A new
+  image is marked valid by `ota_mark_valid()` at the *end* of `app_main()` -
+  after Wi-Fi is up and the web server is serving. An update that breaks the
+  network path never gets confirmed, so the bootloader reverts on the next
+  restart with nobody touching the device. Calling this any earlier would make
+  rollback protect nothing.
+- **The download runs in its own task**, not inline in the HTTP handler: ~1.3MB
+  over TLS is far too slow to hold a response open for. The UI polls progress
+  via `<meta http-equiv='refresh'>`, keeping the no-JS property (§3.11).
+- **Manifest parsing is a small string extractor, not cJSON.** The manifest is
+  three flat string fields we author ourselves; a parse tree would be more
+  moving parts than the job needs, and the extractor cannot recurse or
+  allocate. (cJSON stays for the council backends, where the input is genuinely
+  nested and third-party.)
 
-**Trigger mechanism — open question**:
-- **Manual, web-UI-triggered** (recommended starting point): a field in the web UI
-  to point at a firmware binary URL and kick off `esp_https_ota` on demand. Simplest
-  and safest, matches the low-traffic single-user nature of everything else built
-  so far — no unattended auto-update risk.
-- **Periodic auto-check**: device periodically polls a version endpoint and either
-  notifies or auto-installs. Bigger lift (needs a version-comparison scheme and a
-  machine-readable "latest version" manifest, not just a raw binary) — not
-  recommended as a starting point.
+**Two facts confirmed by probing, both contradicting the usual documentation:**
 
-**Open questions to resolve before implementing** (flagging rather than guessing):
-1. Where do OTA images get hosted — a private server, GitHub Releases (this project
-   isn't currently a git repo, so that's a prerequisite if chosen), or something
-   else?
-2. Manual-trigger, auto-check, or both (starting with manual)?
-3. Real partition sizes once image size is actually measured with HTTPS/OTA code
-   included — don't lock in 1.5MB/1.5MB without checking.
-4. Keep a `factory` fallback slot (dual-boot factory + single OTA slot, trading
-   capacity for a guaranteed-good recovery image) vs. the simpler stock two-OTA-only
-   layout?
+- **The release-download redirect target is now
+  `release-assets.githubusercontent.com`**, not
+  `objects.githubusercontent.com` as most examples state. The signed URL it
+  returns is ~900 characters and carries a **JWT that expires in about an
+  hour**, so it must be followed promptly and can be neither cached nor
+  hardcoded. Redirect-following must stay enabled.
+- **GitHub's real certificate chain could not be verified from here.** Both
+  the build sandbox *and* the owner's Mac are behind a Zscaler TLS-intercepting
+  proxy, so every handshake presents a Zscaler-issued certificate rather than
+  GitHub's. That is a client-agent artifact of those machines and should not
+  affect an ESP32 on the same Wi-Fi, which is not proxied - but it means **the
+  first real OTA on the device is the first genuine test of the CA bundle
+  against GitHub**. If it fails with a TLS or certificate error, check that
+  before suspecting the code.
+
+**Security, stated plainly**: the image is fetched over HTTPS and validated
+against ESP-IDF's bundled CA roots, so authenticity rests on GitHub's
+certificate and on who can push to the repo. There is **no firmware signature
+check** - anyone able to alter the release asset could ship code to every
+device. For a handful of devices among friends that is an acceptable trade,
+and it is recorded here so it stays a decision rather than an oversight. The
+upgrade path is `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`, which verifies a
+signature at OTA time without the irreversibility of full secure boot; the
+signing key must never be committed.
+
+**Not yet verified on hardware**: nothing in this section has run on a device,
+and the first flash of this build is also the first test of the new partition
+table.
 
 ### 3.6 Alternating multi-week manual / fallback schedule (implemented; rename + reframing planned)
 
@@ -2150,7 +2166,7 @@ three different things that are easy to conflate.
 | §3.4 "Forget this network" | ✅ | ✅ | ⚠️ untested — it is the easiest way to reach AutoAP |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
-| §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
+| §3.5 OTA (GitHub-hosted, rollback, no backend) | ✅ | ❌ **not yet flashed** | ❌ |
 
 **Everything is flashed and, with two exceptions, tested on hardware**
 (owner's report, 2026-07-26). The two untested features are:
@@ -2310,10 +2326,12 @@ Two things to watch for specifically, being the parts host tests cannot prove:
 
 After that, in priority order:
 
-1. **§3.5 OTA** — needs a partition-table rework (one 3MB `factory` slot →
-   two OTA slots + `otadata`), so it means an `erase-flash`. **Best done
-   before devices are handed out**, since after that a firmware fix means
-   physically collecting them.
+1. **Flash the OTA build** (§3.5) — it is written but unflashed, and the
+   flash itself is the test of the new partition table. Confirm the config
+   survives (it should: `nvs` did not move), then check the Firmware section
+   reports 1.0.0, and do one real end-to-end update by publishing a 1.0.1.
+   That last step is also the first genuine test of GitHub's TLS chain
+   against the CA bundle.
 2. **§3.14 battery life** — design recorded, not started. Gated on four
    current measurements (§3.14.5), the most important being what the board
    actually draws with Wi-Fi connected and idle. Needs no new hardware and no
@@ -2335,8 +2353,10 @@ After that, in priority order:
    shrink (it is the single biggest consumer once sleep is in), and whether
    duty-cycling the LEDs instead of lighting them steadily is acceptable for
    the product.
-4. **§3.5 OTA**: image hosting, manual vs auto-check, and real partition sizes
-   once an image with TLS is actually measured.
+4. ~~**§3.5 OTA**: image hosting, manual vs auto-check, partition sizes.~~
+   **Resolved** - GitHub Releases plus a manifest, 1.94MB slots against a
+   1.29MB image. What remains open is whether to add an *automatic* periodic
+   check; today it is user-initiated from the UI only.
 5. **§3.7**: the `glass` → Purple default is inferred from the platform-wide
    `event_type` enum, not observed live — Maribyrnong never returns it.
 

@@ -13,6 +13,7 @@
 
 #include "councils.h"
 #include "factory_reset.h"
+#include "ota.h"
 #include "schedule.h"
 #include "settings.h"
 #include "waste_api.h"
@@ -24,13 +25,13 @@ static const char *TAG = "web_server";
 // compiling root_get_handler() on the host against stubs and dumping the
 // bytes it emits:
 //
-//   factory-fresh, nothing configured   7810
-//   realistic setup (3 event types)      9339
+//   factory-fresh, nothing configured   8370
+//   realistic setup (3 event types)      9901
 //   worst case (8 event types, i.e.
 //     WASTE_API_MAX_TYPE_RULES, with
-//     long type names and address)      11524
+//     long type names and address)      12084
 //
-// 14336 leaves ~2.8KB over the worst case - raised from 12288 when the
+// 14336 leaves ~2.2KB over the worst case - raised from 12288 when the
 // Wi-Fi and factory-reset sections pushed the margin under 1KB. Note the
 // fresh-device page alone is 7810 bytes: the original 7200 would have
 // truncated on any real configuration. `./test/host/run.sh render` reprints
@@ -603,6 +604,15 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         wifi_manager_current_ssid());
 
     off = safe_append(html, HTML_BUF_SIZE, off,
+        "<div class='sect'><h2>Firmware</h2>"
+        "<p>Version <b>%s</b>.</p>"
+        "<form method='POST' action='/update'>"
+        "<button type='submit'>Check for updates</button></form>"
+        "<p class='note'>Checks for a newer build and installs it over Wi-Fi. Your settings "
+        "are kept.</p>"
+        "</div>", ota_running_version());
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
         "<div class='sect'><h2>Restart</h2>"
         "<form method='POST' action='/reboot'>"
         "<button type='submit'>Restart the light</button></form>"
@@ -792,6 +802,125 @@ static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
     vTaskDelay(pdMS_TO_TICKS(1500));
     esp_restart();
     return ESP_OK; // not reached
+}
+
+// Firmware updates (SPEC.md 3.5), one handler covering three steps:
+//   no action      -> check the manifest and report what's published
+//   action=install -> kick off the download, then show progress
+//   action=status  -> progress only (the page auto-refreshes into this)
+// POST throughout: checking is a network call and installing is obviously not
+// something a link should trigger.
+static esp_err_t update_post_handler(httpd_req_t *req)
+{
+    char body[320] = "";
+    if (req->content_len > 0 && req->content_len < (int)sizeof(body)) {
+        int received = 0;
+        while (received < req->content_len) {
+            int ret = httpd_req_recv(req, body + received, req->content_len - received);
+            if (ret <= 0) {
+                if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                    continue;
+                }
+                return ESP_FAIL;
+            }
+            received += ret;
+        }
+        body[received] = '\0';
+    }
+    char action[16] = "";
+    httpd_query_key_value(body, "action", action, sizeof(action));
+
+    char *html = malloc(HTML_BUF_SIZE);
+    if (html == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    int off = 0;
+
+    bool installing = (strcmp(action, "install") == 0);
+    if (installing) {
+        char url[256] = "";
+        if (httpd_query_key_value(body, "url", url, sizeof(url)) == ESP_OK) {
+            url_decode_inplace(url);
+            ota_start(url);
+        }
+    }
+    bool show_progress = installing || (strcmp(action, "status") == 0) ||
+                         ota_get_state() == OTA_STATE_RUNNING;
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Firmware Update</title>"
+        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
+        ".note{color:#888;}code{background:#eee;padding:.1em .3em;}</style>"
+        "</head><body><h1>Firmware update</h1>"
+        "<p>Running version: <b>%s</b></p>", ota_running_version());
+
+    if (show_progress) {
+        ota_state_t state = ota_get_state();
+        if (state == OTA_STATE_RUNNING) {
+            // No JavaScript, so progress is a meta-refresh poll. 3s is often
+            // enough to see the percentage move without hammering the device
+            // while it is busy pulling ~1.3MB over TLS.
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<meta http-equiv='refresh' content='3'>"
+                "<p><b>Updating: %s</b></p>"
+                "<p class='note'>Leave this page open. Don't power the light off until it "
+                "finishes &mdash; if it is interrupted the light keeps running its current "
+                "firmware, so a failed update is recoverable, but a half-written one wastes "
+                "the download.</p>", ota_get_message());
+        } else if (state == OTA_STATE_SUCCESS) {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<p><b>Update installed.</b></p>"
+                "<p>Restart to run it. If the new firmware can't get back onto Wi-Fi, the "
+                "light automatically rolls back to this version on the reboot after that.</p>"
+                "<form method='POST' action='/reboot'>"
+                "<button type='submit'>Restart now</button></form>");
+        } else {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<p><b>Update failed:</b> %s</p>"
+                "<p class='note'>Nothing has changed &mdash; the light is still running its "
+                "current firmware.</p>", ota_get_message());
+        }
+    } else {
+        ota_manifest_t m;
+        if (ota_check(&m) != ESP_OK) {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<p><b>Couldn't check for updates.</b></p>"
+                "<p class='note'>The light couldn't reach the update manifest. Check its "
+                "internet connection and try again.</p>");
+        } else if (!m.available) {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<p><b>Up to date.</b> The published version is <b>%s</b>, which is what "
+                "this light is running.</p>", m.version);
+        } else {
+            char esc_url[sizeof(m.url) * 6 + 1];
+            char esc_notes[sizeof(m.notes) * 6 + 1];
+            html_escape_attr(m.url, esc_url, sizeof(esc_url));
+            html_escape_attr(m.notes, esc_notes, sizeof(esc_notes));
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<p><b>Version %s is available.</b></p>", m.version);
+            if (m.notes[0] != '\0') {
+                off = safe_append(html, HTML_BUF_SIZE, off, "<p>%s</p>", esc_notes);
+            }
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<form method='POST' action='/update'>"
+                "<input type='hidden' name='action' value='install'>"
+                "<input type='hidden' name='url' value='%s'>"
+                "<button type='submit'>Download and install</button></form>"
+                "<p class='note'>Takes a couple of minutes. Your settings are kept &mdash; "
+                "an update replaces the firmware, not the configuration.</p>", esc_url);
+        }
+    }
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<p style='margin-top:1em'><a href='/'>&larr; Back to schedule</a></p></body></html>");
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, off);
+    free(html);
+    return ESP_OK;
 }
 
 // Restart the device (SPEC.md 3.12). Unlike the two resets below this loses
@@ -1584,7 +1713,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 11; // 10 in use, small headroom for future additions
+    config.max_uri_handlers = 12; // 11 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -1637,6 +1766,11 @@ esp_err_t web_server_start(void)
         .method = HTTP_POST,
         .handler = wifi_forget_post_handler,
     };
+    static const httpd_uri_t update_uri = {
+        .uri = "/update",
+        .method = HTTP_POST,
+        .handler = update_post_handler,
+    };
     static const httpd_uri_t reboot_uri = {
         .uri = "/reboot",
         .method = HTTP_POST,
@@ -1656,6 +1790,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &test_uri);
     httpd_register_uri_handler(server, &wifi_forget_uri);
+    httpd_register_uri_handler(server, &update_uri);
     httpd_register_uri_handler(server, &reboot_uri);
     httpd_register_uri_handler(server, &factory_reset_uri);
 
