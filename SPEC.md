@@ -1987,132 +1987,133 @@ The shape that made this cheap:
   fields, and the sort order the single-pass renderer depends on. It also
   prints per-state counts so a table edit shows up as a visible diff.
 
-### 3.14 Deep sleep with radar presence wake (planned, not yet implemented)
+### 3.14 Battery life: time-based deep sleep (planned, not yet implemented)
 
-**Requirement**: the production build runs on battery, so the device should
-**deep sleep when nobody is there to look at it** and wake on approach. The
-proposed sensor is an **HLK-LD012-5G** radar presence module (~70µA quiescent,
-per the owner), whose output drives an ESP32-C6 wake pin.
+**Requirement**: the production build runs on a relatively small battery, and
+should last a useful time between charges.
 
 **Must be a runtime toggle, not a build option** (owner's requirement): a
-setting in the web UI's Preferences section (§3.11), persisted in
-`schedule_t` alongside brightness and light mode, defaulting to **off**.
-Mains-powered devices and anyone debugging want it off; battery builds want it
-on. Off must mean *never sleeps* — the current always-on behaviour, unchanged.
+setting in Preferences (§3.11), persisted in `schedule_t` beside brightness
+and light mode, defaulting to **off**. Off means *never sleeps* — today's
+behaviour exactly. Mains-powered devices and anyone debugging want it off.
 
-#### 3.14.1 The pin problem — read this first
+#### 3.14.1 Where the power actually goes
 
-**On the ESP32-C6, only GPIO0–GPIO7 can wake the chip from deep sleep**
-(they are the LP/RTC-capable pins, `LP_GPIO0`–`LP_GPIO7`; everything above
-GPIO7 is dead to `esp_deep_sleep_enable_gpio_wakeup()`). That is a hard
-silicon constraint, and it collides with the current allocation:
+Estimated daily budget. **These are order-of-magnitude figures, not measured**
+— but the ranking is what matters, and it is not close:
 
-| GPIO | Pad | Current use | RTC-capable? |
-|---|---|---|---|
-| 0 | `D0` | WS2812 data | ✅ |
-| 1 | `D1` | action button (capacitive touch) | ✅ |
-| 2 | `D2` | reset button | ✅ |
-
-**All three RTC-capable pads the XIAO ESP32-C6 appears to break out are
-already taken.** GPIO 4, 5, 8, 9 and 15 are strapping pins and unusable for
-this; GPIO 3, 6 and 7 are RTC-capable but **need checking against the board's
-actual pinout** — the XIAO's `D3`–`D10` pads are believed to map to GPIO 21,
-22, 23, 16, 17, 19, 20 and 18, none of which can wake the chip. **Confirm the
-pad↔GPIO map on the real board before designing around this.** If that mapping
-is right, the radar cannot simply be added — something has to move.
-
-**Proposed resolution: move the LEDs, give GPIO 0 to the radar.**
-The WS2812 data line has no wake requirement and works on any GPIO, whereas
-the radar's *only* job is to wake the chip. So:
-
-| GPIO | Pad | Proposed use |
+| Consumer | Draw | mAh/day |
 |---|---|---|
-| 0 | `D0` | **radar OUT** (wake source) |
-| 1 | `D1` | action button |
-| 2 | `D2` | reset button |
-| 21 (or any free pad) | `D3` | WS2812 data |
+| ESP32-C6, Wi-Fi connected (modem sleep, DTIM) | ~25 mA | **600** |
+| 2× WS2812 **lit**, one colour @ 50%, 20h window | ~30 mA | **600** (on a bin night) |
+| 2× WS2812 **idle** — black, but powered | ~2 mA | 48 |
+| ESP32-C6, deep sleep | ~15 µA | 0.4 |
 
-This is a one-line `CONFIG_BINLIGHT_LED_GPIO` change plus a rewire, and it
-costs nothing. Doing it the other way round — putting the radar on a non-RTC
-pad — does not work at all.
+On a 2000 mAh cell that is **about three days**, and under one on a bin night.
 
-**Should the buttons also be wake sources?** Probably not, and that is the
-happy answer: you have to walk up to the device to press a button, and walking
-up is exactly what the radar detects. The radar wakes it, and the button press
-lands on an already-awake device. Only if the radar proves unreliable does a
-button need to compete for a scarce RTC pin.
+**Two consumers dominate, and they are roughly equal: the always-connected
+radio, and the light actually being on.** Everything else is rounding.
 
-#### 3.14.2 Design tensions to resolve before coding
+#### 3.14.2 Why the radar idea was dropped
 
-These are the things that decide whether this feature saves power or just adds
-a part. None is a blocker; all need answering.
+The HLK-LD012-5G presence-wake proposal (previously recorded here) is
+**abandoned**, for two reasons that are worth keeping so it isn't
+re-proposed:
 
-- **The WS2812s may dominate the power budget.** Each WS2812 draws roughly
-  **1mA even when displaying black**, because its controller IC stays powered
-  — so two LEDs idle at ~2mA, which is **~30× the radar's 70µA**. Deep sleep
-  that leaves the LEDs powered would be largely pointless. Expect to need a
-  **P-channel MOSFET or load switch cutting LED VDD**, driven from a GPIO
-  held low during sleep. **Measure the real idle draw before committing** —
-  this single number decides whether the whole feature is worth building.
-- **Waking is not free.** A Wi-Fi reconnect is a multi-second, hundreds-of-mA
-  event. If the radar trips often (a busy hallway, a passing cat), duty-cycled
-  waking can burn *more* than staying awake. Needs a **minimum awake window**
-  and probably a **re-trigger holdoff**.
-- **…but most wakes should not need Wi-Fi at all.** §3.3's sticky cache is
-  already persisted in NVS, so a woken device **already knows the next
-  collection** without touching the network. It can wake, light the right
-  colour from cache, and sleep again with the radio never coming up. Wi-Fi is
-  only needed for the 12-hourly poll and for serving the UI. This is the
-  single most important thing that makes the feature viable, and it exists
-  because of a decision already taken for unrelated reasons.
-- **A sleeping device has no web UI and no mDNS.** `binlight.local` simply
-  will not answer, which is bewildering if you do not know why. Needs a
-  defined "stay awake" rule — e.g. **stay awake for N minutes after any
-  button press or after boot**, so walking up and tapping the pad gives you a
-  reachable device. The AutoAP path (§3.4) must never sleep at all.
-- **Deep sleep restarts `app_main()` from the top.** RAM is lost (bar RTC slow
-  memory); NVS survives. Without care, every wake would re-run the §3.10 boot
-  self-test and the AutoAP checks. Branch on
-  `esp_sleep_get_wakeup_cause()` — a cold boot does the full startup, a radar
-  wake goes straight to "light the cached colour".
-- **Does it sleep on a bin night?** The light's entire purpose is to be
-  glanceable on the night the bins go out. If it sleeps until someone is
-  within radar range, a glance from the back door or a passing car sees
-  nothing. **This is a product question, not a technical one**, and the
-  answer may well be: *never sleep during an active light window; only sleep
-  on the nights when there is nothing to show*. That preserves the point of
-  the device and still captures most of the saving, since most nights are
-  dark ones.
-- **Radar range and angle vs. where the light lives.** §5 already notes the
-  light is "likely seen from a distance and off-axis". Confirm the module's
-  detection cone actually covers the approach path, not just the last metre.
-- **Datasheet facts still needed** (the design branches on these, and the
-  ~70µA figure is the owner's, not verified here): is the output a **level**
-  held while present, or a **pulse** on detection? What is the warm-up time
-  from power-on to a valid output? Detection range, cone angle, and minimum
-  re-trigger interval? Supply voltage — 3V3-compatible, or does it need its
-  own rail?
-- **Battery hardware is out of scope of this section but not of the build**:
-  cell choice, the XIAO's `BAT+`/`BAT-` charging pads, and whether the light
-  window's LED current (far larger than anything above) is what actually
-  sizes the battery.
+1. **It optimised the wrong thing by ~350×.** The radar's own 70 µA is
+   1.7 mAh/day against a 600 mAh/day problem. Presence detection would have
+   saved nothing that time-based sleep doesn't already save.
+2. **It rested on a false assumption about the LEDs.** The WS2812s idle at
+   ~1 mA *each* because **their own controller ICs are powered from the 5 V
+   rail** — nothing to do with the ESP32. Deep-sleeping the MCU only stops it
+   driving the data line; the LEDs neither know nor care. Cutting that 48
+   mAh/day needs a **switch in the LED power rail**, and no amount of MCU
+   sleeping substitutes for it.
 
-#### 3.14.3 Suggested shape, once the above is settled
+Dropping it also **removes the pin problem entirely**. The earlier concern
+was that only GPIO 0–7 can wake an ESP32-C6 from deep sleep and all the
+broken-out ones were taken. But the two things that now need to wake the
+device are the **RTC timer** (no pin at all) and the **buttons**, which are
+already on **GPIO 1 and GPIO 2** — both inside the LP/RTC range. **No
+rewiring, no freed pad, no moved LED line.**
 
-- Kconfig for the radar pin (`CONFIG_BINLIGHT_RADAR_GPIO`, `-1` disables) and
-  its active level, matching how the buttons are configured (§3.12).
+#### 3.14.3 The approach: sleep on time, wake on schedule or touch
+
+The device does not need to be awake because someone is looking at it. It
+needs to be awake to *show* something, to poll occasionally, and to be
+configurable. All three are predictable:
+
+- **Sleep between light windows.** The next collection date is already in
+  NVS (§3.3's sticky cache), so the device can compute exactly when its next
+  window opens and `esp_deep_sleep()` until then. **The cache existing is what
+  makes this cheap**, and it was built for unrelated reasons.
+- **Wake sources**: RTC timer (window start, and a daily-ish API poll), plus
+  either button (GPIO 1/2, already RTC-capable).
+- **A wake usually needs no radio at all.** Lighting the cached colour needs
+  nothing from the network. Wi-Fi comes up only for the periodic poll and
+  when someone is actually configuring the device.
+- **Staying reachable**: a sleeping device answers neither `binlight.local`
+  nor the web UI, which is bewildering if unexplained. Rule: **stay awake for
+  N minutes after any button press or after boot** — walk up, tap the pad, and
+  it is reachable. AutoAP (§3.4) must never sleep.
+- **Cold boot vs. wake**: deep sleep restarts `app_main()` with RAM lost (NVS
+  survives). Branch on `esp_sleep_get_wakeup_cause()` so a timer wake goes
+  straight to lighting the cached colour rather than re-running the §3.10 boot
+  self-test every time.
+
+Estimated result, same assumptions as above, with a 5-hour window on two bin
+nights a week: **~50 mAh/day, or about 40 days** on a 2000 mAh cell — from
+three. Adding a load switch for the LED rail takes it to **~45 days**.
+
+#### 3.14.4 The other half: the light window itself
+
+Once sleep is in, **the light being on becomes the single biggest consumer**,
+and it is governed by settings the user already controls (§3.11). Worth
+stating plainly, because no amount of firmware cleverness beats these:
+
+- **Duration.** The default is **20 hours** (3pm→11am). That is ~600 mAh on a
+  bin night — a third of a small cell for one night. A 5-hour evening window
+  costs ~150 mAh. This is the biggest single lever and it is already a
+  user-facing field.
+- **Brightness.** Already a slider, already defaults to 50%. Current scales
+  roughly linearly, so 25% roughly halves the lit cost.
+- **The dismiss button already helps.** §3.12's action button ends the window
+  early once the bins are out — that is a power feature as much as a
+  convenience one, and it is already built.
+- **Not yet considered: duty-cycling the LEDs** — a brief pulse every few
+  seconds instead of steady illumination would cut lit power by an order of
+  magnitude and is arguably *more* eye-catching. It changes the product feel,
+  so it is a decision for the owner, not an optimisation to slip in.
+
+#### 3.14.5 What to measure before building any of this
+
+In order of how much the answer changes the design:
+
+1. **Actual current with Wi-Fi connected and idle**, on this board and this
+   AP. The ~25 mA above is a book figure; DTIM interval and AP behaviour swing
+   it widely, and it is half the problem.
+2. **Actual WS2812 idle draw**, both LEDs, showing black. Decides whether a
+   load switch is worth adding (~48 mAh/day at the estimate above).
+3. **Actual lit draw** at the brightness and colours really used — red and
+   yellow drive different numbers of channels, so it is not one figure.
+4. **Deep sleep current** with the design's wake sources armed.
+
+#### 3.14.6 Suggested shape, once the above is settled
+
 - A runtime `deep_sleep_enabled` flag in `schedule_t`, surfaced as a
-  Preferences checkbox, defaulting off. Bump `SCHEDULE_STRUCT_VERSION` — or
-  better, self-heal on load, per the precedent in §6 bug 16 and the v2→v3
-  migration note, now that real configured devices exist.
+  Preferences checkbox, default off. **Self-heal on load** rather than bumping
+  `SCHEDULE_STRUCT_VERSION`, per §6 bug 16's precedent — real configured
+  devices exist now.
 - A `power_manager.c` owning the policy: when may we sleep, how long do we
   stay awake, what wakes us. Keeping it out of `schedule.c` matters — the
-  schedule answers "what colour, when", and conflating that with "is anyone
-  looking" is how both become untestable.
-- Host-testable policy: the "may we sleep now?" decision should be a pure
-  function of (light window active, seconds since last interaction, deep sleep
-  enabled, AutoAP active) so `test/host/` can cover it without a device, the
-  same way the resolver and button thresholds are covered.
+  schedule answers "what colour, when"; conflating that with "may we sleep"
+  makes both untestable.
+- **Host-testable policy**: "may we sleep now, and until when?" should be a
+  pure function of (next collection, light window, seconds since last
+  interaction, sleep enabled, AutoAP active) so `test/host/` covers it with no
+  device, exactly as the resolver and button thresholds are covered.
+- Optional hardware: a load switch (P-FET or load-switch IC) on the LED 5 V
+  rail, held off during sleep. Only worth adding if measurement 2 confirms it.
 
 ## 4. Current state of the code — READ THIS FIRST after a context reset
 
@@ -2144,7 +2145,7 @@ three different things that are easy to conflate.
 | §3.12 reset button (3s restart / 10s factory reset, armed-colour feedback) | ✅ | ❌ **not yet flashed** | ❌ needs an external button on GPIO 2 |
 | §3.12 action button (capacitive tap: dismiss / show next) | ✅ | ❌ **not yet flashed** | ❌ needs the touch module wired |
 | §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ✅ | ❌ **the one untested item** — needs a deliberate setup, see below |
-| §3.14 deep sleep + radar presence wake | ❌ not written (design only — **needs a pin freed**, see 3.14.1) | — | — |
+| §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
 
@@ -2301,9 +2302,10 @@ After that, in priority order:
    two OTA slots + `otadata`), so it means an `erase-flash`. **Best done
    before devices are handed out**, since after that a firmware fix means
    physically collecting them.
-2. **§3.14 deep sleep + radar presence wake** — design recorded, not
-   started. Gated on freeing an RTC-capable pin (§3.14.1) and on measuring
-   the LEDs' idle draw, which is what decides whether it saves anything.
+2. **§3.14 battery life** — design recorded, not started. Gated on four
+   current measurements (§3.14.5), the most important being what the board
+   actually draws with Wi-Fi connected and idle. Needs no new hardware and no
+   rewiring; the radar idea was dropped.
 3. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated
    on its lat/lon UX question. Zero value to the working group.
 
@@ -2315,12 +2317,12 @@ After that, in priority order:
    GPIO 1 / `D1`) but **neither has been tested against real hardware** — the
    touch module in particular needs confirming for polarity and momentary
    (not latching) configuration.
-3. **§3.14 (deep sleep)**: the biggest one is **which pad the radar can
-   actually use** — only GPIO 0–7 can wake an ESP32-C6, and the three the
-   XIAO appears to break out are all in use. Then: the WS2812s' true idle
-   draw (which decides whether the feature is worth building at all), whether
-   the device should sleep at all during an active light window, and the
-   module's own datasheet numbers.
+3. **§3.14 (battery)**: nothing can be designed properly until the four
+   currents in §3.14.5 are measured. Beyond that, two are the owner's calls
+   rather than technical: whether the default 20-hour light window should
+   shrink (it is the single biggest consumer once sleep is in), and whether
+   duty-cycling the LEDs instead of lighting them steadily is acceptable for
+   the product.
 4. **§3.5 OTA**: image hosting, manual vs auto-check, and real partition sizes
    once an image with TLS is actually measured.
 5. **§3.7**: the `glass` → Purple default is inferred from the platform-wide
