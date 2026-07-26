@@ -2209,7 +2209,7 @@ three different things that are easy to conflate.
 | §3.4 "Forget this network" | ✅ | ✅ | ⚠️ untested — it is the easiest way to reach AutoAP |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
-| §3.5 OTA (GitHub-hosted, rollback, no backend) | ✅ | ❌ **not yet flashed** | ❌ |
+| §3.5 OTA (GitHub-hosted, auto-update, rollback) | ✅ | ✅ | ❌ **not tested** — no 1.0.1 published yet |
 
 **Everything is flashed and, with two exceptions, tested on hardware**
 (owner's report, 2026-07-26). The two untested features are:
@@ -2323,9 +2323,8 @@ that test, three further features have landed and **none is flashed**: OTA with
 automatic updates (§3.5), factory reset (§3.12), and the restart/action buttons
 (§3.12, partly tested — see the table).
 
-1. **Flash.** This is also the first test of the **new OTA partition table**.
-   `nvs` did not move, so the config *should* survive — confirm it does rather
-   than assume. Expect the Firmware section to report **1.0.0**.
+1. ~~**Flash.**~~ **Done 2026-07-26** — the OTA partition table is live and the
+   device is running 1.0.0.
 2. **Prove the OTA round trip.** Bump `version.txt` to 1.0.1, build, tag, cut a
    GitHub Release with the `.bin`, update `firmware/latest.json`
    ([firmware/README.md](firmware/README.md) has the checklist), then let the
