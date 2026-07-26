@@ -104,6 +104,11 @@ typedef struct {
 // the clock hasn't synced yet, since every branch needs today's date.
 schedule_next_t schedule_get_next_collection(void);
 
+// True while the evaluator is currently lighting the LEDs for a collection.
+// Used by the action button to decide what a tap means, and by the automatic
+// updater to avoid rebooting in the middle of a bin-night display.
+bool schedule_light_is_on(void);
+
 // One press of the action button (SPEC.md 3.12), which does one of two things
 // depending on what the light is doing right now:
 //

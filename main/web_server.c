@@ -608,9 +608,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<p>Version <b>%s</b>.</p>"
         "<form method='POST' action='/update'>"
         "<button type='submit'>Check for updates</button></form>"
-        "<p class='note'>Checks for a newer build and installs it over Wi-Fi. Your settings "
-        "are kept.</p>"
-        "</div>", ota_running_version());
+        "<p class='note'>Automatic updates are <b>%s</b>. Your settings are kept across an "
+        "update either way.</p>"
+        "</div>", ota_running_version(), ota_auto_update_enabled() ? "on" : "off");
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<div class='sect'><h2>Restart</h2>"
@@ -836,6 +836,12 @@ static esp_err_t update_post_handler(httpd_req_t *req)
     }
     int off = 0;
 
+    if (strcmp(action, "setauto") == 0) {
+        char value[8];
+        // An unchecked checkbox submits nothing, so absence means "off".
+        ota_set_auto_update(httpd_query_key_value(body, "auto", value, sizeof(value)) == ESP_OK);
+    }
+
     bool installing = (strcmp(action, "install") == 0);
     if (installing) {
         char url[256] = "";
@@ -913,6 +919,18 @@ static esp_err_t update_post_handler(httpd_req_t *req)
                 "an update replaces the firmware, not the configuration.</p>", esc_url);
         }
     }
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<hr style='margin-top:1.5em'>"
+        "<form method='POST' action='/update'>"
+        "<input type='hidden' name='action' value='setauto'>"
+        "<p><label><input type='checkbox' name='auto' %s> Install updates automatically</label></p>"
+        "<button type='submit'>Save</button></form>"
+        "<p class='note'>Checks once a day and installs anything new on its own. It waits "
+        "until the light is off before restarting, so an update never interrupts a bin-night "
+        "reminder. If an update ever stopped the light getting back onto Wi-Fi, it reverts to "
+        "the previous version by itself.</p>",
+        ota_auto_update_enabled() ? "checked" : "");
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<p style='margin-top:1em'><a href='/'>&larr; Back to schedule</a></p></body></html>");

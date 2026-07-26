@@ -67,3 +67,25 @@ const char *ota_get_message(void);
 //
 // No-op unless the image is actually pending verification.
 void ota_mark_valid(void);
+
+// --- automatic updates ---
+//
+// **On by default.** These devices live in other people's houses; the whole
+// reason OTA exists (SPEC.md 1.1) is that a council API breaking otherwise
+// means visiting each one with a USB cable. Leaving updates for someone else
+// to notice and click would defeat that, so the default is that they simply
+// happen.
+//
+// The updater checks daily, installs anything published, and then waits for
+// the light to be off before restarting - never interrupting a bin-night
+// display. Rollback (see ota_mark_valid) is what makes automatic installation
+// safe: a build that cannot get back onto Wi-Fi is reverted by the bootloader
+// without anyone touching the device.
+
+bool ota_auto_update_enabled(void);
+esp_err_t ota_set_auto_update(bool enabled);
+
+// Starts the background checker. Safe to call when auto-update is disabled -
+// the task still runs but does nothing, so the setting can be toggled at
+// runtime without a reboot.
+esp_err_t ota_auto_task_start(void);

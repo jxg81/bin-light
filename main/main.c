@@ -78,6 +78,7 @@ void app_main(void)
     // roll back to the previous image on the next reboot - which is what
     // saves a physical visit if an update ever bricks the network path.
     ota_mark_valid();
+    ESP_ERROR_CHECK(ota_auto_task_start());
 
     ESP_LOGI(TAG, "bin light ready (firmware %s)", ota_running_version());
 }

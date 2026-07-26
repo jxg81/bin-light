@@ -623,6 +623,49 @@ upgrade path is `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`, which verifies a
 signature at OTA time without the irreversibility of full secure boot; the
 signing key must never be committed.
 
+**Automatic updates, on by default (owner's requirement).** These devices live
+in other people's houses; the whole reason OTA exists (§1.1) is that a council
+API breaking otherwise means visiting each one with a USB cable. Leaving
+updates for someone else to notice and click would defeat that.
+
+- **Checks daily**, first check ~2 minutes after boot so Wi-Fi and SNTP have
+  settled. Installs anything published, then restarts.
+- **Never restarts mid-display.** After a successful install it waits for
+  `schedule_light_is_on()` to go false before rebooting - the light being on
+  is the one moment the device is actually doing its job, and a reboot costs
+  the boot cycle plus the §3.10 self-test.
+- **Rollback is what makes this safe to leave on.** A build that cannot get
+  back onto Wi-Fi is never confirmed by `ota_mark_valid()`, so the bootloader
+  reverts it on the next restart with nobody touching the device. Automatic
+  installation without rollback would be reckless; with it, the worst case is
+  a device that reboots twice and carries on as before.
+- **Stored as its own small NVS key** (`ota_auto` in the `binlight`
+  namespace), *not* as a field in `schedule_t`. Adding a field there changes
+  `sizeof(schedule_t)`, which fails `schedule_init()`'s size check and resets
+  every configured device to defaults - unacceptable now that real ones are
+  deployed. A separate key needs no migration and is still covered by factory
+  reset, which erases the whole namespace.
+- Toggle lives on the update page; the home page's Firmware section reports
+  whether it is on.
+
+**TLS chain verified (2026-07-26)**, after the owner disabled the Zscaler
+client agent that had been intercepting every handshake:
+
+| Host | Chain | Against the ESP-IDF bundle |
+|---|---|---|
+| `raw.githubusercontent.com` (manifest) | Let's Encrypt → ISRG Root YR | ✅ `Verify return code: 0 (ok)` |
+| `github.com` (release URL) | Sectigo Public Server Auth Root E46 | ✅ ok |
+| `release-assets.githubusercontent.com` (redirect target) | Let's Encrypt → ISRG Root YR | ✅ ok |
+
+Validated with `openssl s_client -CAfile` pointed at the *actual*
+`cacrt_all.pem` the device compiles in, not at the system trust store - the
+only test that answers the question. Note the bundle lists ISRG Root **X1/X2**
+rather than YR by name, so this very likely resolves through
+`CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY`, which is already
+enabled - it was turned on during the waste-info.com.au bring-up (§3.3) for
+exactly this class of cross-signed chain. Worth knowing that a setting added
+for the council APIs may also be load-bearing for OTA.
+
 **Not yet verified on hardware**: nothing in this section has run on a device,
 and the first flash of this build is also the first test of the new partition
 table.

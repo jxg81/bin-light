@@ -66,6 +66,10 @@ esp_err_t ota_start(const char *url) { (void)url; return ESP_OK; }
 ota_state_t ota_get_state(void) { return stub_ota_state; }
 const char *ota_get_message(void) { return "downloading 45%"; }
 void ota_mark_valid(void) {}
+bool stub_ota_auto = true;
+bool ota_auto_update_enabled(void) { return stub_ota_auto; }
+esp_err_t ota_set_auto_update(bool e) { stub_ota_auto = e; return ESP_OK; }
+esp_err_t ota_auto_task_start(void) { return ESP_OK; }
 
 const char *stub_query_string = NULL;
 const char *stub_post_body = NULL;

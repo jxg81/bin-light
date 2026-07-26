@@ -12,7 +12,10 @@
 #include "esp_https_ota.h"
 #include "esp_log.h"
 #include "esp_ota_ops.h"
+#include "nvs.h"
 #include "sdkconfig.h"
+
+#include "schedule.h"
 
 static const char *TAG = "ota";
 
@@ -273,6 +276,95 @@ ota_state_t ota_get_state(void)
 const char *ota_get_message(void)
 {
     return s_message;
+}
+
+// ------------------------------------------------------- automatic updates --
+
+// Stored as its own small NVS key rather than a field in schedule_t. Adding a
+// field there changes sizeof(schedule_t), which fails schedule_init()'s size
+// check and resets every configured device back to defaults - unacceptable now
+// that real ones are deployed. A separate key needs no migration, and
+// factory_reset already erases the whole "binlight" namespace, so it is still
+// covered by a reset.
+#define OTA_NVS_NAMESPACE  "binlight"
+#define OTA_NVS_AUTO_KEY   "ota_auto"
+
+#define AUTO_FIRST_CHECK_MS (2UL * 60 * 1000)        // let Wi-Fi and SNTP settle
+#define AUTO_CHECK_INTERVAL_MS (24UL * 60 * 60 * 1000)
+#define AUTO_REBOOT_POLL_MS (60UL * 1000)
+
+bool ota_auto_update_enabled(void)
+{
+    nvs_handle_t handle;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle) != ESP_OK) {
+        return true; // default on - see ota.h
+    }
+    uint8_t value = 1;
+    esp_err_t err = nvs_get_u8(handle, OTA_NVS_AUTO_KEY, &value);
+    nvs_close(handle);
+    return (err == ESP_OK) ? (value != 0) : true;
+}
+
+esp_err_t ota_set_auto_update(bool enabled)
+{
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = nvs_set_u8(handle, OTA_NVS_AUTO_KEY, enabled ? 1 : 0);
+    if (err == ESP_OK) {
+        err = nvs_commit(handle);
+    }
+    nvs_close(handle);
+    ESP_LOGI(TAG, "automatic updates %s", enabled ? "enabled" : "disabled");
+    return err;
+}
+
+static void auto_task_fn(void *arg)
+{
+    vTaskDelay(pdMS_TO_TICKS(AUTO_FIRST_CHECK_MS));
+
+    for (;;) {
+        if (ota_auto_update_enabled() && ota_get_state() != OTA_STATE_RUNNING) {
+            ota_manifest_t m;
+            if (ota_check(&m) == ESP_OK && m.available) {
+                ESP_LOGW(TAG, "auto-update: installing %s", m.version);
+                if (ota_start(m.url) == ESP_OK) {
+                    while (ota_get_state() == OTA_STATE_RUNNING) {
+                        vTaskDelay(pdMS_TO_TICKS(2000));
+                    }
+                    if (ota_get_state() == OTA_STATE_SUCCESS) {
+                        // Never restart mid-display: the light being on is the
+                        // one moment the device is actually doing its job, and
+                        // a reboot would drop it for the ~10s of a boot cycle
+                        // plus the self-test.
+                        while (schedule_light_is_on()) {
+                            ESP_LOGI(TAG, "auto-update: installed, waiting for the light to go off");
+                            vTaskDelay(pdMS_TO_TICKS(AUTO_REBOOT_POLL_MS));
+                        }
+                        ESP_LOGW(TAG, "auto-update: restarting into the new firmware");
+                        vTaskDelay(pdMS_TO_TICKS(500));
+                        esp_restart();
+                    }
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(AUTO_CHECK_INTERVAL_MS));
+    }
+}
+
+esp_err_t ota_auto_task_start(void)
+{
+    if (s_mutex == NULL) {
+        s_mutex = xSemaphoreCreateMutex();
+        if (s_mutex == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    ESP_LOGI(TAG, "automatic updates are %s", ota_auto_update_enabled() ? "on" : "off");
+    BaseType_t ok = xTaskCreate(auto_task_fn, "ota_auto", 6144, NULL, tskIDLE_PRIORITY + 1, NULL);
+    return (ok == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
 void ota_mark_valid(void)

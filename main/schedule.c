@@ -485,6 +485,11 @@ void schedule_task_force_check(void)
     }
 }
 
+bool schedule_light_is_on(void)
+{
+    return s_light_on;
+}
+
 void schedule_suppress_current(void)
 {
     if (!s_light_on) {
