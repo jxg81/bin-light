@@ -91,6 +91,11 @@ static void buttons_task_fn(void *arg)
             if (stable_pressed) {
                 held_ms = 0;
                 shown = ARMED_NONE;
+                // Logged so wiring can be confirmed over serial immediately,
+                // rather than inferred from the LEDs 3 seconds later - useful
+                // when the "button" is a jumper wire on a breadboard.
+                ESP_LOGI(TAG, "reset button pressed (GPIO %d) - hold 3s to restart, 10s to factory reset",
+                         CONFIG_BINLIGHT_RESET_BUTTON_GPIO);
             } else {
                 // Released - act on however long it was held.
                 armed_t action = armed_for_hold(held_ms);

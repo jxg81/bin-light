@@ -1192,6 +1192,34 @@ with the press durations the owner specified:
   [3s, 10s) can resolve to a factory reset — the asymmetry that matters is
   arming the destructive action too early.
 
+**Final input hardware (owner's plan, 2026-07-26):** a **capacitive touch
+switch** for the action button (light on/off) and a **physical push button**
+for restart/reset. Three consequences worth recording before the action button
+is built:
+
+- **The ESP32-C6 has no capacitive-touch peripheral** (unlike the ESP32,
+  S2 and S3). So this must be a self-contained touch *module* — a TTP223 or
+  similar — presenting a plain digital level to a GPIO. That's fine, and it
+  keeps `buttons.c` unchanged in shape: it's still just a pin to debounce.
+- **Touch modules usually idle LOW and go HIGH on touch** — the opposite of
+  the reset button's active-low wiring. The action button therefore needs its
+  own polarity option rather than sharing
+  `CONFIG_BINLIGHT_RESET_BUTTON_ACTIVE_LOW` (many TTP223 boards can be
+  jumpered to invert, but the firmware shouldn't depend on someone getting
+  that right).
+- **Touch modules also have a latch/toggle mode**, which would fight the
+  state-dependent design below (the firmware decides what a press means from
+  the light's current state). Configure the module as **momentary**, and
+  treat "held" as meaningless for this button — it's a tap.
+
+**Bench testing with no button attached**: the reset input is active-low with
+the internal pull-up on, so a bare jumper from the GPIO to GND is a working
+button — touch to press, pull away to release. On the XIAO ESP32-C6 the
+default GPIO 9 is the BOOT button, so it can be tested with no wiring at all.
+A press is logged as soon as it debounces, so wiring can be confirmed over
+serial without waiting for the 3-second LED feedback. Do not hold the pin low
+*through a power-up*: GPIO 9 is a strapping pin and that enters download mode.
+
 The remaining button work is the **second (action) button**: display-next /
 cancel-tonight, which still needs `schedule_suppress_current()`.
 
