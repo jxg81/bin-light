@@ -2285,13 +2285,13 @@ three different things that are easy to conflate.
 | §3.12 **restart** (web UI + shared function) | ✅ | ✅ | ✅ verified |
 | §3.12 **factory reset** (web UI, two-step confirm) | ✅ | ✅ | ✅ **verified 2026-07-27** — erases, restarts cleanly, lands in AutoAP (§6 bugs 21, 22 fixed and confirmed) |
 | §3.12 reset button, 3s hold → restart | ✅ | ✅ | ✅ verified (GPIO 2 confirmed) |
-| §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ❌ **not tested** — the UI path is confirmed, this second entry point never has been |
+| §3.12 reset button, 10s hold → factory reset | ✅ | ✅ | ✅ **verified 2026-07-27** — including release at ~5s restarting rather than wiping, so the 3s/10s discrimination is proven |
 | §3.12 action button (tap: dismiss / show next) | ✅ | ✅ | ✅ verified (GPIO 1 confirmed) |
 | §3.4 AutoAP onboarding | ✅ | ✅ | ✅ **verified 2026-07-27** — full first-run provisioning works |
 | §3.4.0 captive portal (DNS hijack + 302) | ✅ | ✅ host-tested (UBSan) | ✅ **verified 2026-07-27** — the setup page auto-opened |
 | §3.4 mDNS *during* AutoAP (§3.9 reorder) | ✅ | ✅ | ✅ **verified 2026-07-27** — dismissing the portal and browsing `binlight.local` still reached the setup page, so the hijack and the pre-wifi `mdns_start()` both work |
-| §3.4 wrong-password rejection at provisioning | ✅ | ✅ | ❓ **not confirmed** — credentials are verified by joining *before* being persisted; a typo must fail on the page and store nothing |
-| §3.4 "Forget this network" | ✅ | ✅ | ❓ **not confirmed on the fixed build** — this is the path that failed as §6 bug 21, and it uses `wifi_manager_forget_credentials()`, *not* the `factory_reset_erase()` path that was just verified |
+| §3.4 wrong-password rejection at provisioning | ✅ | ✅ | ✅ **verified 2026-07-27** — a typo fails on the page and stores nothing |
+| §3.4 "Forget this network" | ✅ | ✅ | ✅ **verified 2026-07-27** — reaches AutoAP, confirming §6 bug 21 is fixed on this path too (it uses `wifi_manager_forget_credentials()`, not `factory_reset_erase()`) |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA (GitHub-hosted, auto-update, rollback) | ✅ | ✅ | ❌ **not tested** — no 1.0.1 published yet |
@@ -2315,21 +2315,16 @@ deployment story rests on: without it, a council API change means physically
 collecting devices. It is also the riskiest thing to leave untested, because
 what makes automatic updates safe is rollback, and rollback is itself untested.
 
-Three smaller gaps, all cheap:
+**Everything else is verified.** The three remaining gaps — the reset button's
+10-second hold (including release at ~5s restarting rather than wiping),
+wrong-password rejection at provisioning, and "forget this network" — were all
+cleared on 2026-07-27.
 
-1. **The reset button's 10-second hold.** The UI factory reset is confirmed;
-   this second entry point into the *same* function never has been. The 3s
-   restart branch is verified, so what is unproven is specifically the
-   3s-vs-10s discrimination — and getting that wrong turns "restart" into
-   "wipe everything".
-2. **Wrong-password rejection at provisioning.** Credentials are verified by
-   joining before they are persisted, so a typo should fail *on the page* and
-   store nothing. Untested; the failure mode is a device that stores a bad
-   password and reboots into a loop.
-3. **"Forget this network".** Distinct from factory reset — it calls
-   `wifi_manager_forget_credentials()`, not `factory_reset_erase()` — and it is
-   the exact path that failed as §6 bug 21. Verifying the reset path does not
-   verify this one.
+**⚠️ OTA is blocked, not merely untested.** The repo is **private**, so
+`raw.githubusercontent.com` returns **404** to an unauthenticated client, which
+is exactly what the device is. Confirmed by fetching the configured manifest
+URL. No amount of publishing releases will work until the manifest and the
+image asset are reachable without credentials — see "▶ Agreed next step".
 
 See "▶ Agreed next step" below.
 
@@ -2471,21 +2466,42 @@ captive portal. What remains is one substantial item and three cheap ones.
 
    Also grep the built `.bin` for credentials first — see §6 bug 21.
 
-4. **Three cheap gaps**, worth ten minutes in any session that touches the
-   device:
-   - **Reset button, 10s hold** → factory reset, and release at ~5s to confirm
-     it restarts rather than wipes. The UI path is proven; the button path into
-     the same function is not, and this boundary is where the asymmetry bites.
-   - **Wrong password at provisioning** — must fail on the page and store
-     nothing.
-   - **"Forget this network"** — the §6 bug 21 path, and *not* the same code
-     as the factory reset that was just verified. Note it should keep the
-     schedule and council setup, unlike a factory reset.
+4. ~~**Three cheap gaps.**~~ **Done 2026-07-27** — reset button 10s hold
+   (and ~5s release restarting instead of wiping), wrong-password rejection,
+   and "forget this network".
 
-   One thing to watch on the next factory reset: confirm the **timezone** is
-   gone too. It lives in the separate `binlight_cfg` namespace, which is
-   handled, but a device claiming to be factory-fresh while still in
-   Australia/Melbourne would be the tell that it isn't.
+   One thing still worth a glance on the next factory reset: confirm the
+   **timezone** is gone too. It lives in the separate `binlight_cfg`
+   namespace, which is handled, but a device claiming to be factory-fresh
+   while still in Australia/Melbourne would be the tell that it isn't.
+
+#### ⚠️ OTA is blocked on repository visibility — read before attempting it
+
+The manifest URL is
+`https://raw.githubusercontent.com/jxg81/bin-light/main/firmware/latest.json`
+and the repo is **private**. An unauthenticated fetch returns **404**
+(verified 2026-07-27), and the device is unauthenticated — it sends no token
+and has nowhere to keep one. The Release *asset* URL has the same problem.
+
+So OTA cannot be tested, and would not work in the field, until both the
+manifest and the image are fetchable anonymously. Publishing a release into
+the private repo changes nothing. Three ways out:
+
+1. **Make `bin-light` public.** Simplest, and already the stated intent. The
+   history scrub is done and verified (see "Repository and history"), so the
+   remaining consideration is the judgement call noted there: SPEC.md names
+   Maribyrnong as "(home)" and the council set narrows the owner to a
+   Melbourne suburb.
+2. **A separate public repo for firmware only** — e.g. `bin-light-firmware`
+   holding `latest.json` and the release assets, source staying private. Keeps
+   OTA fully working without publishing any code, at the cost of a second repo
+   and a one-line Kconfig change. Good if the source should stay private for
+   now.
+3. **Any other anonymous static host** for the two files. Works, but
+   reintroduces exactly the infrastructure §3.5 was designed to avoid.
+
+**This decision is the gate on OTA. Nothing else about §3.5 can be verified
+until it is made.**
 
 After that, in priority order:
 
