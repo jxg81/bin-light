@@ -64,9 +64,24 @@ if [ "$1" = "render" ]; then
     "$OUT/render_page" --max     "$OUT/home-worst-case.html"
     "$OUT/render_page" --setup   "$OUT/api-setup.html"
     "$OUT/render_page" --merribek "$OUT/api-setup-merribek.html"
+    "$OUT/render_page" --reset-confirm "$OUT/factory-reset-confirm.html"
     echo "page sizes (HTML_BUF_SIZE must exceed the largest home-*;"
     echo "SETUP_HTML_BUF_SIZE must exceed api-setup):"
     wc -c "$OUT"/*.html
+
+    echo
+    echo "== factory reset confirmation gate =="
+    # An unconfirmed POST must render the warning and must NOT wipe. The
+    # harness's factory_reset_perform() never returns, so if the gate ever
+    # broke, --reset-confirm would hang rather than produce this file -
+    # but assert on the content too, so a silently-empty page is caught.
+    if grep -q "Are you sure" "$OUT/factory-reset-confirm.html" &&
+       ! grep -q "has been erased" "$OUT/factory-reset-confirm.html"; then
+        echo "PASS unconfirmed POST warns and does not erase"
+    else
+        echo "FAIL unconfirmed POST did not render the confirmation"
+        status=1
+    fi
 fi
 
 exit $status

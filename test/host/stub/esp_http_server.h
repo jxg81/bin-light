@@ -45,7 +45,17 @@ static inline esp_err_t httpd_resp_set_status(httpd_req_t *r, const char *s) { (
 static inline esp_err_t httpd_resp_set_hdr(httpd_req_t *r, const char *k, const char *v) { (void)r; (void)k; (void)v; return ESP_OK; }
 static inline esp_err_t httpd_resp_send_err(httpd_req_t *r, httpd_err_code_t c, const char *m) { (void)r; (void)c; (void)m; return ESP_OK; }
 static inline esp_err_t httpd_resp_send(httpd_req_t *r, const char *buf, int len) { (void)r; stub_capture(buf, len); return ESP_OK; }
-static inline int httpd_req_recv(httpd_req_t *r, char *b, size_t l) { (void)r; (void)b; (void)l; return -1; }
+// The harness can plant a POST body here to drive POST handlers.
+extern const char *stub_post_body;
+static inline int httpd_req_recv(httpd_req_t *r, char *b, size_t l)
+{
+    (void)r;
+    if (!stub_post_body) return -1;
+    size_t n = strlen(stub_post_body);
+    if (n > l) n = l;
+    memcpy(b, stub_post_body, n);
+    return (int)n;
+}
 // Real implementation, matching ESP-IDF semantics: finds key=value in a
 // urlencoded query/body string. The render harness and POST-parsing paths
 // both depend on this actually working.

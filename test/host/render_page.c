@@ -36,6 +36,8 @@ bool waste_api_config_complete(const waste_api_config_t *c)
 
 const char *wifi_manager_current_ssid(void) { return "Home-WiFi"; }
 esp_err_t wifi_manager_forget_credentials(void) { return ESP_OK; }
+esp_err_t factory_reset_erase(void) { return ESP_OK; }
+void factory_reset_perform(void) { for (;;) {} }
 void waste_api_merribek_calendar_url(char *buf, size_t buf_size)
 {
     snprintf(buf, buf_size, "https://www.merri-bek.vic.gov.au/living-in-merri-bek/"
@@ -43,6 +45,7 @@ void waste_api_merribek_calendar_url(char *buf, size_t buf_size)
 }
 
 const char *stub_query_string = NULL;
+const char *stub_post_body = NULL;
 
 static FILE *s_out;
 void stub_capture(const char *buf, int len) { fwrite(buf, 1, (size_t)len, s_out); }
@@ -100,6 +103,7 @@ int main(int argc, char **argv)
         s_sched.light_mode = LIGHT_MODE_SINGLE_COLOUR;
     }
 
+    bool reset_confirm = (argc > 1 && strcmp(argv[1], "--reset-confirm") == 0);
     bool setup_page = (argc > 1 && strcmp(argv[1], "--setup") == 0);
     if (argc > 1 && strcmp(argv[1], "--merribek") == 0) {
         setup_page = true;
@@ -110,7 +114,10 @@ int main(int argc, char **argv)
     httpd_req_t req = {0};
     // No query string is stubbed, so /api-setup renders its first step - the
     // state + council pickers, which is the page worth eyeballing.
-    if (setup_page) {
+    if (reset_confirm) {
+        req.content_len = 0;         // first POST: no confirm field
+        factory_reset_post_handler(&req);
+    } else if (setup_page) {
         api_setup_get_handler(&req);
     } else {
         root_get_handler(&req);

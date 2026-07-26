@@ -12,6 +12,7 @@
 #include "esp_system.h"
 
 #include "councils.h"
+#include "factory_reset.h"
 #include "schedule.h"
 #include "settings.h"
 #include "waste_api.h"
@@ -23,19 +24,22 @@ static const char *TAG = "web_server";
 // compiling root_get_handler() on the host against stubs and dumping the
 // bytes it emits:
 //
-//   factory-fresh, nothing configured   7555
-//   realistic setup (3 event types)     9084
+//   factory-fresh, nothing configured   7810
+//   realistic setup (3 event types)      9339
 //   worst case (8 event types, i.e.
 //     WASTE_API_MAX_TYPE_RULES, with
-//     long type names and address)     11269
+//     long type names and address)      11524
 //
-// 12288 leaves ~1KB over the worst case. Note the fresh-device page alone is
-// 7555 bytes: the original 7200 would have truncated on any real
-// configuration. Each handler also logs an error if it ever hits the ceiling,
+// 14336 leaves ~2.8KB over the worst case - raised from 12288 when the
+// Wi-Fi and factory-reset sections pushed the margin under 1KB. Note the
+// fresh-device page alone is 7810 bytes: the original 7200 would have
+// truncated on any real configuration. `./test/host/run.sh render` reprints
+// these figures, so re-check them after touching this page. Each handler
+// also logs an error if it ever hits the ceiling,
 // because safe_append() truncates *silently* and a truncated page drops form
 // fields - which then read back as "absent"/unchecked on the next save,
 // quietly destroying config.
-#define HTML_BUF_SIZE   12288
+#define HTML_BUF_SIZE   14336
 #define SAVE_BODY_MAX   1024
 #define FIELD_BUF_SIZE  16
 #define API_TEST_LOOKAHEAD_DAYS 28
@@ -584,18 +588,28 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<p style='margin-top:1em'><button type='submit'>Save</button></p>"
         "</form>");
 
-    // Outside the /save form (it posts elsewhere), last on the page because
-    // it's the one destructive action here.
+    // Outside the /save form (these post elsewhere), last on the page because
+    // they're the destructive actions. The two are deliberately separate and
+    // described by what they *keep*: the difference between them is the whole
+    // reason to have both.
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<div class='sect'><h2>Wi-Fi</h2>"
         "<p>Connected to <b>%s</b>.</p>"
         "<form method='POST' action='/wifi-forget'>"
         "<button type='submit'>Forget this network and restart setup</button></form>"
-        "<p class='note'>Use this to move the light to a different Wi-Fi network. It "
-        "restarts, both LEDs breathe white, and a network named binlight-XXXX appears "
-        "for you to join. Your schedule and council settings are kept.</p>"
+        "<p class='note'>Moves the light to a different Wi-Fi network. It restarts into "
+        "setup mode. <b>Everything else is kept</b> &mdash; schedule, council and colours.</p>"
         "</div>",
         wifi_manager_current_ssid());
+
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<div class='sect'><h2>Factory reset</h2>"
+        "<form method='POST' action='/factory-reset'>"
+        "<button type='submit'>Factory reset&hellip;</button></form>"
+        "<p class='note'>Erases <b>everything</b>, including the Wi-Fi network, and "
+        "returns the light to how it left the workbench. You'll be asked to confirm "
+        "first.</p>"
+        "</div>");
 
     off = safe_append(html, HTML_BUF_SIZE, off, "</body></html>");
 
@@ -770,6 +784,109 @@ static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
     vTaskDelay(pdMS_TO_TICKS(1500));
     esp_restart();
     return ESP_OK; // not reached
+}
+
+// Factory reset (SPEC.md 3.12), in two steps through one handler: the first
+// POST renders an "are you sure?" page spelling out exactly what is lost, and
+// only a second POST carrying confirm=yes actually wipes. Deliberately not a
+// GET at any stage - nothing destructive should be reachable by following a
+// link or replaying a URL from history.
+static esp_err_t factory_reset_post_handler(httpd_req_t *req)
+{
+    char body[64] = "";
+    bool confirmed = false;
+    if (req->content_len > 0 && req->content_len < (int)sizeof(body)) {
+        int received = 0;
+        while (received < req->content_len) {
+            int ret = httpd_req_recv(req, body + received, req->content_len - received);
+            if (ret <= 0) {
+                if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                    continue;
+                }
+                return ESP_FAIL;
+            }
+            received += ret;
+        }
+        body[received] = '\0';
+        char value[8];
+        confirmed = httpd_query_key_value(body, "confirm", value, sizeof(value)) == ESP_OK &&
+                    strcmp(value, "yes") == 0;
+    }
+
+    static const char HEAD[] =
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<title>Factory Reset</title>"
+        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
+        ".warn{border:2px solid #a00;padding:.8em 1em;border-radius:4px;}"
+        ".note{color:#888;}</style></head><body>";
+
+    if (!confirmed) {
+        static const char CONFIRM_PAGE[] =
+            "<h1>Factory reset</h1>"
+            "<div class='warn'>"
+            "<p><b>Are you sure you want to reset this bin light?</b></p>"
+            "<p>All configuration will be lost, including:</p>"
+            "<ul>"
+            "<li>the Wi-Fi network and password</li>"
+            "<li>the council and address setup, and the bin colour mapping</li>"
+            "<li>the manual / fallback schedule and its colour rules</li>"
+            "<li>brightness, on-time, light mode and timezone</li>"
+            "</ul>"
+            "<p>The light will restart into setup mode with both LEDs breathing white, "
+            "and will need to be set up again from scratch &mdash; starting with joining "
+            "it to your Wi-Fi.</p>"
+            "<p><b>This cannot be undone.</b></p>"
+            "</div>"
+            "<form method='POST' action='/factory-reset' style='margin-top:1em'>"
+            "<input type='hidden' name='confirm' value='yes'>"
+            "<button type='submit'>Yes, erase everything and restart</button></form>"
+            "<p style='margin-top:1em'><a href='/'>&larr; No, take me back</a></p>"
+            "</body></html>";
+
+        char *page = malloc(sizeof(HEAD) + sizeof(CONFIRM_PAGE));
+        if (page == NULL) {
+            return ESP_ERR_NO_MEM;
+        }
+        int off = 0;
+        memcpy(page, HEAD, sizeof(HEAD) - 1);
+        off += sizeof(HEAD) - 1;
+        memcpy(page + off, CONFIRM_PAGE, sizeof(CONFIRM_PAGE) - 1);
+        off += sizeof(CONFIRM_PAGE) - 1;
+
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_send(req, page, off);
+        free(page);
+        return ESP_OK;
+    }
+
+    static const char DONE_PAGE[] =
+        "<h1>Reset</h1>"
+        "<p>Everything has been erased and the light is restarting.</p>"
+        "<p>In a few seconds both LEDs will start breathing white and a Wi-Fi network "
+        "named <b>binlight-XXXX</b> will appear. Join it, and a setup page will open at "
+        "<b>http://192.168.4.1/</b>.</p>"
+        "</body></html>";
+
+    char *page = malloc(sizeof(HEAD) + sizeof(DONE_PAGE));
+    if (page == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+    int off = 0;
+    memcpy(page, HEAD, sizeof(HEAD) - 1);
+    off += sizeof(HEAD) - 1;
+    memcpy(page + off, DONE_PAGE, sizeof(DONE_PAGE) - 1);
+    off += sizeof(DONE_PAGE) - 1;
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, page, off);
+    free(page);
+
+    // Send first, wipe second: the browser must have the page before the
+    // device disappears off the network.
+    vTaskDelay(pdMS_TO_TICKS(1500));
+    factory_reset_perform(); // does not return
 }
 
 // Previews whatever the light would show at its next scheduled occurrence
@@ -1428,7 +1545,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 9; // 8 in use, small headroom for future additions
+    config.max_uri_handlers = 10; // 9 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -1481,6 +1598,11 @@ esp_err_t web_server_start(void)
         .method = HTTP_POST,
         .handler = wifi_forget_post_handler,
     };
+    static const httpd_uri_t factory_reset_uri = {
+        .uri = "/factory-reset",
+        .method = HTTP_POST,
+        .handler = factory_reset_post_handler,
+    };
 
     httpd_register_uri_handler(server, &root_uri);
     httpd_register_uri_handler(server, &save_uri);
@@ -1490,6 +1612,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &test_uri);
     httpd_register_uri_handler(server, &wifi_forget_uri);
+    httpd_register_uri_handler(server, &factory_reset_uri);
 
     ESP_LOGI(TAG, "HTTP server started");
     return ESP_OK;

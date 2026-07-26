@@ -56,17 +56,17 @@ priority for implementation, and the acceptance criteria for the API feature:
 
 | # | Council | Backend | Status | Detail |
 |---|---|---|---|---|
-| 1 | **Maribyrnong** (home) | Impact Apps | ✅ implemented, verified on hardware | §3.3 |
-| 2 | **Merri-bek** | bespoke (ArcGIS + council API) | ✅ **implemented** — parser verified against live payload | §3.13.3 |
-| 3 | **Knox** | bespoke (2 JSON calls) | ✅ **implemented** — parser verified against live payload | §3.13.4 |
-| 4 | **Whitehorse** | bespoke (Weave GIS) | ✅ **implemented** — parser verified against live payload | §3.13.4 |
-| 5 | **Monash** | OpenCities / MyArea | ✅ **implemented** — parser verified against live payload | §3.13.4 |
+| 1 | **Maribyrnong** (home) | Impact Apps | ✅ **done** — verified on hardware | §3.3 |
+| 2 | **Merri-bek** | bespoke (ArcGIS + council API) | ✅ **done** — verified on hardware | §3.13.3 |
+| 3 | **Knox** | bespoke (2 JSON calls) | ✅ **done** — verified on hardware | §3.13.4 |
+| 4 | **Whitehorse** | bespoke (Weave GIS) | ✅ **done** — verified on hardware | §3.13.4 |
+| 5 | **Monash** | OpenCities / MyArea | ✅ **done** — verified on hardware | §3.13.4 |
 
-All five backends are written and their parsers pass against real captured
-payloads (test/host/fixtures/, fetched live 2026-07-25 from the owner's
-machine — see `test_backends.c`). What remains for the working group is
-**on-device verification**: each council set up through the real `/api-setup`
-flow on real hardware. See "backend abstraction — as built" in §3.13.5.
+**✅ This section's acceptance criterion is met (2026-07-26).** All five
+councils were set up through the real `/api-setup` flow on real hardware and
+work end to end. Parsers are additionally pinned by host tests against live
+captured payloads (test/host/fixtures/, `test_backends.c`), so a future
+refactor has a regression net that doesn't need five households to run.
 
 **Re-verification note (2026-07-25)**: before implementing the backends, all
 four bespoke endpoints were re-probed. Knox and Whitehorse returned exactly the
@@ -1115,7 +1115,46 @@ catches buffer truncation before the device does.
   rework): the button is renamed to **"Display Next Collection (30 seconds)"**
   and `TEST_PREVIEW_DURATION_MS` dropped from 2 minutes to 30 seconds.
 
-### 3.12 Physical buttons (planned, not yet implemented)
+### 3.12 Physical buttons (planned; the factory-reset action is built and exposed in the UI)
+
+**Factory reset — implemented as a shared function + web UI action
+(2026-07-26).** [factory_reset.h](main/factory_reset.h)/[factory_reset.c](main/factory_reset.c)
+holds the single implementation both entry points use; the physical button
+will call `factory_reset_perform()` rather than reimplementing anything. As
+built:
+
+- **`factory_reset_erase()`** wipes every persisted setting: the schedule and
+  colour rules, the council/API config and its next-collection cache, the
+  timezone, and the Wi-Fi credentials. The device then comes up in AutoAP
+  setup mode (§3.4).
+- **It erases two NVS namespaces, not one.** State is split across
+  `binlight` (schedule, waste API, cache, Wi-Fi credentials) and
+  `binlight_cfg` (timezone only — a split dating from `settings.c` being
+  written separately). Erasing only the obvious one would leave a
+  "factory-fresh" device still holding its old timezone. Worth stating
+  because nothing in the code makes that split visible at the call site.
+- **It also calls `esp_wifi_restore()`**, since the Wi-Fi driver keeps its
+  own copy of the last SSID/password in its own namespace. Our boot path
+  wouldn't use it, but "all configuration will be lost" should be true rather
+  than merely effective.
+- **It erases named namespaces rather than the whole NVS partition.** A
+  factory reset should be a *settings* reset; `nvs_flash_erase()` (what the
+  earlier sketch below proposed) would also take out anything the system
+  stores for itself. Every step is attempted even if an earlier one fails —
+  a half-reset device is worse than either outcome.
+- **Web UI: a two-step confirmation through one `POST /factory-reset`
+  handler.** The first POST renders an "Are you sure?" page listing exactly
+  what is lost (Wi-Fi, council/address/colours, manual schedule, preferences)
+  and stating plainly that it cannot be undone; only a second POST carrying
+  `confirm=yes` wipes. **Deliberately POST at both stages** — nothing
+  destructive should be reachable by following a link or replaying a URL from
+  history. The confirmation gate is asserted in `test/host/run.sh`.
+- **Kept distinct from §3.4's "Forget this network"**, which resets *only*
+  Wi-Fi and keeps everything else. The home page describes each by what it
+  **keeps**, since that difference is the whole reason both exist.
+
+The button-specific parts below (GPIO choice, long-press debouncing, the
+action button) remain unimplemented.
 
 **Requirement**: three physical button actions, without needing the web UI:
 1. **Factory reset.**
@@ -1140,9 +1179,13 @@ off, pressing it displays the next scheduled collection for 30 seconds.*
   this is a destructive, hard-to-undo action (wipes NVS config back to
   defaults) sitting behind a bare GPIO with no confirmation dialog the way
   the web UI could offer one; a long-press guards against an accidental knock
-  or a hand brushing past it. Implementation: `nvs_flash_erase()` (the same
+  or a hand brushing past it. ~~Implementation: `nvs_flash_erase()` (the same
   call already used defensively in `nvs_init_with_erase_retry()`) followed by
-  a reboot (`esp_restart()`).
+  a reboot (`esp_restart()`).~~ **Superseded**: call
+  `factory_reset_perform()` (above), which erases the app's own namespaces
+  rather than the whole partition and handles the driver's Wi-Fi copy too.
+  The long-press requirement stands and belongs to the button handler — the
+  shared function assumes the decision has already been made.
 - **Action button, short press, state-dependent**:
   - **Light currently on** → turn it off immediately (`led_state_off()`) and
     **suppress relighting until the next scheduled occurrence** — not just a
@@ -1853,16 +1896,17 @@ three different things that are easy to conflate.
 | §3.8 "Display Next Collection" button | ✅ | ✅ | ✅ **works** — confirmed on hardware |
 | §3.11 brightness default fix (§6 bug 16) | ✅ | ✅ | ✅ **works** — see below |
 | Warmer yellow `(255,150,0)` (§2) | ✅ | ✅ | ⚠️ red/green/purple good; yellow deferred (§5) |
-| §3.11 Preferences UI reorganisation | ✅ | ❌ **not yet flashed** | ❌ |
-| §3.8 button rename + 30s duration | ✅ | ❌ **not yet flashed** | ❌ |
-| §3.3 next-collection rework (sticky cache, unified resolver) | ✅ | ❌ **not yet flashed** | ⚠️ 28 host tests pass; no device time |
-| §3.13.5 council dropdown (39 Impact Apps LGAs) | ✅ | ❌ **not yet flashed** | ⚠️ table tests pass; 39/39 probed live |
-| §3.13.3/3.13.4 all four bespoke backends (Knox, Whitehorse, Merri-bek, Monash) | ✅ | ❌ **not yet flashed** | ⚠️ parsers pass against real captured payloads; nothing on-device yet |
-| waste_api config v2→v3 migration | ✅ | ❌ **not yet flashed** | ⚠️ host-tested; watch the first boot's log |
-| Merri-bek cpage self-discovery + year-derived URLs | ✅ | ❌ **not yet flashed** | ⚠️ host-tested end to end against real page bytes |
-| DST day-count fix (§6 bug 17) | ✅ | ❌ **not yet flashed** | ⚠️ host tests only (next real chance: Oct 2026) |
-| §3.12 physical buttons | ❌ not written | — | — |
-| §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ❌ **not yet flashed** | ❌ needs a device |
+| §3.11 Preferences UI reorganisation | ✅ | ✅ | ✅ verified |
+| §3.8 button rename + 30s duration | ✅ | ✅ | ✅ verified |
+| §3.3 next-collection rework (sticky cache, unified resolver) | ✅ | ✅ | ✅ verified |
+| §3.13.5 council dropdown (39 Impact Apps LGAs) | ✅ | ✅ | ✅ verified |
+| §3.13.3/3.13.4 all four bespoke backends (Knox, Whitehorse, Merri-bek, Monash) | ✅ | ✅ | ✅ verified on-device — **§1.2 working group complete** |
+| waste_api config v2→v3 migration | ✅ | ✅ | ✅ verified (existing setup survived) |
+| Merri-bek cpage self-discovery + year-derived URLs | ✅ | ✅ | ⚠️ normal path verified; the *rediscovery* branch only fires on failure, so still host-tested only |
+| DST day-count fix (§6 bug 17) | ✅ | ✅ | ⚠️ host tests only — not observable until Oct 2026 |
+| §3.12 factory reset (shared function + UI, two-step confirm) | ✅ | ❌ **not yet flashed** | ❌ |
+| §3.12 physical buttons (GPIO wiring, long-press, action button) | ❌ not written | — | — |
+| §3.4 AutoAP provisioning + Wi-Fi forget | ✅ | ✅ | ❌ **the one untested item** — needs a deliberate setup, see below |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
 | §3.5 OTA | ❌ not written (needs a partition-table rework) | — | — |
 
@@ -1979,86 +2023,41 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: flash, then verify the working group on-device
+### ▶ Agreed next step: exercise AutoAP, then the physical buttons
 
-**Everything §1.2 requires is now written**: all five councils' backends, the
-council dropdown that selects them, the sticky-cache resolver they feed, and
-the setup flows for both backend families. The owner's directive stands:
-*the five working-group councils are the definition of done; everything else
-is nice-to-have.* What remains is on-device verification, which no host test
-can substitute for:
+**§1.2 is met.** All five working-group councils were verified on real
+hardware on 2026-07-26 — the flash carried the §3.11 UI, the §3.3 resolver
+rework, the four bespoke backends, the council dropdown and the v2→v3 config
+migration, and all of it checked out. That was the acceptance criterion for
+the API feature.
 
-0. **Note the Wi-Fi change first (§3.4).** Credentials now come from NVS, with
-   the compiled-in Kconfig pair only as a fallback. Your bench device has its
-   network in `sdkconfig`, so it will keep connecting exactly as before — but
-   that also means AutoAP won't be exercised until you either blank the
-   Kconfig SSID or press "Forget this network and restart setup" on the home
-   page. Worth doing once deliberately, since it's the flow every handed-out
-   device will start in.
-1. **Flash** (this also carries the still-unflashed §3.11 UI and §3.3 work
-   below). Watch the first boot for `migrated waste API config v2 -> v3` —
-   the existing Maribyrnong setup must survive, not reset.
-2. **Maribyrnong** keeps working (regression check: the poll logs
-   `next=known`).
-3. **Each of the other four councils**, one at a time, via
-   `/api-setup` → VIC dropdown → address search → save. For each: the
-   auto-built colour mapping looks right, `/api-test` shows the real upcoming
-   dates, and "Display Next Collection" lights the right colours. The four
-   test addresses used to verify the parsers are in
-   [test/host/test_backends.c](test/host/test_backends.c); real deployments
-   will use the real households' addresses.
-4. **Watch Monash specifically** — its 403 behaviour is UA-fingerprint
-   consistency (see §3.13.4); `esp_http_client`'s honest UA is expected to
-   pass, but this is the one backend whose device-side network behaviour
-   differs most from curl's.
-5. Then return devices to the family deployments at leisure. Merri-bek's
-   `cpage` (§3.13.3) is the known annual-maintenance item.
+**One thing from that build remains untested: AutoAP (§3.4).** It won't
+exercise itself, because a device with Wi-Fi in `sdkconfig` keeps using the
+Kconfig fallback. To try it, either blank `CONFIG_BINLIGHT_WIFI_SSID` and
+reflash, or press **Forget this network** (or **Factory reset**) on the home
+page. Then check:
+- Both LEDs breathe white, and a `binlight-XXXX` network appears.
+- Joining it and browsing to `http://192.168.4.1/` lists nearby networks.
+- A wrong password reports failure *on the page* and does not get stored.
+- A correct one shows "Connected", the AP disappears, and `binlight.local`
+  works again.
+- Nothing else was lost (Forget) or everything was (Factory reset).
 
-The older per-step verification list from the previous next-step note follows,
-still applicable to the same flash:
+Also unflashed: the **factory reset** work itself (§3.12) — the shared
+`factory_reset_perform()` and its two-step confirmation page.
 
-#### (carried forward) flash-and-verify details for §3.11 + §3.3
-
-**Two substantial changes are written and unflashed**, so the device is well
-behind the tree:
-
-1. **§3.11 UI** — Preferences section, "Manual / Fallback Schedule" rename,
-   CSS-only collapsible sections, plus §3.8's rename and 30-second duration.
-2. **§3.3 next-collection rework** — sticky NVS-persisted cache, staleness by
-   date rather than by timer, and one unified `schedule_get_next_collection()`
-   resolver shared by the live evaluator and the Display button. Three
-   off-by-ones and a DST day-counting bug were fixed along the way; 28 host
-   tests pass (`./test/host/run.sh`) but none of it has run on hardware.
-
-**Next action is a flash and a verification pass**, which also settles the two
-long-standing unverified items above (LED2 independently, and the boot
-self-test) in the same boot.
-
-Worth a specific eye on, since none of it has run on the device:
-- The two UI sections expand/collapse from their own checkbox only.
-- Saving with a section **collapsed** does not wipe that section's stored
-  values (it shouldn't — hidden fields still submit — but this is the one
-  failure mode that would silently destroy config).
-- "Save mapping" still posts to `/api-test` and returns to `/`, now that its
-  controls sit inside the `/save` form's DOM via `form='mapform'`.
-- No `web_server: home page truncated` error in the serial log.
-- **The first poll after flashing**: expect a `waste_api: poll complete: N
-  event(s) in window, next=known` line, then a `restored next-collection
-  cache` line on the *following* boot — that pair is the whole point of the
-  sticky-cache change and is the one thing host tests can't prove.
-- **"Display Next Collection" should now always do something** once anything
-  is configured. If it no-ops, the log says why
-  (`display-next requested but the next collection is unknown`).
-- Note the manual schedule's "First collection" dates now behave as labelled
-  (see §3.3 "off-by-one #2") — any existing manual rule will fire one cycle
-  earlier than it used to. Worth re-checking those dates if the manual
-  fallback is in use.
-
-After the working group is verified on-device, what's left is (in the owner's
-priority order, all nice-to-have): §3.12 physical buttons, §3.4 AutoAP (the
-distribution blocker for handing devices out), §3.5 OTA, and the two shared
-platforms already researched in §3.13 (Impact Apps list is done; SA remains,
-gated on its lat/lon UX question).
+After that, in priority order:
+1. **§3.12 physical buttons** — the reset action already exists as a shared
+   function, so what's left is the GPIO work: pin choice on the XIAO
+   ESP32-C6 (strapping pins not yet checked — an open question below),
+   debouncing, the 5-second long-press guard, and the state-dependent action
+   button (display-next / cancel-tonight) with `schedule_suppress_current()`.
+2. **§3.5 OTA** — needs a partition-table rework (one 3MB `factory` slot →
+   two OTA slots + `otadata`), so it means an `erase-flash`. **Best done
+   before devices are handed out**, since after that a firmware fix means
+   physically collecting them.
+3. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated
+   on its lat/lon UX question. Zero value to the working group.
 
 ### Open questions not yet resolved
 
