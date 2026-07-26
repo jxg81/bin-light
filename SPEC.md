@@ -103,9 +103,16 @@ JSON, and no colour data at all.
   a logic-level converter (3.3V → 5V) with a series resistor on the data line and a
   100nF cap across the LEDs' power pins. Physically wired; firmware still only
   drives pixel 0 — see §3.7 for the pending second-LED support work.
+  - The converter is only needed because *these* LEDs want 3.5 V logic. §5
+    records a WS2812B-V5 candidate that accepts 2.7 V and would delete it.
 - Confirmed empirically: this specific LED batch expects **RGB** byte order on the
   wire, not the WS2812 datasheet-standard GRB — `LED_STRIP_COLOR_COMPONENT_FMT_RGB`
   in [led_state.c](main/led_state.c). Do not "correct" this back to GRB.
+  - ⚠️ **This is a property of the current batch, not of the project.** If the
+    LEDs are ever replaced, re-derive it rather than preserving it — the
+    WS2812B-V5 candidate in §5 is standard GRB, and blindly obeying the line
+    above would ship red and green swapped. The instruction is "match the
+    hardware you have", not "always use RGB".
 - **Enclosure**: transparent/natural PLA, printed. The LEDs are viewed through
   it, so colours are judged **diffused, not bare** — the palette is tuned
   against the real enclosure, and any future colour work should be evaluated
@@ -2380,6 +2387,76 @@ After that, in priority order:
 - **Matter over Wi-Fi commissioning** — its own phase, per the "core first, Matter
   last" decision. Nothing in 3.2–3.4 blocks it; the single `led_state_set()` seam
   still applies.
+
+- **Candidate LED change for the production build: WS2812B-V5, to delete the
+  logic-level converter.** Not decided, not bought, no code changed. Recorded
+  because the analysis is done and because it interacts with a §2 note that
+  would otherwise mislead.
+
+  Part considered:
+  [GlowBit LED 20 Pack — White (WS2812B v5)](https://core-electronics.com.au/glowbit-led-20-pack-white-ws2812b-v5-neopixel-compatible.html)
+
+  **The change is real, and this is the number that makes it work:**
+
+  | | Original WS2812B | WS2812B-V5 |
+  |---|---|---|
+  | VIH min | 0.7 × VDD = **3.5 V** @ 5 V | **2.7 V**, fixed |
+
+  3.3 V clears 2.7 V, so the C6 drives DIN directly and the level shifter goes.
+  Only the *first* LED is at risk anyway — LED1's DOUT reshapes to full 5 V
+  levels for LED2.
+
+  **The one figure that looks alarming and isn't**: the C6 datasheet specs VOH
+  at `0.8 × VDD` = **2.64 V**, i.e. 60 mV *below* the V5's 2.7 V VIH. That
+  figure is specified **at 40 mA of source current**. A V5 DIN draws ±1 µA into
+  15 pF, so real VOH ≈ VDD ≈ 3.3 V and actual margin is ~600 mV. Do not
+  re-derive this and panic; it was checked against both datasheets.
+
+  **Still power them from 5 V.** "3.3 V logic compatible" is not "3.3 V
+  supply" — the V5 supply range is 3.7–5.3 V, so a 3.3 V rail is out of spec.
+  Keep the data-line series resistor and the 100 nF cap; they cost nothing.
+
+  **What would have to change in software:**
+  1. **Byte order → GRB.** The V5 datasheet is explicit: *"Data transmit in
+     order of GRB, high bit data at first."* One enum in
+     [led_state.c](main/led_state.c), **plus** the §2 note that currently says
+     not to do exactly that. Symptom if missed: red and green swap, purple
+     `(128,0,128)` renders teal — obvious on the §3.10 self-test or `/test`.
+  2. **Re-run the colour calibration.** The `(255,150,0)` yellow and the
+     "green far outshines red" finding are per-batch. V5 typical output is
+     green 780 mcd vs red 310 mcd — same direction, ~2.5×, so the tuning won't
+     invert, but the ratio will differ. Red/green/purple lose their
+     "confirmed good" status and get re-checked. Cheap, because it folds into
+     the final-enclosure yellow calibration already deferred above.
+
+  **Two things that need no work at all** (checked, so they aren't
+  re-investigated):
+  - **Reset timing.** V5 needs RES > 280 µs vs the old 50 µs, but Espressif's
+    driver already defaults to it —
+    [led_strip_rmt_encoder.c:99](managed_components/espressif__led_strip/src/led_strip_rmt_encoder.c:99),
+    comment reads *"defaults to 280us to accommodate WS2812B-V5"*. `LED_MODEL_WS2812`
+    bit timings (T0H 0.3 µs, T1H 0.9 µs) sit inside the V5 windows.
+  - **§3.14 battery conclusions.** V5 quiescent is 0.6 mA/LED vs the ~1 mA/LED
+    assumed in §3.14.1 → the pair drops 48 → ~29 mAh/day. Real, but still a
+    distant third behind the radio (600) and the light being on (600).
+    Nothing in §3.14 changes, **including** that killing idle draw needs a
+    switch in the LED power rail.
+
+  **The actual cost, and the reason this isn't a free win**: these ship as
+  *"packaged in cut-tape"* — twenty bare 5.0 × 5.4 mm 5050 components, no PCB,
+  no pads, no breakout. Hand-soldering leads to a bare 5050 is fiddly, and
+  they're MSL 5a (dry-bake before reflow; hand-soldering is more forgiving).
+  Against the current breadboard build this is a step backwards in assembly
+  convenience unless a small PCB or protoboard is on the cards anyway. That
+  tradeoff — fewer components and one less failure point, versus harder
+  assembly — is the decision, not the electrical question.
+
+  Also: "White" is the LED's **front face** colour. Not the LED colour, not a
+  PCB. Since §2 judges colour *diffused through the PLA cover*, it may shift
+  diffusion slightly — folds into the recalibration above.
+
+  Sources: [WS2812B-V5 datasheet](http://www.peace-corp.co.jp/data/WS2812B-V5_V1.0_EN.pdf),
+  [ESP32-C6 datasheet §5.4](https://www.espressif.com/sites/default/files/documentation/esp32-c6_datasheet_en.pdf).
 
 - **Final yellow calibration — do this during final integration testing, in the
   real printed enclosure.** Red, green and purple are confirmed good and need
