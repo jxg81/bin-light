@@ -1,5 +1,5 @@
 {
-  "version": "1.0.2",
-  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.2/bin-light.bin",
-  "notes": "Fixes OTA downloads failing at GitHub's signed redirect."
+  "version": "1.0.3",
+  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.3/bin-light.bin",
+  "notes": "Exercises the OTA download path fixed in 1.0.2."
 }
