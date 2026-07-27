@@ -56,6 +56,13 @@ void app_main(void)
 
     ESP_ERROR_CHECK(settings_init());
 
+    // Before wifi_manager_start(), which blocks indefinitely in AutoAP mode.
+    // A freshly-OTA'd image that can no longer reach the network would stop
+    // right there, never reach ota_mark_valid() below, and never reboot - so
+    // the bootloader would never get the reset it needs to roll back. Armed
+    // here, the watchdog supplies that reset. No-op on an ordinary boot.
+    ota_rollback_watchdog_start();
+
     // Before wifi, not after. wifi_manager_start() blocks for the whole AutoAP
     // session (SPEC.md 3.4), so starting mDNS afterwards left the responder
     // dead during setup - exactly when a memorable name is most useful, since

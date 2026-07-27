@@ -71,12 +71,14 @@ valid only once it has booted, joined Wi-Fi and started serving. An update
 that **crashes** therefore reboots, and the bootloader reverts it with nobody
 touching the device. Verified on hardware — see SPEC.md §3.5.1.
 
-> **⚠️ It does not cover an image that hangs.** Rollback is decided at boot, so
-> it needs a reset to happen. A release that boots but never reaches
-> `ota_mark_valid()` — say it can't rejoin Wi-Fi, so it waits in AutoAP — never
-> reboots, so nothing ever triggers the revert. It will sit there until someone
-> power-cycles it. SPEC.md §3.5.1 proposes a watchdog to close this; until that
-> exists, **a release that breaks the network path is still a house call.**
+An image that **hangs** rather than crashing is covered separately, because
+rollback is decided at boot and a hang never produces the necessary reset. From
+1.0.4 a watchdog handles it: an image still unverified ten minutes after boot
+rolls itself back. So a release that breaks the network path recovers on its
+own too — it just takes ten minutes rather than seconds.
+
+> Verified for crashes on hardware. **The hang path is not yet verified** —
+> see SPEC.md §3.5.1.
 
 ## Security note
 

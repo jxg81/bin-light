@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/timers.h"
 #include "esp_app_desc.h"
 #include "esp_crt_bundle.h"
 #include "esp_http_client.h"
@@ -403,6 +404,56 @@ esp_err_t ota_auto_task_start(void)
     return (ok == pdPASS) ? ESP_OK : ESP_ERR_NO_MEM;
 }
 
+// How long a new image gets to finish starting up before it is presumed dead.
+//
+// Ten minutes is chosen against the *false positive*, not the true one. A
+// healthy boot reaches ota_mark_valid() in seconds, so any value above about a
+// minute catches a genuine hang. The risk being sized for is the opposite one:
+// a good update landing while the router happens to be rebooting, where the
+// device correctly waits in AutoAP and would be rolled back for it. Household
+// outages are minutes, not tens of minutes.
+#define ROLLBACK_WATCHDOG_MS (10 * 60 * 1000)
+
+static TimerHandle_t s_rollback_timer;
+
+static void rollback_watchdog_fire(TimerHandle_t timer)
+{
+    (void)timer;
+    ESP_LOGE(TAG, "this image never finished starting up after %d minutes - rolling back",
+             ROLLBACK_WATCHDOG_MS / 60000);
+
+    // Marks the running image invalid and reboots, so the bootloader takes the
+    // previous slot. Only returns if it *couldn't* - e.g. there is no earlier
+    // image to fall back to. Carry on rather than restarting blindly in that
+    // case: a reboot that changes nothing would just loop.
+    esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
+    ESP_LOGE(TAG, "rollback refused (%s) - staying on this image", esp_err_to_name(err));
+}
+
+void ota_rollback_watchdog_start(void)
+{
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (running == NULL || esp_ota_get_state_partition(running, &state) != ESP_OK) {
+        return;
+    }
+    if (state != ESP_OTA_IMG_PENDING_VERIFY) {
+        return; // ordinary boot of a confirmed image - nothing to guard
+    }
+
+    s_rollback_timer = xTimerCreate("ota_rollback", pdMS_TO_TICKS(ROLLBACK_WATCHDOG_MS),
+                                    pdFALSE, NULL, rollback_watchdog_fire);
+    if (s_rollback_timer == NULL || xTimerStart(s_rollback_timer, 0) != pdPASS) {
+        // Not fatal, but say so plainly: without this the only protection left
+        // is the image crashing on its own.
+        ESP_LOGE(TAG, "could not arm the rollback watchdog - a hang would not be recovered");
+        s_rollback_timer = NULL;
+        return;
+    }
+    ESP_LOGW(TAG, "unverified image: rolling back unless startup completes within %d minutes",
+             ROLLBACK_WATCHDOG_MS / 60000);
+}
+
 void ota_mark_valid(void)
 {
     const esp_partition_t *running = esp_ota_get_running_partition();
@@ -413,6 +464,15 @@ void ota_mark_valid(void)
     if (state != ESP_OTA_IMG_PENDING_VERIFY) {
         return; // an ordinary boot of an already-confirmed image
     }
+
+    // Disarm first. Confirming the image and then leaving a timer running that
+    // would roll it back anyway is the one ordering that must not happen.
+    if (s_rollback_timer != NULL) {
+        xTimerStop(s_rollback_timer, portMAX_DELAY);
+        xTimerDelete(s_rollback_timer, portMAX_DELAY);
+        s_rollback_timer = NULL;
+    }
+
     if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
         ESP_LOGW(TAG, "new firmware confirmed healthy - rollback cancelled");
     } else {

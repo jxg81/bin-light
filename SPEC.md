@@ -760,13 +760,37 @@ house call. [firmware/README.md](firmware/README.md) previously claimed such an
 update "gets rolled back by the bootloader on the next restart, without anyone
 touching the device"; that is only true if a next restart ever comes.
 
-**Proposed fix, not yet built: a pending-verify watchdog.** At boot, if
-`esp_ota_get_state_partition()` reports `ESP_OTA_IMG_PENDING_VERIFY`, arm a
-one-shot timer (~10 min). If `ota_mark_valid()` hasn't run by the time it
-fires, call `esp_restart()` — which supplies the reset the bootloader needs and
-turns the hang case into the crash case proven above. Small, self-contained,
-and it is the difference between "rollback works if the image crashes" and
-"rollback works".
+**Closed by the pending-verify watchdog** (`ota_rollback_watchdog_start()`,
+[ota.c](main/ota.c) — implemented, in 1.0.4). If the running image is
+`ESP_OTA_IMG_PENDING_VERIFY`, it arms a one-shot 10-minute timer; if
+`ota_mark_valid()` hasn't run by the time it fires, it calls
+`esp_ota_mark_app_invalid_rollback_and_reboot()`. That supplies the reset the
+bootloader needs, turning the hang case into the crash case proven above.
+
+Three things about it that are deliberate:
+
+- **It is armed before `wifi_manager_start()`** ([main.c](main/main.c)), not
+  beside `ota_mark_valid()` at the end. Arming it after the call that blocks
+  would defeat the entire purpose — that block *is* the failure being guarded
+  against. If these ever get reordered, the watchdog silently stops working.
+- **Ten minutes is sized against the false positive, not the true one.** A
+  healthy boot confirms in seconds, so anything over a minute catches a real
+  hang. The risk being sized for is the opposite: a *good* update landing while
+  the router is rebooting, where the device correctly waits in AutoAP and would
+  be rolled back for it. Household outages are minutes, not tens of minutes.
+- **Biased toward firing anyway.** A false positive costs one wasted update
+  cycle and self-corrects — the device simply reinstalls once the network is
+  back. A false negative is a house call. Asymmetric, so it errs loudly.
+
+If there is no earlier image to fall back to, the rollback call returns instead
+of rebooting; that is logged and the device carries on, rather than looping on
+a reboot that would change nothing.
+
+**Not host-tested**, and honestly so: the logic is three ESP-IDF calls and a
+FreeRTOS timer, with no decision worth stubbing out. What would actually be
+worth proving is a *hanging* image being recovered on hardware — the same
+deliberate-bad-build method as the crash test, but with Wi-Fi credentials that
+cannot succeed, and a ten-minute wait.
 
 #### 3.5.2 Manual installs restart themselves (implemented, not yet flashed)
 
@@ -2367,8 +2391,8 @@ three different things that are easy to conflate.
 | §3.5 OTA — automatic update (on by default) | ✅ | ✅ | ✅ **verified 2026-07-27** — the 1.0.3 install was the daily checker, not a button |
 | §3.5 `GET /update` (§6 bug 24) | ✅ | ✅ | ✅ **verified 2026-07-27** — 200, was 405 |
 | §3.5 OTA — rollback safety net (**crashing** image) | ✅ | ✅ | ✅ **verified 2026-07-27** — installed a deliberately-aborting build, device reverted itself to 1.0.3. Evidence below. |
-| §3.5 OTA — rollback safety net (**hanging** image) | ✅ | ✅ | ⚠️ **cannot work as written** — no reset means no rollback. See §3.5.1. |
-| §3.5 manual install restarts itself | ✅ | ❌ **not flashed** | ❌ — behaviour changed after the rollback test |
+| §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog, in 1.0.4 | ❌ **not flashed** | ❌ **not tested** — needs a build that hangs rather than crashes, plus a 10-minute wait. See §3.5.1. |
+| §3.5 manual install restarts itself | ✅ | ❌ **not flashed** | ❌ — in 1.0.4 |
 
 **Everything is written, flashed and — with the exceptions below — verified on
 hardware** (owner's reports, 2026-07-26 and 2026-07-27).

@@ -81,6 +81,29 @@ const char *ota_get_message(void);
 // No-op unless the image is actually pending verification.
 void ota_mark_valid(void);
 
+// Arms the rollback watchdog. **Call early in app_main(), before anything that
+// can block** - `wifi_manager_start()` above all, which waits indefinitely in
+// AutoAP mode. Calling it after that point defeats the entire purpose.
+//
+// Why this exists: bootloader rollback is decided *at boot*, so it needs a
+// reset to happen at all. A new image that **crashes** supplies one and is
+// reverted automatically (verified on hardware, SPEC.md 3.5.1). A new image
+// that **boots but hangs** - most plausibly one that can no longer reach
+// Wi-Fi, so it sits in AutoAP waiting for a human - never reboots, so nothing
+// ever triggers the revert. It would wait forever, and that is the failure
+// mode that costs a physical visit.
+//
+// So: if the running image is still PENDING_VERIFY after a generous window,
+// assume startup will never complete and force the rollback. No-op on an
+// ordinary boot of an already-confirmed image. ota_mark_valid() disarms it.
+//
+// **Deliberately biased toward firing.** A false positive - rolling back a
+// good image because the router happened to be down at the wrong moment -
+// costs one wasted update cycle and self-corrects, since the device simply
+// installs it again once the network returns. A false negative is a house
+// call. The window is sized so ordinary transient outages don't trip it.
+void ota_rollback_watchdog_start(void);
+
 // --- automatic updates ---
 //
 // **On by default.** These devices live in other people's houses; the whole
