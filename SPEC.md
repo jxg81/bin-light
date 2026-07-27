@@ -14,6 +14,13 @@ dropped as the build continues. Update this file whenever scope changes.
 > verified against its live endpoint, with real URLs, parameters, response shapes
 > and payload sizes recorded, so no re-research should be needed to implement.
 
+> **UI decisions live in [UI-SPEC.md](UI-SPEC.md)** — information architecture,
+> wording, layout, CSS. **This file remains authoritative for behaviour**:
+> functional decisions, hardware calibration (§2's palette especially),
+> protocol decisions and NVS schemas. Where the two disagree, `SPEC.md` wins.
+> Anything in `UI-SPEC.md` that would change what the device *does* is
+> quarantined in its §9 and needs sign-off before it lands here.
+
 ## 1. What this is
 
 A bin-day reminder light: a WS2812 LED (Seeed XIAO ESP32-C6) that lights up in a
