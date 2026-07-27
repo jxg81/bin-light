@@ -2662,16 +2662,16 @@ three different things that are easy to conflate.
 | §3.5 OTA — rollback watchdog: arm + disarm | ✅ | ✅ | ✅ **verified 2026-07-27** — armed on an unverified boot, cancelled on a healthy one |
 | §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog | ✅ | ✅ **verified 2026-07-27** — a build that hangs in AutoAP rather than crashing was rolled back after 10 min, unattended. See §3.5.1. |
 | §3.5 manual install restarts itself | ✅ | ✅ | ✅ **verified 2026-07-27** — an install performed *from* 1.0.4, per §3.5.0's one-release-late rule (owner report; the captured log covers the watchdog lines) |
-| §3.5.3 OTA URL prefix allowlist | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only** — refusal path covered by 23 assertions against the real `ota.c`; never run on a device |
-| §3.5.3 OTA version floor (pinned 1.0.7) | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only**, and per §3.5.0 the *accept* path cannot be proven by the install that introduces it — needs a USB-flashed bench device plus a further release |
-| §3.15 cross-origin POST rejection | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only** (8 assertions) — not yet exercised in a real browser, by name *and* by IP |
-| §3.15 HTML escaping + `HTML_BUF_SIZE` 16384 | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only** — page sizes asserted against adversarial fixtures; pages not yet eyeballed on a device |
+| §3.5.3 OTA URL prefix allowlist | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet on a device** — refusal path covered by 23 host assertions against the real `ota.c` |
+| §3.5.3 OTA version floor (1.0.6 in this release; 1.0.7 from 1.0.8 on) | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet on a device**, and per §3.5.0 the *accept* path cannot be proven by the install that introduces it — needs a USB-flashed bench device plus a further release |
+| §3.15 cross-origin POST rejection | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet in a real browser** — 8 host assertions pass; still to check by name *and* by IP |
+| §3.15 HTML escaping + `HTML_BUF_SIZE` 16384 | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet on a device** — page sizes asserted against adversarial fixtures; pages not yet eyeballed |
 
 **Everything is written, flashed and — with the exceptions below — verified on
-hardware** (owner's reports, 2026-07-26 and 2026-07-27). The exception to that
-sentence is the 1.0.7 work: §3.5.3 and §3.15 are written and host-tested but
-**have never been built by the ESP-IDF toolchain or run on a device**, so they
-are the only rows in the table with an empty "Flashed" column.
+hardware** (owner's reports, 2026-07-26 and 2026-07-27). The exception is the
+1.0.7 work: §3.5.3 and §3.15 are written, host-tested and **built and published
+as v1.0.7**, but have **not yet run on a device** — they are the only rows in
+the table whose hardware column is still open.
 
 The 2026-07-27 session closed out the two features that had been outstanding
 longest. Factory reset via the web UI erases, restarts cleanly and lands in
@@ -2741,11 +2741,23 @@ guesses from the published pinout.
   stubs, so it catches far more than its size suggests.
 - **`sdkconfig` is gitignored and caches Kconfig values.** A changed Kconfig
   *default* does NOT reach an existing build — the stored value wins. This has
-  now bitten **twice**: the reset-button GPIO stayed at 9 after the default
-  moved to 2, and a stale SSID/password silently defeated factory reset and
-  "forget Wi-Fi" (bug 21). Change both, or `idf.py menuconfig`. **When a
-  symptom contradicts the tracked source, check `sdkconfig` before anything
-  else.**
+  now bitten **three times**: the reset-button GPIO stayed at 9 after the
+  default moved to 2; a stale SSID/password silently defeated factory reset and
+  "forget Wi-Fi" (bug 21); and publishing 1.0.7 the stored
+  `CONFIG_BINLIGHT_OTA_MIN_VERSION` was `"1.0.7"` from an earlier build while
+  the Kconfig default had since moved to `"1.0.6"` — the build said
+  `Using default value from sdkconfig ("1.0.7")` and would have shipped a
+  version floor that forbade the rollback the release was meant to allow, i.e.
+  the exact inverse of the intended setting. Change both, or
+  `idf.py menuconfig`. **When a symptom contradicts the tracked source, check
+  `sdkconfig` before anything else** — and after changing a Kconfig default,
+  read the `info:` lines the build prints and confirm the value in
+  `build/config/sdkconfig.h`, which is what actually reaches the image.
+
+  > Any claim that "`sdkconfig` is gitignored so it regenerates from the
+  > Kconfig defaults" is **false for an existing checkout** and has now caused
+  > a near-miss on a security setting. It is true only for a fresh clone that
+  > has never been built.
 - **Wi-Fi credentials are not compiled in.** `Kconfig.projbuild`'s
   SSID/password default to `""`, and since bug 21 the fallback additionally
   requires `CONFIG_BINLIGHT_WIFI_COMPILED_FALLBACK=y` (default `n`) — setting
@@ -2852,11 +2864,15 @@ Immediate, and the only thing actually blocking normal use:
 2. **Turn auto-update back on** if it is still off from the rollback test.
 3. **Take 1.0.6.** The device may still be on 1.0.4, whose watchdog is the
    timer version. 1.0.6 is what makes the hang case recoverable.
-4. **Build 1.0.7 and flash it over USB.** It is the first release carrying
-   §3.5.3 and §3.15, and none of it has been near a compiler that targets the
-   chip. Flashing it by cable rather than by OTA is also what makes the §3.5.3
-   accept path testable at all — per §3.5.0, installing 1.0.7 *from* 1.0.6
-   exercises none of its checks, because 1.0.6 does the installing.
+4. **Take 1.0.7 and exercise §3.15 in a browser** — save the schedule, run the
+   council wizard, press the update button, reached both as `binlight.local`
+   *and* by LAN IP. Nothing should return 403. That is the whole
+   hardware-verification debt for this release.
+5. **To test §3.5.3's accept path, flash 1.0.7 over USB and publish a further
+   release.** Per §3.5.0, taking 1.0.7 *by OTA* exercises none of its checks —
+   1.0.6 does that install, and it has neither. A `1.0.6 → 1.0.7` success is
+   therefore not evidence about the allowlist, and should not be recorded as
+   such.
 
 Then, in priority order:
 
