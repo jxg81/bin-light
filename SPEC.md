@@ -55,6 +55,15 @@ A third, smaller consequence: the **factory-reset button (§3.12)** and the
 misconfigured device and confirm the hardware works, without a serial console.
 Both are already specified; this is why they earn their place.
 
+**This repository is public, and the security model is documented in it
+openly** (§3.5.3, §3.15). That is a settled decision, not an oversight, and it
+does not need revisiting: no devices have been handed out, every device the
+owner produces will ship at or above the §3.5.3 minimum, and a fork that reads
+the reasoning and ignores it is not the owner's problem. Describing what the
+firmware enforces and why is worth more — to the next reader and to the next
+agent picking this file up cold — than the little that withholding it would
+buy.
+
 ### 1.2 The critical working group (five councils — the definition of "done")
 
 These five LGAs are where devices will **actually be deployed**. They are the
@@ -688,6 +697,11 @@ upgrade path is `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT`, which verifies a
 signature at OTA time without the irreversibility of full secure boot; the
 signing key must never be committed.
 
+Since 1.0.7 that trust is also **bounded by where an image may come from** - a
+URL prefix and a version floor, both enforced in `ota_start()` so no caller can
+bypass them. See §3.5.3; it is what stops the device installing from somewhere
+the owner never published to.
+
 **Automatic updates, on by default (owner's requirement).** These devices live
 in other people's houses; the whole reason OTA exists (§1.1) is that a council
 API breaking otherwise means visiting each one with a USB cable. Leaving
@@ -880,6 +894,113 @@ want opposite things:
   `schedule_light_is_on()` to go false so an update never interrupts a
   bin-night display. Nobody is watching, so delay is free and a badly-timed
   reboot is not.
+
+#### 3.5.3 Where an update may come from (implemented, 1.0.7 — host-tested only)
+
+Two checks in [ota.c](main/ota.c) constrain what `ota_start()` will install.
+Both are pure input validation on data the device already has: **no extra
+network round-trip, no new precondition, and nothing that a legitimate release
+can fail.** That is the whole design brief — §1.1 means a device that stops
+updating costs a house call, so an install-source rule that could refuse a good
+release would cost more than it buys.
+
+They live in `ota.c` rather than in the web handler so that no current or
+future caller can bypass them. Both callers — the daily `auto_task_fn()` and
+the manual button — pass a URL that originated from `firmware/latest.json`, so
+neither is affected in normal operation.
+
+**1. The image URL must start with `CONFIG_BINLIGHT_OTA_URL_PREFIX`**
+(default `https://github.com/jxg81/bin-light/releases/download/`). URLs
+containing `..` or a backslash are refused as well.
+
+- **The prefix is compared, the URL is not parsed.** A prefix beginning
+  `https://github.com/` pins the scheme and host by construction, because a
+  URL's authority ends at the first `/`. Writing a parser here would be more
+  code and more ways to be wrong.
+- **It ends at `/releases/download/` on purpose.** The tag and filename — the
+  only parts a normal release changes — both fall *after* it, so **routine
+  releases cannot cause drift**. It also matters that it names the repository
+  and not just the account: anyone can get a file served from
+  `github.com/<account>/<repo>/` by opening a pull request, but only someone
+  with write access can attach a release asset.
+- **Redirects are unaffected.** GitHub's 302 to
+  `release-assets.githubusercontent.com` is followed *inside*
+  `esp_http_client`, after this check has already passed. Redirect-following
+  must stay enabled.
+- **Empty string disables it**, so a fork hosting images elsewhere is never
+  hard-blocked from updating.
+
+**2. The image's own version must be ≥ `CONFIG_BINLIGHT_OTA_MIN_VERSION`**,
+read from `esp_app_desc_t` in the header already being downloaded.
+
+- **The floor is pinned at 1.0.7 permanently.** It is not a version number and
+  does not move with releases: 1.0.7 is simply the first release enforcing
+  these checks, and holding it there is all the constraint needed. Pinning is
+  also the *least* restrictive option — anything at or above the floor
+  installs, so the set of accepted firmware only grows, and by 1.0.12 a device
+  can be rolled back to any release from 1.0.7 onward.
+- **This keeps downgrade-as-recovery working**, which matters more than the
+  check itself. Publishing an older version in the manifest still walks the
+  whole fleet backwards (the mechanism §3.5 above calls out as the recovery
+  path), and it keeps working indefinitely.
+- **Do not raise it with each release.** A floor equal to the current version
+  makes every release refuse the one before it, silently removing
+  downgrade-by-manifest. That is the one mistake worth guarding against, and
+  `./test/host/run.sh` warns on it.
+- **It fails open.** An unparseable version, or an image descriptor that cannot
+  be read, allows the install and logs it. Failing closed could strand every
+  deployed device at once on a single malformed string — the worst outcome this
+  project has — and buys nothing, since the choice is only ever between
+  versions the owner actually published.
+- **A version, not a build date.** `esp_app_desc_t` also carries
+  `date`/`time`, but those are `__DATE__`/`__TIME__` — when the image was
+  *built*, not published — so a date floor is defeated by rebuilding an old
+  tag. **Neither check reads the device clock**, so a wrong or spoofed system
+  time cannot influence either decision.
+
+**Failure is soft, and recovery is a git push.** A refusal returns an error
+from `ota_start()`; `auto_task_fn()` skips that cycle and retries in 24 hours,
+and the device carries on working as a light. Nothing crashes and nothing
+reboot-loops. If the manifest and the prefix ever disagree, fixing
+`latest.json` recovers every device unattended within a day — no cable.
+
+**The one operational tie:** `CONFIG_BINLIGHT_OTA_URL_PREFIX` and the `url`
+field in `firmware/latest.json` must stay in agreement. Per the prefix design
+above this cannot drift through routine releases; only a deliberate move —
+renaming the account or repo, or hosting images elsewhere — can, and the first
+two already break `CONFIG_BINLIGHT_OTA_MANIFEST_URL` independently.
+
+> **Renaming the GitHub account is the sharp edge.** It releases the old
+> username for anyone to register, and *both* baked-in URLs — the manifest at
+> `raw.githubusercontent.com/jxg81/...` and the allowlist prefix at
+> `github.com/jxg81/...` — would then point into a namespace a stranger
+> controls, whose release assets would legitimately pass the check. GitHub's
+> namespace-retirement protection only covers repositories with 100+ clones in
+> the week before the rename, which this project will not reach. If the account
+> is ever renamed, register the old username as a placeholder and hold it.
+> Renaming the *repository* is safe by comparison — only the account owner can
+> create repositories in their own namespace.
+
+**Deliberately not done**, recorded so they stay decisions rather than
+oversights:
+
+| Rejected | Why |
+|---|---|
+| Re-fetch the manifest inside the install handler instead of trusting the posted `url` | Adds a second network round-trip to the install path — a new way for an update to *not happen*. The prefix check closes the same gap without touching the flow. |
+| `CONFIG_SECURE_SIGNED_APPS_NO_SECURE_BOOT` (firmware signing) | Accepted risk, per §3.5's "Security, stated plainly". A signing key that is lost permanently ends updates. |
+| eFuse anti-rollback (`CONFIG_BOOTLOADER_APP_ANTI_ROLLBACK`) | Strictly stronger, and rejected on irreversibility: the secure version is a unary counter in one-time-programmable silicon, burned automatically in the field by `esp_ota_mark_app_valid_cancel_rollback()`. An image that boots cleanly, burns the fuse and *then* degrades can never be walked back — fixing forward becomes the only option, permanently, on every device. Without secure boot it also adds no coverage over the software floor, since anyone with physical access can flash a bootloader built without it. |
+| `CONFIG_MBEDTLS_HAVE_TIME_DATE` | Would make every TLS handshake depend on the system clock, including the window at boot before SNTP has landed. A live risk to OTA in exchange for a theoretical gain. |
+
+**Verification state.** Both checks are host-tested against the real `ota.c`
+(23 assertions: the prefix accepts the live manifest URL and any future
+tag/filename, and refuses another account, another repo, a non-release path,
+plain `http`, a lookalike host and `..` traversal; the floor accepts the
+current and newer versions and refuses older ones, with unparseable input
+failing open). **Neither has run on hardware**, and per §3.5.0 the accept path
+cannot be meaningfully tested by the install that introduces it — the *previous*
+release does that install, and it has no such checks. Proving the accept path
+needs a bench device flashed with 1.0.7 over USB and a *further* release
+published after it.
 
 ### 3.6 Alternating multi-week manual / fallback schedule (implemented)
 
@@ -2417,6 +2538,84 @@ In order of how much the answer changes the design:
 - Optional hardware: a load switch (P-FET or load-switch IC) on the LED 5 V
   rail, held off during sleep. Only worth adding if measurement 2 confirms it.
 
+### 3.15 Web UI request protection (implemented, 1.0.7 — host-tested only)
+
+The config server has **no login and no password, deliberately** (§1.1: these
+are gifts to non-technical people, and setup friction is a real cost). Two
+things make that defensible rather than careless. Both are confined to
+[web_server.c](main/web_server.c).
+
+**1. State-changing POSTs must come from the device's own pages.** Browsers
+attach an `Origin` header to cross-site requests, so `reject_cross_origin()`
+compares it against *this request's own `Host`* — not a fixed hostname, which
+is what keeps every route to the device working: `binlight.local`, the LAN IP
+and `192.168.4.1` on the setup AP all compare equal to themselves. A mismatch
+answers 403.
+
+Applied to all seven POST handlers: `/save`, `/api-test`, `/update`,
+`/wifi-forget`, `/reboot`, `/factory-reset`, `/test`. Two deliberate exemptions:
+
+- **A missing `Origin` is allowed.** `curl` and scripts do not send one, and
+  they are not what this addresses — the case being closed is a browser being
+  used as a confused deputy by a page on another site. An oversized header that
+  cannot be read is refused rather than allowed.
+- **GET is never checked, at all.** `GET /update` shares its handler with the
+  POST route, and a GET carries no body, so it can only render status — the
+  check would have **no** security value there while risking a 403 on the
+  firmware page, which is the one page that must never break. Safe methods stay
+  out of the way. A host assertion pins this.
+
+This does not touch unattended updates: `auto_task_fn()` runs on its own task
+and never enters the HTTP server. The worst case if it were wrong is the manual
+"Check for updates" button failing while automatic updates carry on — visible
+and non-fatal.
+
+**The provisioning server in [wifi_manager.c](main/wifi_manager.c) is
+deliberately untouched.** It is a second, separate server reachable only on the
+temporary setup AP; first-run setup is the most fragile part of the user
+experience and a mistake there strands a device with no way in.
+
+**2. Everything printed into a page is escaped.** `html_escape_attr()` neutralises
+`< > & ' "` and every stored or fetched string now goes through it — the
+property label, council and event-type names, the SSID, reflected query
+parameters, and the manifest's version string. The one that matters most is
+`property_label`: it is written from `/api-setup?step=save&label=…`, stored in
+NVS, and re-rendered **on every visit to the home page**, so anything unescaped
+there persists and re-runs indefinitely.
+
+That sink is the reason this is not cosmetic. The `/api-setup` save steps are
+GET links by design (§3.13.5 — the wizard's query-string threading is fiddly
+and works, and those steps only change settings), which means they are
+deliberately *outside* the `Origin` check above. Escaping at the print site is
+therefore what actually contains them.
+
+- **Escaping is at the print site only** — after every HTTP request, JSON parse
+  and URL build has completed. It cannot affect a council API call, and
+  `waste_api.c` / `councils.c` / `date_parse.c` are untouched.
+- **`HTML_BUF_SIZE` rose 14336 → 16384 as a direct consequence.** Escaped
+  strings expand up to 5:1 (`'` → `&#39;`), and the home page prints up to 8
+  event types *twice* each. Measured worst case went 12092 → **14592**, which
+  overflowed the old buffer by 256 bytes. Truncation here is not cosmetic:
+  `safe_append()` truncates *silently* and a truncated page drops form fields,
+  which read back as "absent" on the next save and quietly destroy config.
+  Ordinary content does not expand at all, so realistic page sizes are
+  unchanged; only the ceiling moved.
+- **`./test/host/run.sh render` now asserts this rather than printing it.** It
+  fails any page that reaches its buffer and warns below 1 KB of headroom,
+  reading the limits from the source so they cannot drift. Adversarial
+  fixtures (`--max-escaped`, `--setup-escaped`) exist because the ordinary ones
+  contain no escapable characters and so measure the escaping at zero cost.
+
+**Accepted, not fixed** (§1.1 — worst case is a missed bin night or a re-setup,
+against real setup friction for the recipient): config tampering via the GET
+wizard steps, the one-request factory reset, and the open setup AP.
+
+**Verification state.** Host-tested only — 8 assertions on the origin gate
+(no-`Origin` allowed; matching `Origin` allowed for both `binlight.local` and a
+LAN IP; cross-site, prefix-spoofed and `Origin: null` refused; `GET /update`
+never refused) plus the page-size assertions above. **Not yet exercised in a
+real browser on hardware**, which is what §4 still lists as outstanding.
+
 ## 4. Current state of the code — READ THIS FIRST after a context reset
 
 This section exists so work can resume from this file alone. It records what is
@@ -2463,9 +2662,16 @@ three different things that are easy to conflate.
 | §3.5 OTA — rollback watchdog: arm + disarm | ✅ | ✅ | ✅ **verified 2026-07-27** — armed on an unverified boot, cancelled on a healthy one |
 | §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog | ✅ | ✅ **verified 2026-07-27** — a build that hangs in AutoAP rather than crashing was rolled back after 10 min, unattended. See §3.5.1. |
 | §3.5 manual install restarts itself | ✅ | ✅ | ✅ **verified 2026-07-27** — an install performed *from* 1.0.4, per §3.5.0's one-release-late rule (owner report; the captured log covers the watchdog lines) |
+| §3.5.3 OTA URL prefix allowlist | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only** — refusal path covered by 23 assertions against the real `ota.c`; never run on a device |
+| §3.5.3 OTA version floor (pinned 1.0.7) | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only**, and per §3.5.0 the *accept* path cannot be proven by the install that introduces it — needs a USB-flashed bench device plus a further release |
+| §3.15 cross-origin POST rejection | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only** (8 assertions) — not yet exercised in a real browser, by name *and* by IP |
+| §3.15 HTML escaping + `HTML_BUF_SIZE` 16384 | ✅ 1.0.7 | ❌ | ⚠️ **host-tested only** — page sizes asserted against adversarial fixtures; pages not yet eyeballed on a device |
 
 **Everything is written, flashed and — with the exceptions below — verified on
-hardware** (owner's reports, 2026-07-26 and 2026-07-27).
+hardware** (owner's reports, 2026-07-26 and 2026-07-27). The exception to that
+sentence is the 1.0.7 work: §3.5.3 and §3.15 are written and host-tested but
+**have never been built by the ESP-IDF toolchain or run on a device**, so they
+are the only rows in the table with an empty "Flashed" column.
 
 The 2026-07-27 session closed out the two features that had been outstanding
 longest. Factory reset via the web UI erases, restarts cleanly and lands in
@@ -2646,6 +2852,11 @@ Immediate, and the only thing actually blocking normal use:
 2. **Turn auto-update back on** if it is still off from the rollback test.
 3. **Take 1.0.6.** The device may still be on 1.0.4, whose watchdog is the
    timer version. 1.0.6 is what makes the hang case recoverable.
+4. **Build 1.0.7 and flash it over USB.** It is the first release carrying
+   §3.5.3 and §3.15, and none of it has been near a compiler that targets the
+   chip. Flashing it by cable rather than by OTA is also what makes the §3.5.3
+   accept path testable at all — per §3.5.0, installing 1.0.7 *from* 1.0.6
+   exercises none of its checks, because 1.0.6 does the installing.
 
 Then, in priority order:
 
@@ -2657,11 +2868,21 @@ Then, in priority order:
 3. **§5 final yellow calibration**, in the printed enclosure.
 4. **The WS2812B-V5 LED swap** (§5), if the assembly cost is acceptable.
 
-**Distribution is no longer gated on firmware.** The two things §1.1 named as
+**Distribution is nearly ungated on firmware.** The two things §1.1 named as
 prerequisites for handing a device to someone else — runtime provisioning and
 OTA — both work, and OTA is safe to leave on by default now that rollback is
-proven in both directions. What remains before giving one away is physical:
-enclosure, assembly, and the colour calibration that depends on both.
+proven in both directions. What remains is mostly physical: enclosure,
+assembly, and the colour calibration that depends on both.
+
+> **⚠️ One firmware gate remains: `CONFIG_BINLIGHT_OTA_MIN_VERSION` must be at
+> least 1.0.7 before any device is given away.** It currently sits at **1.0.6**
+> so that the current round of OTA testing can still roll back to the previous
+> release. While it is below 1.0.7 a device can be walked back onto firmware
+> that predates the §3.5.3 checks, which makes the URL allowlist bypassable —
+> acceptable on the bench, not acceptable in someone else's house. Raise it to
+> 1.0.7 when 1.0.8 is cut, then leave it there permanently (§3.5.3).
+> `./test/host/run.sh` prints a loud warning on every run until this is done,
+> and goes quiet by itself once it is.
 
 ### Open questions not yet resolved
 

@@ -25,6 +25,73 @@ static const char *TAG = "ota";
 // The image is streamed to flash, so this only bounds one read at a time.
 #define OTA_RX_BUFFER      4096
 
+// An OTA image is only installed if its URL starts with this prefix (see the
+// Kconfig help for BINLIGHT_OTA_URL_PREFIX). Without it, anything able to
+// reach the web server can name any URL and have the device flash whatever is
+// there. Kept here rather than in the web handler so no future caller can
+// bypass it.
+static bool ota_url_is_allowed(const char *url)
+{
+    const char *prefix = CONFIG_BINLIGHT_OTA_URL_PREFIX;
+    size_t prefix_len = strlen(prefix);
+
+    if (prefix_len == 0) {
+        return true;  // check disabled by configuration
+    }
+    if (strncmp(url, prefix, prefix_len) != 0) {
+        return false;
+    }
+    // Reject path traversal. The prefix pins the host, but a server that
+    // normalises ".." could still walk the path out of this repository and into
+    // somebody else's. Backslash is rejected for the same reason - some parsers
+    // fold it to '/'.
+    if (strstr(url, "..") != NULL || strchr(url, '\\') != NULL) {
+        return false;
+    }
+    return true;
+}
+
+// "1.2.3" -> a comparable ordinal. False if it is not a plain numeric version.
+static bool version_to_ordinal(const char *v, unsigned long *out)
+{
+    unsigned int a = 0, b = 0, c = 0;
+    if (sscanf(v, "%u.%u.%u", &a, &b, &c) != 3 || a > 999 || b > 999 || c > 999) {
+        return false;
+    }
+    *out = a * 1000000UL + b * 1000UL + c;
+    return true;
+}
+
+// Whether an image announcing itself as `candidate` is new enough to install.
+// The floor exists because old releases are genuine assets and pass the URL
+// prefix check above, and firmware old enough to predate that check would
+// accept any URL at all - so walking a device backwards past the floor would
+// undo the whole boundary.
+//
+// **Fails open on purpose.** An unparseable version allows the install and logs
+// it. Failing closed would let one malformed version string stop updates on
+// every deployed device at once, which is the worst outcome this project has -
+// and it buys nothing, because an attacker can only choose between versions the
+// owner actually published, all of which parse.
+static bool ota_version_is_allowed(const char *candidate)
+{
+    const char *floor_str = CONFIG_BINLIGHT_OTA_MIN_VERSION;
+    unsigned long floor_ord = 0, cand_ord = 0;
+
+    if (floor_str[0] == '\0') {
+        return true;  // check disabled by configuration
+    }
+    if (!version_to_ordinal(floor_str, &floor_ord)) {
+        ESP_LOGE(TAG, "minimum version \"%s\" is unparseable - allowing the update", floor_str);
+        return true;
+    }
+    if (!version_to_ordinal(candidate, &cand_ord)) {
+        ESP_LOGW(TAG, "image version \"%s\" is unparseable - allowing the update", candidate);
+        return true;
+    }
+    return cand_ord >= floor_ord;
+}
+
 static SemaphoreHandle_t s_mutex;
 static ota_state_t s_state = OTA_STATE_IDLE;
 static char s_message[96] = "";
@@ -216,6 +283,23 @@ static void ota_task_fn(void *arg)
         return;
     }
 
+    // The candidate's own version, read from the image header already being
+    // downloaded - no extra request. Must sit between begin and perform; that
+    // is the documented calling order for esp_https_ota_get_img_desc().
+    esp_app_desc_t new_desc;
+    if (esp_https_ota_get_img_desc(handle, &new_desc) == ESP_OK) {
+        if (!ota_version_is_allowed(new_desc.version)) {
+            ESP_LOGE(TAG, "refusing to install version %s - minimum allowed is %s",
+                     new_desc.version, CONFIG_BINLIGHT_OTA_MIN_VERSION);
+            esp_https_ota_abort(handle);
+            set_state(OTA_STATE_FAILED, "that firmware version is too old to install");
+            vTaskDelete(NULL);
+            return;
+        }
+    }
+    // Descriptor unreadable: continue anyway, same fail-open reasoning as in
+    // ota_version_is_allowed().
+
     int total = esp_https_ota_get_image_size(handle);
     int last_pct = -1;
     while ((err = esp_https_ota_perform(handle)) == ESP_ERR_HTTPS_OTA_IN_PROGRESS) {
@@ -282,6 +366,19 @@ esp_err_t ota_start(const char *url, bool restart_when_done)
     }
     if (ota_get_state() == OTA_STATE_RUNNING) {
         return ESP_ERR_INVALID_STATE;
+    }
+    // After the RUNNING check on purpose: a refused URL must not set_state()
+    // over an install that is already in progress - auto_task_fn() watches the
+    // state to decide when to reboot, and a spurious FAILED would strand a
+    // finished download until the next daily cycle.
+    if (!ota_url_is_allowed(url)) {
+        // ERROR level and the full URL on purpose: if a legitimate release is
+        // ever refused because the manifest and the prefix drifted apart, this
+        // log line is the only way to diagnose it over serial.
+        ESP_LOGE(TAG, "refusing to install from a URL outside the allowed prefix: %s", url);
+        ESP_LOGE(TAG, "allowed prefix is \"%s\" - check firmware/latest.json", CONFIG_BINLIGHT_OTA_URL_PREFIX);
+        set_state(OTA_STATE_FAILED, "update source not allowed");
+        return ESP_ERR_INVALID_ARG;
     }
 
     snprintf(s_pending_url, sizeof(s_pending_url), "%s", url);

@@ -64,6 +64,81 @@ menu "Bin Light Configuration"
 
             Point this at your own fork if you maintain your own builds.
 
+    config BINLIGHT_OTA_URL_PREFIX
+        string "Allowed OTA image URL prefix"
+        default "https://github.com/jxg81/bin-light/releases/download/"
+        help
+            An OTA image is only installed if its URL starts with this exact
+            string. This is what stops anything that can reach the device's web
+            server from pointing it at firmware someone else wrote.
+
+            It MUST match the "url" field published in the manifest above -
+            firmware/latest.json. Note the prefix ends at /releases/download/,
+            so the tag and filename a normal release changes both fall after it:
+            routine releases cannot drift. Only a deliberate move - renaming the
+            account or repo, or hosting the image elsewhere - can, and the first
+            two already break the manifest URL above independently of this check.
+
+            The prefix deliberately includes the repository and the
+            /releases/download/ path, not just the account name. Anyone can get a
+            file served from github.com/<account>/<repo>/ by opening a pull
+            request, but only someone with write access can attach a release
+            asset - so the longer prefix is what makes this a real boundary.
+
+            Set to an empty string to disable the check entirely (not
+            recommended; provided so a fork hosting images elsewhere is not
+            forced to patch C).
+
+    config BINLIGHT_OTA_MIN_VERSION
+        string "Minimum firmware version accepted by OTA"
+        default "1.0.6"
+        help
+            An OTA image is refused if its own version (from esp_app_desc_t) is
+            lower than this. It exists because old releases are legitimate
+            release assets and sail through BINLIGHT_OTA_URL_PREFIX above, and
+            firmware old enough to predate that prefix check would then accept
+            any URL at all - so without a floor, a device can be walked
+            backwards out of the whole boundary in two steps.
+
+            PIN IT AT 1.0.7 AND LEAVE IT THERE. This is not a version number
+            and it does not move with releases: 1.0.7 is simply the first
+            release that enforces the OTA security checks, and holding the
+            floor there is all the constraint the boundary needs. 1.0.8, 1.0.9
+            and everything after it all keep 1.0.7.
+
+            Pinning is also the least restrictive option, which is the point.
+            Anything at or above the floor installs, so the set of firmware a
+            device will accept only ever grows: by 1.0.12 a device can be
+            rolled back to any release from 1.0.7 onward. Publishing an older
+            version in the manifest still rolls the whole fleet back, which is
+            the primary way a bad release is recovered without a USB cable
+            (SPEC.md 3.5), and it keeps working indefinitely.
+
+            **Do not raise it with each release.** A floor equal to the current
+            version means every release refuses the one before it, which
+            silently removes downgrade-by-manifest and leaves the two-step
+            below as the only way back. That is the one mistake worth guarding
+            against here.
+
+            The only reason to change this is a change to the OTA security
+            checks themselves - if the URL allowlist above is reworked, or a
+            later release fixes something that must never be rolled back past,
+            pin it to the first release carrying that new check. Nothing else
+            justifies moving it.
+
+            **Ship gate: this must be at least 1.0.7 before any device is given
+            away.** While the floor is below it, a device can still be walked
+            back onto firmware with no allowlist, which is a complete bypass of
+            the prefix check above. Below 1.0.7 is for bench testing only, and
+            the test suite warns about it every run.
+
+            To go below the floor anyway: publish a release above the floor
+            whose own floor is lower, let devices take it, then publish the
+            older build. Two steps, but it never needs a USB cable.
+
+            Format is "major.minor.patch", all numeric. Set to an empty string to
+            disable the check.
+
     config BINLIGHT_LED_GPIO
         int "WS2812 data GPIO"
         default 0

@@ -82,3 +82,6 @@ Desktop.ini
 
 # Host test build output
 test/host/out/
+
+# Security remediation working document (not for publication)
+SECURITY-REMEDIATION.md

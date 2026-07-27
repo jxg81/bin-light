@@ -25,22 +25,27 @@ static const char *TAG = "web_server";
 // compiling root_get_handler() on the host against stubs and dumping the
 // bytes it emits:
 //
-//   factory-fresh, nothing configured   8370
-//   realistic setup (3 event types)      9901
+//   factory-fresh, nothing configured    8378
+//   realistic setup (3 event types)      9909
 //   worst case (8 event types, i.e.
 //     WASTE_API_MAX_TYPE_RULES, with
-//     long type names and address)      12084
+//     long type names and address)      12092
+//   worst case with every escapable
+//     field full of "'" (5:1 expansion) 14592
 //
-// 14336 leaves ~2.2KB over the worst case - raised from 12288 when the
-// Wi-Fi and factory-reset sections pushed the margin under 1KB. Note the
-// fresh-device page alone is 7810 bytes: the original 7200 would have
+// 16384 leaves ~1.8KB over that last figure - raised from 14336, which the
+// escaped worst case overflowed by 256 bytes once the strings printed into
+// this page started going through html_escape_attr(). Ordinary content does
+// not expand at all (addresses and type names contain nothing escapable), so
+// the realistic figures above are unchanged; the ceiling is what moved. Note
+// the fresh-device page alone is 8378 bytes: the original 7200 would have
 // truncated on any real configuration. `./test/host/run.sh render` reprints
-// these figures, so re-check them after touching this page. Each handler
-// also logs an error if it ever hits the ceiling,
-// because safe_append() truncates *silently* and a truncated page drops form
-// fields - which then read back as "absent"/unchecked on the next save,
-// quietly destroying config.
-#define HTML_BUF_SIZE   14336
+// and now asserts these figures, so re-check them after touching this page.
+// Each handler also logs an error if it ever hits the ceiling, because
+// safe_append() truncates *silently* and a truncated page drops form fields -
+// which then read back as "absent"/unchecked on the next save, quietly
+// destroying config.
+#define HTML_BUF_SIZE   16384
 #define SAVE_BODY_MAX   1024
 #define FIELD_BUF_SIZE  16
 #define API_TEST_LOOKAHEAD_DAYS 28
@@ -106,6 +111,61 @@ static const char FAVICON_SVG[] =
     "<circle cx='20' cy='30' r='2' fill='#111'/>"
     "</svg>";
 
+// True unless this is a request a browser made from a different website.
+//
+// Browsers attach an Origin header to cross-site requests. Comparing it against
+// this request's own Host - rather than a fixed hostname - is what keeps every
+// way of reaching the device working: binlight.local, the LAN IP, and
+// 192.168.4.1 on the setup AP all compare equal to themselves.
+//
+// A missing Origin is allowed. Non-browser clients (curl, scripts) do not send
+// one, and they are not the threat here: the attack requires a browser to be the
+// confused deputy. A header too long to read is rejected rather than allowed, so
+// an oversized value cannot be used to slip past the check.
+static bool request_is_same_origin(httpd_req_t *req)
+{
+    char origin[128];
+    esp_err_t err = httpd_req_get_hdr_value_str(req, "Origin", origin, sizeof(origin));
+    if (err == ESP_ERR_NOT_FOUND) {
+        return true;
+    }
+    if (err != ESP_OK) {
+        return false;
+    }
+
+    char host[64];
+    if (httpd_req_get_hdr_value_str(req, "Host", host, sizeof(host)) != ESP_OK) {
+        return false;
+    }
+
+    // Origin is "scheme://host[:port]" - compare everything after the scheme.
+    const char *o = strstr(origin, "://");
+    if (o == NULL) {
+        return false;
+    }
+    return strcmp(o + 3, host) == 0;
+}
+
+// Returns true if the handler should stop; sends the 403 itself.
+static bool reject_cross_origin(httpd_req_t *req)
+{
+    // GET never fails this check. Only POST handlers act on a body, so a GET
+    // has nothing to forge - and /update is registered for both methods on one
+    // handler, where a GET only renders status. Checking it there would risk a
+    // 403 on the firmware page, which is the one page that must never break,
+    // in exchange for no security at all. Safe methods stay out of the way.
+    if (req->method != HTTP_POST) {
+        return false;
+    }
+    if (request_is_same_origin(req)) {
+        return false;
+    }
+    ESP_LOGW(TAG, "rejected a cross-site request to %s", req->uri);
+    httpd_resp_send_err(req, HTTPD_403_FORBIDDEN,
+                        "This request didn't come from the bin light's own page.");
+    return true;
+}
+
 static esp_err_t favicon_get_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "image/svg+xml");
@@ -150,6 +210,26 @@ static int safe_append(char *buf, size_t buf_size, int off, const char *fmt, ...
     }
     int new_off = off + n;
     return new_off > (int)buf_size ? (int)buf_size : new_off;
+}
+
+// Escapes a string for safe embedding in HTML, as text or inside a
+// single-quoted attribute. Anything user-supplied or fetched from a council
+// API goes through this before being printed into a page - the TZ string, the
+// property label, event-type names, and the rest.
+static void html_escape_attr(const char *in, char *out, size_t out_size)
+{
+    size_t o = 0;
+    for (; *in != '\0' && o + 6 < out_size; in++) {
+        switch (*in) {
+            case '&':  o += snprintf(out + o, out_size - o, "&amp;");  break;
+            case '\'': o += snprintf(out + o, out_size - o, "&#39;");  break;
+            case '<':  o += snprintf(out + o, out_size - o, "&lt;");   break;
+            case '>':  o += snprintf(out + o, out_size - o, "&gt;");   break;
+            case '"':  o += snprintf(out + o, out_size - o, "&quot;"); break;
+            default:   out[o++] = *in;
+        }
+    }
+    out[o] = '\0';
 }
 
 // Index of the preset closest to c, by squared distance in RGB space.
@@ -312,10 +392,16 @@ static int append_type_mapping_rows(char *buf, size_t buf_size, int off, const w
         snprintf(ignored_field, sizeof(ignored_field), "type%d_ignored", idx);
         snprintf(color_field, sizeof(color_field), "type%d_color", idx);
 
+        // Third-party data (the council API names the types). Escaped once,
+        // used as both cell text and attribute value; the browser decodes the
+        // entities before submitting, so the stored value round-trips intact.
+        char esc_type[sizeof(r->event_type) * 6 + 1];
+        html_escape_attr(r->event_type, esc_type, sizeof(esc_type));
+
         off = safe_append(buf, buf_size, off,
             "<tr><td>%s<input type='hidden' form='mapform' name='%s' value='%s'></td>"
             "<td><input type='checkbox' form='mapform' name='%s' %s></td><td>",
-            r->event_type, name_field, r->event_type, ignored_field, r->ignored ? "checked" : "");
+            esc_type, name_field, esc_type, ignored_field, r->ignored ? "checked" : "");
         off = append_color_select_for(buf, buf_size, off, color_field, r->color, "mapform");
         off = safe_append(buf, buf_size, off, "</td></tr>");
         idx++;
@@ -377,25 +463,6 @@ static const tz_preset_t *find_tz_preset(const char *tz)
         }
     }
     return NULL;
-}
-
-// Escapes a string for safe embedding inside a single-quoted HTML attribute.
-// The stored TZ string is user-supplied (via the "Custom" field) and gets
-// reflected back into the page on every load, so this isn't optional.
-static void html_escape_attr(const char *in, char *out, size_t out_size)
-{
-    size_t o = 0;
-    for (; *in != '\0' && o + 6 < out_size; in++) {
-        switch (*in) {
-            case '&':  o += snprintf(out + o, out_size - o, "&amp;");  break;
-            case '\'': o += snprintf(out + o, out_size - o, "&#39;");  break;
-            case '<':  o += snprintf(out + o, out_size - o, "&lt;");   break;
-            case '>':  o += snprintf(out + o, out_size - o, "&gt;");   break;
-            case '"':  o += snprintf(out + o, out_size - o, "&quot;"); break;
-            default:   out[o++] = *in;
-        }
-    }
-    out[o] = '\0';
 }
 
 static esp_err_t root_get_handler(httpd_req_t *req)
@@ -504,9 +571,15 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         api_cfg.enabled ? "checked" : "");
 
     if (waste_api_config_complete(&api_cfg)) {
+        // Both strings are attacker-influenceable: the label arrives via the
+        // setup wizard's ?label= query parameter, and the council name falls
+        // back to the raw typed subdomain for unlisted councils.
+        char esc_council[WASTE_API_SUBDOMAIN_MAX_LEN * 6 + 1];
+        char esc_label[WASTE_API_LABEL_MAX_LEN * 6 + 1];
+        html_escape_attr(api_council_name(&api_cfg), esc_council, sizeof(esc_council));
+        html_escape_attr(api_cfg.property_label, esc_label, sizeof(esc_label));
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>Configured: <b>%s</b><br>%s</p>",
-            api_council_name(&api_cfg), api_cfg.property_label);
+            "<p>Configured: <b>%s</b><br>%s</p>", esc_council, esc_label);
     } else {
         off = safe_append(html, HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
     }
@@ -593,6 +666,11 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     // they're the destructive actions. The two are deliberately separate and
     // described by what they *keep*: the difference between them is the whole
     // reason to have both.
+    //
+    // The SSID is escaped: it is at most 32 bytes but its content is whatever
+    // the joined network calls itself.
+    char esc_ssid[33 * 6 + 1];
+    html_escape_attr(wifi_manager_current_ssid(), esc_ssid, sizeof(esc_ssid));
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<div class='sect'><h2>Wi-Fi</h2>"
         "<p>Connected to <b>%s</b>.</p>"
@@ -601,7 +679,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         "<p class='note'>Moves the light to a different Wi-Fi network. It restarts into "
         "setup mode. <b>Everything else is kept</b> &mdash; schedule, council and colours.</p>"
         "</div>",
-        wifi_manager_current_ssid());
+        esc_ssid);
 
     off = safe_append(html, HTML_BUF_SIZE, off,
         "<div class='sect'><h2>Firmware</h2>"
@@ -643,6 +721,9 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     if (req->content_len <= 0 || req->content_len >= SAVE_BODY_MAX) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body size");
         return ESP_FAIL;
@@ -776,6 +857,9 @@ static esp_err_t save_post_handler(httpd_req_t *req)
 // the browser before the connection drops.
 static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
 {
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     esp_err_t err = wifi_manager_forget_credentials();
     if (err != ESP_OK) {
         httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "failed to erase credentials");
@@ -813,6 +897,12 @@ static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
 // something a link should trigger.
 static esp_err_t update_post_handler(httpd_req_t *req)
 {
+    // POST only - reject_cross_origin() lets every GET through, which is what
+    // keeps the dual-registered GET /update (see the registration below) unable
+    // to answer 403.
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     char body[320] = "";
     if (req->content_len > 0 && req->content_len < (int)sizeof(body)) {
         int received = 0;
@@ -896,22 +986,27 @@ static esp_err_t update_post_handler(httpd_req_t *req)
         }
     } else {
         ota_manifest_t m;
+        // The manifest is owner-published, but it is still remote input - the
+        // version is escaped like the url and notes already are.
+        char esc_version[sizeof(m.version) * 6 + 1];
         if (ota_check(&m) != ESP_OK) {
             off = safe_append(html, HTML_BUF_SIZE, off,
                 "<p><b>Couldn't check for updates.</b></p>"
                 "<p class='note'>The light couldn't reach the update manifest. Check its "
                 "internet connection and try again.</p>");
         } else if (!m.available) {
+            html_escape_attr(m.version, esc_version, sizeof(esc_version));
             off = safe_append(html, HTML_BUF_SIZE, off,
                 "<p><b>Up to date.</b> The published version is <b>%s</b>, which is what "
-                "this light is running.</p>", m.version);
+                "this light is running.</p>", esc_version);
         } else {
             char esc_url[sizeof(m.url) * 6 + 1];
             char esc_notes[sizeof(m.notes) * 6 + 1];
             html_escape_attr(m.url, esc_url, sizeof(esc_url));
             html_escape_attr(m.notes, esc_notes, sizeof(esc_notes));
+            html_escape_attr(m.version, esc_version, sizeof(esc_version));
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "<p><b>Version %s is available.</b></p>", m.version);
+                "<p><b>Version %s is available.</b></p>", esc_version);
             if (m.notes[0] != '\0') {
                 off = safe_append(html, HTML_BUF_SIZE, off, "<p>%s</p>", esc_notes);
             }
@@ -952,6 +1047,9 @@ static esp_err_t update_post_handler(httpd_req_t *req)
 // through with no confirmation step.
 static esp_err_t reboot_post_handler(httpd_req_t *req)
 {
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     static const char PAGE[] =
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
@@ -984,6 +1082,9 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
 // link or replaying a URL from history.
 static esp_err_t factory_reset_post_handler(httpd_req_t *req)
 {
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     char body[64] = "";
     bool confirmed = false;
     if (req->content_len > 0 && req->content_len < (int)sizeof(body)) {
@@ -1086,6 +1187,9 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req)
 // No body to read - the button always previews "next", nothing to configure.
 static esp_err_t test_post_handler(httpd_req_t *req)
 {
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     schedule_test_trigger();
 
     httpd_resp_set_status(req, "303 See Other");
@@ -1100,6 +1204,12 @@ static esp_err_t test_post_handler(httpd_req_t *req)
 // this cap is what keeps the page inside SETUP_HTML_BUF_SIZE.
 #define SETUP_SEARCH_MAX    12
 #define SETUP_HTML_BUF_SIZE 20000
+// One scratch for html_escape_attr() at the setup and API-test pages' print
+// sinks. Heap rather than stack because those handlers also run blocking TLS
+// fetches on their own task stack (see web_server_start), which is where the
+// headroom matters. Sized for the largest escapable input, a bespoke
+// search-result label.
+#define PAGE_ESC_BUF_SIZE  (sizeof(((waste_api_search_result_t *)0)->label) * 6 + 1)
 
 // Percent-encodes a string for safe use as one application/x-www-form-urlencoded
 // query value (the mirror of url_decode_inplace() - needed here because this
@@ -1261,7 +1371,10 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
     }
 
     char *html = malloc(SETUP_HTML_BUF_SIZE);
-    if (html == NULL) {
+    char *esc = malloc(PAGE_ESC_BUF_SIZE);
+    if (html == NULL || esc == NULL) {
+        free(html);
+        free(esc);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1337,8 +1450,9 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
                 "<p>Couldn't search %s's address lookup just now &mdash; check the "
                 "device's connection and try again.</p>", council->name);
         } else if (n == 0) {
+            html_escape_attr(query, esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>No matches for \"%s\". Try just the house number and street name.</p>", query);
+                "<p>No matches for \"%s\". Try just the house number and street name.</p>", esc);
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your address</h2>");
             for (int i = 0; i < n; i++) {
@@ -1346,9 +1460,10 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
                 char enc_label[sizeof(results[i].label) * 3 + 1];
                 url_encode_component(results[i].id, enc_id, sizeof(enc_id));
                 url_encode_component(results[i].label, enc_label, sizeof(enc_label));
+                html_escape_attr(results[i].label, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
                     "<a class='item' href='/api-setup?step=bsave&council=%s&id=%s&label=%s'>%s</a>",
-                    enc_param, enc_id, enc_label, results[i].label);
+                    enc_param, enc_id, enc_label, esc);
             }
         }
         if (results != NULL) {
@@ -1366,9 +1481,10 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
             for (int i = 0; i < n; i++) {
                 char enc_label[sizeof(props[i].name) * 3 + 1];
                 url_encode_component(props[i].name, enc_label, sizeof(enc_label));
+                html_escape_attr(props[i].name, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
                     "<a class='item' href='/api-setup?step=save&subdomain=%s&property=%u&label=%s'>%s</a>",
-                    enc_subdomain, (unsigned)props[i].id, enc_label, props[i].name);
+                    enc_subdomain, (unsigned)props[i].id, enc_label, esc);
             }
         }
         if (props != NULL) {
@@ -1384,9 +1500,10 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your street</h2>");
             for (int i = 0; i < n; i++) {
+                html_escape_attr(streets[i].name, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
                     "<a class='item' href='/api-setup?step=property&subdomain=%s&street=%u'>%s</a>",
-                    enc_subdomain, (unsigned)streets[i].id, streets[i].name);
+                    enc_subdomain, (unsigned)streets[i].id, esc);
             }
         }
         if (streets != NULL) {
@@ -1396,15 +1513,17 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         waste_api_locality_t *localities = malloc(sizeof(waste_api_locality_t) * SETUP_LOOKUP_MAX);
         int n = (localities != NULL) ? waste_api_fetch_localities(subdomain, localities, SETUP_LOOKUP_MAX) : -1;
         if (n < 0) {
+            html_escape_attr(subdomain, esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
                 "<p>Couldn't reach \"%s.waste-info.com.au\" &mdash; check the council subdomain and try again.</p>",
-                subdomain);
+                esc);
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your suburb</h2>");
             for (int i = 0; i < n; i++) {
+                html_escape_attr(localities[i].name, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
                     "<a class='item' href='/api-setup?step=street&subdomain=%s&locality=%u'>%s</a>",
-                    enc_subdomain, (unsigned)localities[i].id, localities[i].name);
+                    enc_subdomain, (unsigned)localities[i].id, esc);
             }
         }
         if (localities != NULL) {
@@ -1419,9 +1538,14 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
                                        : council_find_by_backend(cfg.backend);
 
         if (waste_api_config_complete(&cfg)) {
+            // Split so both values can share the one escape scratch (council
+            // name falls back to the raw typed subdomain; the label came in
+            // via the wizard's query string).
+            html_escape_attr(api_council_name(&cfg), esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Currently configured: <b>%s</b><br>%s</p>",
-                api_council_name(&cfg), cfg.property_label);
+                "<p>Currently configured: <b>%s</b><br>", esc);
+            html_escape_attr(cfg.property_label, esc, PAGE_ESC_BUF_SIZE);
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "%s</p>", esc);
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
         }
@@ -1486,6 +1610,8 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         // The escape hatch that keeps SPEC.md 3.3's deliberate flexibility:
         // any council on this platform works without a firmware change, listed
         // or not. Demoted below the dropdown rather than removed.
+        html_escape_attr(subdomain[0] != '\0' ? subdomain : cfg.council_subdomain,
+                         esc, PAGE_ESC_BUF_SIZE);
         off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
             "<h3>Council not listed?</h3>"
             "<p class='note'>Any council running the same \"waste-info.com.au\" platform will "
@@ -1496,13 +1622,14 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
             "<label>Subdomain: <input type='text' name='subdomain' value='%s'></label> "
             "<button type='submit'>Find my suburb</button>"
             "</form>",
-            subdomain[0] != '\0' ? subdomain : cfg.council_subdomain);
+            esc);
     }
 
     off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "</body></html>");
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, off);
+    free(esc);
     free(html);
     return ESP_OK;
 }
@@ -1516,7 +1643,10 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
     waste_api_config_t cfg = waste_api_get_config();
 
     char *html = malloc(HTML_BUF_SIZE);
-    if (html == NULL) {
+    char *esc = malloc(PAGE_ESC_BUF_SIZE);
+    if (html == NULL || esc == NULL) {
+        free(html);
+        free(esc);
         return ESP_ERR_NO_MEM;
     }
 
@@ -1540,10 +1670,13 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
         off = safe_append(html, HTML_BUF_SIZE, off,
             "<p>No council/address configured yet &mdash; <a href='/api-setup'>set one up first</a>.</p>");
     } else {
+        // Split so both values can share the one escape scratch.
+        html_escape_attr(api_council_name(&cfg), esc, PAGE_ESC_BUF_SIZE);
+        off = safe_append(html, HTML_BUF_SIZE, off, "<p>Testing <b>%s</b>, ", esc);
+        html_escape_attr(cfg.property_label, esc, PAGE_ESC_BUF_SIZE);
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>Testing <b>%s</b>, %s &mdash; raw data for the next %d days "
-            "(nothing filtered out yet):</p>",
-            api_council_name(&cfg), cfg.property_label, API_TEST_LOOKAHEAD_DAYS);
+            "%s &mdash; raw data for the next %d days "
+            "(nothing filtered out yet):</p>", esc, API_TEST_LOOKAHEAD_DAYS);
 
         waste_api_event_t events[API_TEST_MAX_EVENTS];
         int n = waste_api_fetch_upcoming(&cfg, API_TEST_LOOKAHEAD_DAYS, events, API_TEST_MAX_EVENTS);
@@ -1558,10 +1691,11 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
                 "<table><tr><th>Date</th><th>Type</th><th>API's colour</th></tr>");
             for (int i = 0; i < n; i++) {
                 const waste_api_event_t *e = &events[i];
+                html_escape_attr(e->event_type, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, HTML_BUF_SIZE, off,
                     "<tr><td>%04u-%02u-%02u</td><td>%s</td>"
                     "<td><span class='swatch' style='background:#%02x%02x%02x'></span>#%02x%02x%02x</td></tr>",
-                    (unsigned)e->year, (unsigned)e->month, (unsigned)e->day, e->event_type,
+                    (unsigned)e->year, (unsigned)e->month, (unsigned)e->day, esc,
                     e->color.r, e->color.g, e->color.b, e->color.r, e->color.g, e->color.b);
             }
             off = safe_append(html, HTML_BUF_SIZE, off, "</table>");
@@ -1634,10 +1768,13 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
                 snprintf(ignored_field, sizeof(ignored_field), "type%d_ignored", i);
                 snprintf(color_field, sizeof(color_field), "type%d_color", i);
 
+                // As on the home page's mapping table: escaped once, used as
+                // both cell text and attribute value.
+                html_escape_attr(summaries[i].event_type, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, HTML_BUF_SIZE, off,
                     "<tr><td>%s<input type='hidden' name='%s' value='%s'></td>"
                     "<td><input type='checkbox' name='%s' %s></td><td>",
-                    summaries[i].event_type, name_field, summaries[i].event_type,
+                    esc, name_field, esc,
                     ignored_field, ignored_default ? "checked" : "");
                 off = append_color_select(html, HTML_BUF_SIZE, off, color_field, color_default);
                 off = safe_append(html, HTML_BUF_SIZE, off, "</td></tr>");
@@ -1655,6 +1792,7 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, off);
+    free(esc);
     free(html);
     return ESP_OK;
 }
@@ -1665,6 +1803,9 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
 // urlencoded body has no arrays).
 static esp_err_t api_test_post_handler(httpd_req_t *req)
 {
+    if (reject_cross_origin(req)) {
+        return ESP_FAIL;
+    }
     if (req->content_len <= 0 || req->content_len >= SAVE_BODY_MAX) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid body size");
         return ESP_FAIL;

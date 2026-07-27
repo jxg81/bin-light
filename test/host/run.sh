@@ -27,6 +27,70 @@ CFLAGS="-I stub -I $MAIN -Wall -Wno-unused-function"
 
 status=0
 
+# Fails a rendered page that reached its buffer, and warns below 1KB of
+# headroom. Exact equality means safe_append() clamped, i.e. the page was
+# truncated - which is the failure this guards, not a near miss.
+check_page() {
+    file=$1; limit=$2; name=$3
+    size=$(wc -c < "$file" | tr -d ' ')
+    head=$((limit - size))
+    if [ "$size" -ge "$limit" ]; then
+        echo "FAIL $(basename "$file") is ${size}B, at or over $name ($limit) - truncated"
+        status=1
+    elif [ "$head" -lt 1024 ]; then
+        echo "WARN $(basename "$file") is ${size}B, only ${head}B under $name ($limit)"
+    else
+        echo "PASS $(basename "$file") ${size}B, ${head}B under $name"
+    fi
+}
+
+# The OTA version floor is a release-process setting, not code, and getting it
+# wrong is silent: too high and the build refuses to reinstall itself, too low
+# and a device can be walked back onto firmware with no URL allowlist. Neither
+# shows up on the bench. So it is checked here, on every run.
+#
+# FIRST_SECURED_RELEASE is the first version carrying the BINLIGHT_OTA_URL_PREFIX
+# check, and the floor is pinned there permanently - it is not a version number
+# and does not move with releases. Below it, the downgrade bypass is open and
+# the build must not ship. Above it, rollback room is being given away for
+# nothing. Only a change to the OTA checks themselves should move it.
+FIRST_SECURED_RELEASE=1.0.7
+
+ver_ord() {
+    a=$(echo "$1" | cut -d. -f1); b=$(echo "$1" | cut -d. -f2); c=$(echo "$1" | cut -d. -f3)
+    echo $(( ${a:-0} * 1000000 + ${b:-0} * 1000 + ${c:-0} ))
+}
+
+echo "== OTA version floor =="
+proj_ver=$(tr -d ' \n' < ../../version.txt)
+floor=$(sed -n '/config BINLIGHT_OTA_MIN_VERSION/,/^$/s/^ *default "\(.*\)"/\1/p' $MAIN/Kconfig.projbuild)
+
+if [ -z "$floor" ]; then
+    echo "SKIP floor is empty - the version check is disabled by configuration"
+elif [ "$(ver_ord "$floor")" -gt "$(ver_ord "$proj_ver")" ]; then
+    echo "FAIL floor $floor is above version.txt $proj_ver - this build would refuse to reinstall itself"
+    status=1
+else
+    echo "PASS floor $floor is at or below version.txt $proj_ver"
+    if [ "$(ver_ord "$floor")" -lt "$(ver_ord "$FIRST_SECURED_RELEASE")" ]; then
+        echo
+        echo "  ****************************************************************"
+        echo "  DO NOT GIVE A DEVICE AWAY ON THIS BUILD."
+        echo "  The floor ($floor) is below $FIRST_SECURED_RELEASE, the first release with the"
+        echo "  OTA URL allowlist. Anything that can reach POST /update can still"
+        echo "  install pre-$FIRST_SECURED_RELEASE firmware, which accepts any URL at all - so the"
+        echo "  allowlist is fully bypassable. This is fine for bench testing."
+        echo "  Raise BINLIGHT_OTA_MIN_VERSION to $FIRST_SECURED_RELEASE before shipping."
+        echo "  ****************************************************************"
+        echo
+    elif [ "$(ver_ord "$floor")" -gt "$(ver_ord "$FIRST_SECURED_RELEASE")" ]; then
+        echo "NOTE floor is above $FIRST_SECURED_RELEASE, so releases between the two can no longer be"
+        echo "     installed and rollback below $floor now needs the two-step. Pin it at"
+        echo "     $FIRST_SECURED_RELEASE unless the OTA security checks themselves changed."
+    fi
+fi
+echo
+
 echo "building test_resolver..."
 cc -o "$OUT/test_resolver" test_resolver.c $CFLAGS
 echo
@@ -84,15 +148,37 @@ if [ "$1" = "render" ]; then
     "$OUT/render_page" ""        "$OUT/home-configured.html"
     "$OUT/render_page" --empty   "$OUT/home-unconfigured.html"
     "$OUT/render_page" --max     "$OUT/home-worst-case.html"
+    "$OUT/render_page" --max-escaped "$OUT/home-worst-case-escaped.html"
     "$OUT/render_page" --setup   "$OUT/api-setup.html"
+    "$OUT/render_page" --setup-escaped "$OUT/api-setup-worst-case-escaped.html"
     "$OUT/render_page" --merribek "$OUT/api-setup-merribek.html"
     "$OUT/render_page" --reset-confirm "$OUT/factory-reset-confirm.html"
     "$OUT/render_page" --update-uptodate  "$OUT/update-uptodate.html"
     "$OUT/render_page" --update-available "$OUT/update-available.html"
     "$OUT/render_page" --update-progress  "$OUT/update-progress.html"
-    echo "page sizes (HTML_BUF_SIZE must exceed the largest home-*;"
-    echo "SETUP_HTML_BUF_SIZE must exceed api-setup):"
+    echo "page sizes (HTML_BUF_SIZE must exceed the largest home-* and"
+    echo "update-*; SETUP_HTML_BUF_SIZE must exceed api-setup*):"
     wc -c "$OUT"/*.html
+
+    echo
+    echo "== page buffer headroom =="
+    # Asserted, not eyeballed. safe_append() truncates silently and a truncated
+    # page drops form fields, which read back as "absent" on the next save and
+    # quietly destroy config - so a page that outgrows its buffer has to fail
+    # the suite rather than print a number someone has to notice. The limits
+    # are read from the source so they cannot drift from what ships.
+    html_buf=$(sed -n 's/^#define HTML_BUF_SIZE  *\([0-9]*\).*/\1/p' $MAIN/web_server.c)
+    setup_buf=$(sed -n 's/^#define SETUP_HTML_BUF_SIZE  *\([0-9]*\).*/\1/p' $MAIN/web_server.c)
+    for f in "$OUT"/home-*.html "$OUT"/update-*.html "$OUT"/factory-reset-*.html; do
+        check_page "$f" "$html_buf" HTML_BUF_SIZE
+    done
+    for f in "$OUT"/api-setup*.html; do
+        check_page "$f" "$setup_buf" SETUP_HTML_BUF_SIZE
+    done
+
+    echo
+    echo "== cross-origin gate =="
+    "$OUT/render_page" --origin-check || status=1
 
     echo
     echo "== factory reset confirmation gate =="

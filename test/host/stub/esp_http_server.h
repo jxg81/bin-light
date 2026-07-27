@@ -5,6 +5,7 @@
 #include "esp_err.h"
 
 #define HTTPD_400_BAD_REQUEST            400
+#define HTTPD_403_FORBIDDEN              403
 #define HTTPD_500_INTERNAL_SERVER_ERROR  500
 #define HTTPD_SOCK_ERR_TIMEOUT           (-3)
 #define HTTPD_RESP_USE_STRLEN            (-1)
@@ -40,10 +41,29 @@ typedef struct {
 // Capture hooks provided by the harness.
 void stub_capture(const char *buf, int len);
 
+// Plantable request headers, and a recorder for the last error response, so
+// the harness can drive the same-origin check through real handlers. NULL
+// means "header absent" (ESP_ERR_NOT_FOUND), matching a non-browser client.
+extern const char *stub_hdr_origin;
+extern const char *stub_hdr_host;
+extern int stub_last_err_code;
+
+static inline esp_err_t httpd_req_get_hdr_value_str(httpd_req_t *r, const char *field, char *val, size_t val_size)
+{
+    (void)r;
+    const char *v = NULL;
+    if (strcmp(field, "Origin") == 0) v = stub_hdr_origin;
+    else if (strcmp(field, "Host") == 0) v = stub_hdr_host;
+    if (v == NULL) return ESP_ERR_NOT_FOUND;
+    if (strlen(v) >= val_size) return ESP_FAIL; // real API: ESP_ERR_HTTPD_RESULT_TRUNC
+    strcpy(val, v);
+    return ESP_OK;
+}
+
 static inline esp_err_t httpd_resp_set_type(httpd_req_t *r, const char *t) { (void)r; (void)t; return ESP_OK; }
 static inline esp_err_t httpd_resp_set_status(httpd_req_t *r, const char *s) { (void)r; (void)s; return ESP_OK; }
 static inline esp_err_t httpd_resp_set_hdr(httpd_req_t *r, const char *k, const char *v) { (void)r; (void)k; (void)v; return ESP_OK; }
-static inline esp_err_t httpd_resp_send_err(httpd_req_t *r, httpd_err_code_t c, const char *m) { (void)r; (void)c; (void)m; return ESP_OK; }
+static inline esp_err_t httpd_resp_send_err(httpd_req_t *r, httpd_err_code_t c, const char *m) { (void)r; (void)m; stub_last_err_code = c; return ESP_OK; }
 static inline esp_err_t httpd_resp_send(httpd_req_t *r, const char *buf, int len) { (void)r; stub_capture(buf, len); return ESP_OK; }
 // The harness can plant a POST body here to drive POST handlers.
 extern const char *stub_post_body;
