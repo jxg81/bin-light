@@ -2302,9 +2302,11 @@ three different things that are easy to conflate.
 | §3.4 "Forget this network" | ✅ | ✅ | ✅ **verified 2026-07-27** — reaches AutoAP, confirming §6 bug 21 is fixed on this path too (it uses `wifi_manager_forget_credentials()`, not `factory_reset_erase()`) |
 | §3.14 battery life / time-based deep sleep | ❌ not written (design only — needs current measurements first, see 3.14.5) | — | — |
 | §3.13.2 South Australia (46 councils) | ❌ not written (research complete, gated on the lat/lon UX question) | — | — |
-| §3.5 OTA — manifest fetch + version compare | ✅ | ✅ | ✅ **verified 2026-07-27** — fetched over TLS from `raw.githubusercontent.com`, detected 1.0.1 against a running 1.0.0 |
-| §3.5 OTA — image download + install | ✅ | ✅ (fix in 1.0.2, **needs USB flash**) | ❌ **failed on first attempt** — §6 bug 23, fixed but unproven |
-| §3.5 OTA — rollback safety net | ✅ | ✅ | ❌ **not tested** |
+| §3.5 OTA — manifest fetch + version compare | ✅ | ✅ | ✅ **verified 2026-07-27** — fetched over TLS from `raw.githubusercontent.com` |
+| §3.5 OTA — image download + install | ✅ | ✅ | ✅ **verified 2026-07-27** — 1.0.2 → 1.0.3 unattended: GitHub's signed redirect followed, ~1.3 MB pulled over TLS into the spare slot, flashed, rebooted, healthy. **No cable.** |
+| §3.5 OTA — automatic update (on by default) | ✅ | ✅ | ✅ **verified 2026-07-27** — the 1.0.3 install was the daily checker, not a button |
+| §3.5 `GET /update` (§6 bug 24) | ✅ | ✅ | ✅ **verified 2026-07-27** — 200, was 405 |
+| §3.5 OTA — rollback safety net | ✅ | ✅ | ❌ **not tested** — see the rollback plan in "▶ Agreed next step" |
 
 **Everything is written, flashed and — with the exceptions below — verified on
 hardware** (owner's reports, 2026-07-26 and 2026-07-27).
@@ -2330,16 +2332,19 @@ what makes automatic updates safe is rollback, and rollback is itself untested.
 wrong-password rejection at provisioning, and "forget this network" — were all
 cleared on 2026-07-27.
 
-**OTA is half proven.** The repo was made public and 1.0.1 published on
-2026-07-27. The device fetched the manifest over TLS and correctly detected the
-new version — so the CA bundle, the HTTPS path and the version compare all
-work. **The download then failed on every attempt** (§6 bug 23: the request
-line for GitHub's 880-byte signed redirect URL didn't fit a 512-byte default
-TX buffer). Fixed in 1.0.2.
+**OTA delivers, end to end (2026-07-27).** The device went **1.0.2 → 1.0.3
+unattended**: the daily auto-checker found the manifest, followed GitHub's
+signed redirect, pulled ~1.3 MB over TLS into the spare slot, flashed, rebooted
+and came back healthy. No cable, no button. That closes the §1.1 argument —
+a council-API break can now be fixed with a push instead of a house call.
 
-**⚠️ 1.0.2 must be installed over USB.** OTA is the thing that is broken, so it
-cannot deliver its own fix. Nothing about §3.5 beyond the manifest check can be
-retested until that flash happens.
+Getting there took two fixes found by actually trying it (§6 bugs 23 and 24);
+neither was visible from reasoning about the code, and bug 23's own fix had to
+go on over USB because OTA could not deliver the fix for OTA.
+
+**Only rollback remains untested**, and it is the one that matters most: it is
+what makes automatic installation safe, and auto-update is on by default. See
+"▶ Agreed next step".
 
 **⚠️ Never publish 1.0.0 or 1.0.1 in the manifest again.** Neither can perform
 an OTA, so a device that lands on one is stuck until someone visits it with a
@@ -2473,29 +2478,39 @@ captive portal. What remains is one substantial item and three cheap ones.
    fixes and the captive portal.
 2. ~~**Factory reset and AutoAP.**~~ **Done 2026-07-27** — see the status
    table. Found and fixed §6 bugs 21 and 22 along the way.
-3. **Prove the OTA round trip.** ← *the only large piece left.* Bump
-   `version.txt` to 1.0.1, build, tag, cut a GitHub Release with the `.bin`,
-   update `firmware/latest.json` ([firmware/README.md](firmware/README.md) has
-   the checklist), then let the device find it.
+3. ~~**Prove the OTA round trip.**~~ **Done 2026-07-27** — 1.0.2 → 1.0.3
+   unattended. TLS chain, redirect, download, flash and reboot all confirmed.
+   Found §6 bugs 23 and 24 on the way.
 
-   Three things get their first real exercise here, none of which has ever run
-   on the device:
-   - **GitHub's TLS chain against the CA bundle.** It validates offline (§3.5)
-     but has never been attempted from the ESP32. This is what
-     `CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY` exists for.
-   - **The download and flash into the spare slot**, at ~1.3 MB over TLS.
-   - **Rollback.** `ota_mark_valid()` is what stops the bootloader reverting on
-     the next boot. Worth deliberately proving by publishing a build that
-     *cannot* reach Wi-Fi and confirming the device reverts itself — that is
-     the entire safety net under automatic updates, and it is unproven.
+5. **Prove rollback.** ← *the last untested thing in the project.* Everything
+   else about automatic updates is now verified, which makes this the only
+   remaining question — and the important one, because rollback is what makes
+   installing-without-asking safe.
 
-   **Do this before the repo goes public or any device leaves the house.**
-   Auto-update is on by default (§3.5), so the first published release ships
-   itself to every device automatically. A broken one with an untested
-   rollback is the one failure that needs a USB cable to fix — the exact
-   outcome OTA exists to prevent.
+   `ota_mark_valid()` runs at the end of `app_main()`, after Wi-Fi is up and
+   the web server is serving. An image that never gets that far stays
+   `ESP_OTA_IMG_PENDING_VERIFY`, and the bootloader reverts to the previous
+   slot on the next boot (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`).
 
-   Also grep the built `.bin` for credentials first — see §6 bug 21.
+   **Turn auto-update OFF in Preferences before starting.** The manifest will
+   be pointing at a deliberately broken build; with auto-update on, the device
+   would roll back and then immediately fetch the bad image again, forever.
+   This is a real property of "difference, not ordering" versioning, not a
+   quirk of the test.
+
+   Sequence:
+   1. Auto-update **off** on the device.
+   2. Publish a build that cannot reach `ota_mark_valid()` — e.g. an
+      `abort()` early in `app_main()`, or one whose Wi-Fi credentials are
+      guaranteed to fail. Tag it clearly (`v0.0.0-rollback-test`).
+   3. Install it **manually** from the Firmware page.
+   4. Watch the serial log: it should install, reboot into the broken image,
+      fail to validate, and on the following boot come back as the *previous*
+      version with no intervention.
+   5. Repoint `latest.json` at the good release, then turn auto-update back
+      on. **Delete the broken release** so it can never be selected again.
+
+   Also grep the built `.bin` for credentials before any release — §6 bug 21.
 
 4. ~~**Three cheap gaps.**~~ **Done 2026-07-27** — reset button 10s hold
    (and ~5s release restarting instead of wiping), wrong-password rejection,
