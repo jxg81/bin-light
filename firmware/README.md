@@ -33,6 +33,13 @@ asset. Nothing to host, nothing to keep running.
 5. **Check a device**: its Firmware section should offer the new version.
    `raw.githubusercontent.com` caches for a few minutes, so allow for that.
 
+> **⚠️ If the release changes how updating itself works, you cannot test that
+> by installing it.** The firmware performing an install is the *old* one, so
+> the download, the buffers and the restart-afterwards decision all run in the
+> image being replaced. Anything you changed there is first exercised by the
+> **next** release. Only boot-time behaviour is proven by the release's own
+> arrival. See SPEC.md §3.5.0.
+
 **Do steps 3 and 4 in that order.** Publishing the manifest before the asset
 exists means every device that checks in the gap gets a failed download.
 

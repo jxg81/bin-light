@@ -792,7 +792,37 @@ worth proving is a *hanging* image being recovered on hardware — the same
 deliberate-bad-build method as the crash test, but with Wi-Fi credentials that
 cannot succeed, and a ten-minute wait.
 
-#### 3.5.2 Manual installs restart themselves (implemented, not yet flashed)
+#### 3.5.0 ⚠️ Changes to the OTA path are validated one release late
+
+Not a bug — a property of the mechanism that is very easy to get wrong when
+planning a test, and it was got wrong once already.
+
+**The firmware that performs an install is the *old* one.** Everything up to
+and including the reboot decision — manifest fetch, version compare, download,
+buffer sizes, whether it restarts afterwards — runs in the image being
+*replaced*. Only what happens from the new image's first boot onward is the new
+code.
+
+So after shipping 1.0.4's "manual installs restart themselves", installing
+1.0.4 *from 1.0.3* proves nothing about it: 1.0.3 does the installing, and
+1.0.3 waits for a button. The behaviour can only be exercised by the **next**
+install after it is running.
+
+Concretely, for any release that touches §3.5:
+
+| Changed | First proven by |
+|---|---|
+| Manifest fetch, download, buffers, install-time restart | the release **after** the one that contains it |
+| Watchdog arming, `ota_mark_valid()`, anything at boot | that release's **own** first boot |
+
+A useful consequence of the second row: **1.0.4's own arrival exercised the
+watchdog's arm-and-disarm path.** Booting as `PENDING_VERIFY` it should have
+logged `unverified image: rolling back unless startup completes within 10
+minutes`, then `new firmware confirmed healthy - rollback cancelled` once
+startup finished. That is the timer being armed and correctly cancelled — the
+whole path bar the firing itself.
+
+#### 3.5.2 Manual installs restart themselves (implemented, flashed in 1.0.4)
 
 The rollback test surfaced a UX fault worth recording because the symptom
 misleads. A manual install flashed the image and then **waited for a second
@@ -2391,8 +2421,9 @@ three different things that are easy to conflate.
 | §3.5 OTA — automatic update (on by default) | ✅ | ✅ | ✅ **verified 2026-07-27** — the 1.0.3 install was the daily checker, not a button |
 | §3.5 `GET /update` (§6 bug 24) | ✅ | ✅ | ✅ **verified 2026-07-27** — 200, was 405 |
 | §3.5 OTA — rollback safety net (**crashing** image) | ✅ | ✅ | ✅ **verified 2026-07-27** — installed a deliberately-aborting build, device reverted itself to 1.0.3. Evidence below. |
-| §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog, in 1.0.4 | ❌ **not flashed** | ❌ **not tested** — needs a build that hangs rather than crashes, plus a 10-minute wait. See §3.5.1. |
-| §3.5 manual install restarts itself | ✅ | ❌ **not flashed** | ❌ — in 1.0.4 |
+| §3.5 OTA — rollback watchdog: arm + disarm | ✅ | ✅ 1.0.4 | ⚠️ **exercised by 1.0.4's own boot** — confirm the two log lines in §3.5.0 |
+| §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog | ✅ 1.0.4 | ❌ **not tested** — the *firing* path. Needs a build that hangs rather than crashes, plus a 10-minute wait. See §3.5.1. |
+| §3.5 manual install restarts itself | ✅ | ✅ 1.0.4 | ❌ **not tested** — the *installing* firmware decides, so this needs a manual install performed **from** 1.0.4. See §3.5.0. |
 
 **Everything is written, flashed and — with the exceptions below — verified on
 hardware** (owner's reports, 2026-07-26 and 2026-07-27).
