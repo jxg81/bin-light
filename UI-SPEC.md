@@ -747,6 +747,16 @@ disagree, which defeats the swatch's only purpose. See §10.7.
 buttons. Shares **no values** with palette 1 and is defined only in `/s.css` as
 custom properties.
 
+**The interface palette is deliberately not a bin colour.** The accent is a
+slate blue (`#2c5d8a`) and the destructive colour a dark, desaturated red
+(`#9b2c2c`) — chosen so that no button, link or border on any page can be
+mistaken for one of the four bin colours. An earlier draft used a green accent;
+that was wrong, because a green button beside a green bin swatch teaches the
+user that green is decoration. **Colour on these pages means a bin, and nothing
+else means a bin.** (Owner's direction, 2026-07-28: reliable colour
+reproduction in the enclosure matters more than flexibility. That priority
+governs §10.7 and this rule alike.)
+
 > **Rule: `COLOR_PRESETS` is device output, not a UI theme.** The interface may
 > not draw its chrome from it, and must never be "unified" with it. A future
 > change to the interface palette must not touch `COLOR_PRESETS`; a future
@@ -761,9 +771,9 @@ served with `httpd_resp_send(..., HTTPD_RESP_USE_STRLEN)` from a plain literal,
 like `FAVICON_SVG` — **no `printf` formatting, so no `%%` doubling**.
 
 ```css
-:root{--bg:#fff;--fg:#1b1b1b;--mut:#666;--line:#dcdcdc;--card:#f5f5f4;--acc:#2f6d4f;--warn:#a33}
+:root{--bg:#fff;--fg:#1b1b1b;--mut:#666;--line:#dcdcdc;--card:#f5f5f4;--acc:#2c5d8a;--warn:#9b2c2c}
 @media(prefers-color-scheme:dark){
-:root{--bg:#141414;--fg:#ededed;--mut:#9b9b9b;--line:#333;--card:#1e1e1e;--acc:#78c8a0;--warn:#e08080}}
+:root{--bg:#141414;--fg:#ededed;--mut:#9b9b9b;--line:#333;--card:#1e1e1e;--acc:#7fb3e0;--warn:#d08a8a}}
 *{box-sizing:border-box}
 body{font:16px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg);
 max-width:30rem;margin:0 auto;padding:1rem 1rem 3rem}
@@ -867,7 +877,7 @@ only safe inside a quoted attribute.
   <p class=note>Next collection</p>
   <p class=big>Tuesday 4 August</p>
   <p><span class=sw style=background:#ff9600></span>Yellow
-     <span class=sw style=background:#008000></span>Green</p>
+     <span class=sw style=background:#00ff00></span>Green</p>
   <p class=note>The light comes on the night before, from 6:00 pm.</p>
 </div>
 <form method=POST action=/test><button class=pri>Show me the next colour</button></form>
