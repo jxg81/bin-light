@@ -1,5 +1,5 @@
 {
-  "version": "1.0.3",
-  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.3/bin-light.bin",
-  "notes": "Exercises the OTA download path fixed in 1.0.2."
+  "version": "1.0.4",
+  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.4/bin-light.bin",
+  "notes": "Manual installs restart themselves; rollback watchdog for hung images."
 }
