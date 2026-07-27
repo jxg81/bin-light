@@ -1,5 +1,5 @@
 {
-  "version": "1.0.4",
-  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.4/bin-light.bin",
-  "notes": "Manual installs restart themselves; rollback watchdog for hung images."
+  "version": "1.0.5-hangtest",
+  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.5-hangtest/bin-light.bin",
+  "notes": "HANG TEST - deliberately broken, revert to 1.0.4 after."
 }
