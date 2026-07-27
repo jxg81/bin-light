@@ -767,7 +767,21 @@ touching the device"; that is only true if a next restart ever comes.
 `esp_ota_mark_app_invalid_rollback_and_reboot()`. That supplies the reset the
 bootloader needs, turning the hang case into the crash case proven above.
 
-Three things about it that are deliberate:
+**It is a task, not a software timer** — changed before the hang test was ever
+run, because the timer version would have produced a *false pass*. A timer
+callback runs on the timer service task, whose stack is
+`CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH` = **2048 bytes**, and
+`esp_ota_mark_app_invalid_rollback_and_reboot()` writes the otadata partition.
+Flash operations on a 2 KB stack are at best uncomfortably tight — and the
+failure mode hides itself: a stack overflow panics, the panic reboots, and the
+reboot rolls the image back *because it is still `PENDING_VERIFY`*. The device
+recovers, the test looks like a pass, and nothing about the watchdog has been
+proven. A wrong mechanism producing the right outcome is the one failure that
+cannot be spotted from the outcome. The task also states the logic better:
+wait for the deadline **or** notification that startup finished, whichever
+comes first (`ulTaskNotifyTake` with a timeout).
+
+Three further things about it that are deliberate:
 
 - **It is armed before `wifi_manager_start()`** ([main.c](main/main.c)), not
   beside `ota_mark_valid()` at the end. Arming it after the call that blocks

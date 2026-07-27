@@ -414,11 +414,39 @@ esp_err_t ota_auto_task_start(void)
 // outages are minutes, not tens of minutes.
 #define ROLLBACK_WATCHDOG_MS (10 * 60 * 1000)
 
-static TimerHandle_t s_rollback_timer;
+// A dedicated task rather than a FreeRTOS software timer, on purpose.
+//
+// The obvious implementation is a one-shot timer, and that is what this was
+// first written as. The problem is where a timer callback runs: the timer
+// service task, whose stack is CONFIG_FREERTOS_TIMER_TASK_STACK_DEPTH = 2048
+// bytes. esp_ota_mark_app_invalid_rollback_and_reboot() writes the otadata
+// partition, and running flash operations on a 2KB stack is at best
+// uncomfortably tight.
+//
+// What makes that worth avoiding is not the crash itself but how it would
+// read: a stack overflow panics, the panic reboots, and the reboot rolls the
+// image back - because it is still PENDING_VERIFY. The device would recover
+// and the test would look like a pass, while proving nothing about the
+// watchdog. A wrong mechanism producing the right outcome is the one failure
+// that hides itself.
+//
+// A task also expresses the logic better: wait for either the deadline or
+// notification that startup finished, whichever comes first.
+#define ROLLBACK_TASK_STACK 4096
 
-static void rollback_watchdog_fire(TimerHandle_t timer)
+static TaskHandle_t s_rollback_task;
+
+static void rollback_watchdog_task(void *arg)
 {
-    (void)timer;
+    (void)arg;
+
+    // Returns non-zero if ota_mark_valid() notified us, 0 if the wait expired.
+    if (ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(ROLLBACK_WATCHDOG_MS)) != 0) {
+        s_rollback_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     ESP_LOGE(TAG, "this image never finished starting up after %d minutes - rolling back",
              ROLLBACK_WATCHDOG_MS / 60000);
 
@@ -428,6 +456,8 @@ static void rollback_watchdog_fire(TimerHandle_t timer)
     // case: a reboot that changes nothing would just loop.
     esp_err_t err = esp_ota_mark_app_invalid_rollback_and_reboot();
     ESP_LOGE(TAG, "rollback refused (%s) - staying on this image", esp_err_to_name(err));
+    s_rollback_task = NULL;
+    vTaskDelete(NULL);
 }
 
 void ota_rollback_watchdog_start(void)
@@ -441,13 +471,12 @@ void ota_rollback_watchdog_start(void)
         return; // ordinary boot of a confirmed image - nothing to guard
     }
 
-    s_rollback_timer = xTimerCreate("ota_rollback", pdMS_TO_TICKS(ROLLBACK_WATCHDOG_MS),
-                                    pdFALSE, NULL, rollback_watchdog_fire);
-    if (s_rollback_timer == NULL || xTimerStart(s_rollback_timer, 0) != pdPASS) {
+    if (xTaskCreate(rollback_watchdog_task, "ota_rollback", ROLLBACK_TASK_STACK, NULL,
+                    tskIDLE_PRIORITY + 1, &s_rollback_task) != pdPASS) {
         // Not fatal, but say so plainly: without this the only protection left
         // is the image crashing on its own.
         ESP_LOGE(TAG, "could not arm the rollback watchdog - a hang would not be recovered");
-        s_rollback_timer = NULL;
+        s_rollback_task = NULL;
         return;
     }
     ESP_LOGW(TAG, "unverified image: rolling back unless startup completes within %d minutes",
@@ -465,12 +494,10 @@ void ota_mark_valid(void)
         return; // an ordinary boot of an already-confirmed image
     }
 
-    // Disarm first. Confirming the image and then leaving a timer running that
-    // would roll it back anyway is the one ordering that must not happen.
-    if (s_rollback_timer != NULL) {
-        xTimerStop(s_rollback_timer, portMAX_DELAY);
-        xTimerDelete(s_rollback_timer, portMAX_DELAY);
-        s_rollback_timer = NULL;
+    // Disarm first. Confirming the image and then leaving a watchdog running
+    // that would roll it back anyway is the one ordering that must not happen.
+    if (s_rollback_task != NULL) {
+        xTaskNotifyGive(s_rollback_task);
     }
 
     if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
