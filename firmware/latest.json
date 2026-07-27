@@ -1,5 +1,5 @@
 {
-  "version": "0.0.0-broken",
-  "url": "https://github.com/jxg81/bin-light/releases/download/v0.0.0-rollback-test/bin-light.bin",
-  "notes": "ROLLBACK TEST - deliberately broken, revert to 1.0.3 after."
+  "version": "1.0.3",
+  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.3/bin-light.bin",
+  "notes": "Exercises the OTA download path fixed in 1.0.2."
 }
