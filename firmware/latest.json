@@ -1,5 +1,5 @@
 {
-  "version": "1.0.6",
-  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.6/bin-light.bin",
-  "notes": "Rollback watchdog runs as its own task, off the timer service stack."
+  "version": "1.0.7",
+  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.7/bin-light.bin",
+  "notes": "OTA images must now come from this repo's releases; web UI hardened."
 }
