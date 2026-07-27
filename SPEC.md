@@ -800,11 +800,29 @@ If there is no earlier image to fall back to, the rollback call returns instead
 of rebooting; that is logged and the device carries on, rather than looping on
 a reboot that would change nothing.
 
-**Not host-tested**, and honestly so: the logic is three ESP-IDF calls and a
-FreeRTOS timer, with no decision worth stubbing out. What would actually be
-worth proving is a *hanging* image being recovered on hardware — the same
-deliberate-bad-build method as the crash test, but with Wi-Fi credentials that
-cannot succeed, and a ten-minute wait.
+**Not host-tested**, and deliberately so: the logic is three ESP-IDF calls and
+a wait, with no decision worth stubbing out. It was proven on hardware instead,
+which is the only place it means anything.
+
+**Verified 2026-07-27.** A build that forced its SSID to a non-existent network
+was installed, fell into AutoAP as intended, and *did not crash* — so nothing
+rebooted it and the bootloader never saw a reset. Ten minutes later:
+
+```
+E ota: this image never finished starting up after 10 minutes - rolling back
+I esp_ota_ops: Rollback to previously worked partition.
+```
+
+Unattended, no cable. The second line is ESP-IDF's own confirmation, not ours.
+
+The hang was injected **inside `wifi_manager_start()`**, which is what makes
+the result meaningful: it proves the watchdog was armed early enough. A hang
+faked anywhere after that call would have passed even with the watchdog armed
+too late — the exact mistake the design guards against.
+
+**Rollback is now proven for both failure modes**: crashing (§3.5.1 above) and
+hanging (here). Those were the two halves of the safety net that makes
+auto-update-by-default defensible.
 
 #### 3.5.0 ⚠️ Changes to the OTA path are validated one release late
 
@@ -2435,9 +2453,9 @@ three different things that are easy to conflate.
 | §3.5 OTA — automatic update (on by default) | ✅ | ✅ | ✅ **verified 2026-07-27** — the 1.0.3 install was the daily checker, not a button |
 | §3.5 `GET /update` (§6 bug 24) | ✅ | ✅ | ✅ **verified 2026-07-27** — 200, was 405 |
 | §3.5 OTA — rollback safety net (**crashing** image) | ✅ | ✅ | ✅ **verified 2026-07-27** — installed a deliberately-aborting build, device reverted itself to 1.0.3. Evidence below. |
-| §3.5 OTA — rollback watchdog: arm + disarm | ✅ | ✅ 1.0.4 | ⚠️ **exercised by 1.0.4's own boot** — confirm the two log lines in §3.5.0 |
-| §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog | ✅ 1.0.4 | ❌ **not tested** — the *firing* path. Needs a build that hangs rather than crashes, plus a 10-minute wait. See §3.5.1. |
-| §3.5 manual install restarts itself | ✅ | ✅ 1.0.4 | ❌ **not tested** — the *installing* firmware decides, so this needs a manual install performed **from** 1.0.4. See §3.5.0. |
+| §3.5 OTA — rollback watchdog: arm + disarm | ✅ | ✅ | ✅ **verified 2026-07-27** — armed on an unverified boot, cancelled on a healthy one |
+| §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog | ✅ | ✅ **verified 2026-07-27** — a build that hangs in AutoAP rather than crashing was rolled back after 10 min, unattended. See §3.5.1. |
+| §3.5 manual install restarts itself | ✅ | ✅ | ✅ **verified 2026-07-27** — an install performed *from* 1.0.4, per §3.5.0's one-release-late rule (owner report; the captured log covers the watchdog lines) |
 
 **Everything is written, flashed and — with the exceptions below — verified on
 hardware** (owner's reports, 2026-07-26 and 2026-07-27).
@@ -2463,8 +2481,8 @@ what makes automatic updates safe is rollback, and rollback is itself untested.
 wrong-password rejection at provisioning, and "forget this network" — were all
 cleared on 2026-07-27.
 
-**OTA delivers, end to end (2026-07-27).** The device went **1.0.2 → 1.0.3
-unattended**: the daily auto-checker found the manifest, followed GitHub's
+**OTA is fully proven, including rollback (2026-07-27).** The device went
+**1.0.2 → 1.0.3 unattended**: the daily auto-checker found the manifest, followed GitHub's
 signed redirect, pulled ~1.3 MB over TLS into the spare slot, flashed, rebooted
 and came back healthy. No cable, no button. That closes the §1.1 argument —
 a council-API break can now be fixed with a push instead of a house call.
@@ -2473,9 +2491,12 @@ Getting there took two fixes found by actually trying it (§6 bugs 23 and 24);
 neither was visible from reasoning about the code, and bug 23's own fix had to
 go on over USB because OTA could not deliver the fix for OTA.
 
-**Only rollback remains untested**, and it is the one that matters most: it is
-what makes automatic installation safe, and auto-update is on by default. See
-"▶ Agreed next step".
+**Rollback is verified in both directions** — a crashing image and a hanging
+one (§3.5.1). That was the last open question in the project, and it is what
+makes auto-update-on-by-default defensible rather than optimistic.
+
+**The watchdog needs 1.0.6 or later.** Earlier releases recover from a crash
+only; a hang would still sit there indefinitely.
 
 **⚠️ Never publish 1.0.0 or 1.0.1 in the manifest again.** Neither can perform
 an OTA, so a device that lands on one is stuck until someone visits it with a
@@ -2599,86 +2620,41 @@ presentation-layer data, and §3.13 needs a shared colour module anyway (for
 name→RGB mapping, since none of the bespoke council backends return colours) —
 so both should land together rather than moving the same code twice.
 
-### ▶ Agreed next step: prove the OTA round trip
+### ▶ Agreed next step: re-configure the device, then decide on distribution
 
-**§1.2 is met** — all five working-group councils verified on hardware.
-**Factory reset and AutoAP are now closed out too** (2026-07-27), including the
-captive portal. What remains is one substantial item and three cheap ones.
+**Everything specified is now implemented and verified on hardware.** §1.2 is
+met (all five working-group councils), AutoAP and the captive portal work,
+factory reset works from both entry points, and §3.5 OTA is proven end to end
+**including both halves of the rollback safety net** — a crashing image and a
+hanging one. That was the last open question, closed 2026-07-27.
 
-1. ~~**Flash.**~~ **Done 2026-07-26**, and again 2026-07-27 with the bug 21/22
-   fixes and the captive portal.
-2. ~~**Factory reset and AutoAP.**~~ **Done 2026-07-27** — see the status
-   table. Found and fixed §6 bugs 21 and 22 along the way.
-3. ~~**Prove the OTA round trip.**~~ **Done 2026-07-27** — 1.0.2 → 1.0.3
-   unattended. TLS chain, redirect, download, flash and reboot all confirmed.
-   Found §6 bugs 23 and 24 on the way.
+Immediate, and the only thing actually blocking normal use:
 
-5. **Prove rollback.** ← *the last untested thing in the project.* Everything
-   else about automatic updates is now verified, which makes this the only
-   remaining question — and the important one, because rollback is what makes
-   installing-without-asking safe.
+1. **Re-run `/api-setup` and set the timezone.** The factory-reset and rollback
+   testing wiped both — the boot log reads `no stored waste API config,
+   defaulting to disabled` and `using default TZ`. Until this is done the light
+   will not show anything. (That the timezone was cleared is itself the
+   confirmation, previously outstanding, that a factory reset really does clear
+   the separate `binlight_cfg` namespace.)
+2. **Turn auto-update back on** if it is still off from the rollback test.
+3. **Take 1.0.6.** The device may still be on 1.0.4, whose watchdog is the
+   timer version. 1.0.6 is what makes the hang case recoverable.
 
-   `ota_mark_valid()` runs at the end of `app_main()`, after Wi-Fi is up and
-   the web server is serving. An image that never gets that far stays
-   `ESP_OTA_IMG_PENDING_VERIFY`, and the bootloader reverts to the previous
-   slot on the next boot (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`).
-
-   **Turn auto-update OFF in Preferences before starting.** The manifest will
-   be pointing at a deliberately broken build; with auto-update on, the device
-   would roll back and then immediately fetch the bad image again, forever.
-   This is a real property of "difference, not ordering" versioning, not a
-   quirk of the test.
-
-   Sequence:
-   1. Auto-update **off** on the device.
-   2. Publish a build that cannot reach `ota_mark_valid()` — e.g. an
-      `abort()` early in `app_main()`, or one whose Wi-Fi credentials are
-      guaranteed to fail. Tag it clearly (`v0.0.0-rollback-test`).
-   3. Install it **manually** from the Firmware page.
-   4. Watch the serial log: it should install, reboot into the broken image,
-      fail to validate, and on the following boot come back as the *previous*
-      version with no intervention.
-   5. Repoint `latest.json` at the good release, then turn auto-update back
-      on. **Delete the broken release** so it can never be selected again.
-
-   Also grep the built `.bin` for credentials before any release — §6 bug 21.
-
-4. ~~**Three cheap gaps.**~~ **Done 2026-07-27** — reset button 10s hold
-   (and ~5s release restarting instead of wiping), wrong-password rejection,
-   and "forget this network".
-
-   One thing still worth a glance on the next factory reset: confirm the
-   **timezone** is gone too. It lives in the separate `binlight_cfg`
-   namespace, which is handled, but a device claiming to be factory-fresh
-   while still in Australia/Melbourne would be the tell that it isn't.
-
-#### ⚠️ OTA is blocked on repository visibility — read before attempting it
-
-The manifest URL is
-`https://raw.githubusercontent.com/jxg81/bin-light/main/firmware/latest.json`
-and the repo is **private**. An unauthenticated fetch returns **404**
-(verified 2026-07-27), and the device is unauthenticated — it sends no token
-and has nowhere to keep one. The Release *asset* URL has the same problem.
-
-So OTA cannot be tested, and would not work in the field, until both the
-manifest and the image are fetchable anonymously. Publishing a release into
-the private repo changes nothing. Three ways out:
-
-**Resolved 2026-07-27: the repo was made public**, after the working tree was
-cleaned of the "(home)" annotation and the real example address (see
-"Repository and history"). The alternatives considered and not taken were a
-separate public firmware-only repo, or another anonymous static host — both
-rejected as more moving parts than publishing a repo that was going public
-anyway.
-
-After that, in priority order:
+Then, in priority order:
 
 1. **§3.14 battery life** — design recorded, not started. Gated on the four
    current measurements in §3.14.5, the most important being what the board
    draws with Wi-Fi connected and idle. No new hardware, no rewiring.
 2. **§3.13.2 South Australia** (46 councils) — the last coverage win, gated on
    its lat/lon UX question. Zero value to the working group.
-3. **Make the repo public**, if still wanted (see "Repository and history").
+3. **§5 final yellow calibration**, in the printed enclosure.
+4. **The WS2812B-V5 LED swap** (§5), if the assembly cost is acceptable.
+
+**Distribution is no longer gated on firmware.** The two things §1.1 named as
+prerequisites for handing a device to someone else — runtime provisioning and
+OTA — both work, and OTA is safe to leave on by default now that rollback is
+proven in both directions. What remains before giving one away is physical:
+enclosure, assembly, and the colour calibration that depends on both.
 
 ### Open questions not yet resolved
 

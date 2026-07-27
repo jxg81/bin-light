@@ -84,8 +84,9 @@ rollback is decided at boot and a hang never produces the necessary reset. From
 rolls itself back. So a release that breaks the network path recovers on its
 own too — it just takes ten minutes rather than seconds.
 
-> Verified for crashes on hardware. **The hang path is not yet verified** —
-> see SPEC.md §3.5.1.
+> Both paths verified on hardware — a crashing image and a hanging one — see
+> SPEC.md §3.5.1. **The watchdog needs 1.0.6 or later**; earlier releases
+> recover from crashes only.
 
 ## Security note
 
