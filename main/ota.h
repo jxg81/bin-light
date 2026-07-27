@@ -52,7 +52,20 @@ typedef enum {
 // Starts an update in a background task and returns immediately - the image
 // is ~1.3MB over TLS, far too slow to hold an HTTP response open for. Poll
 // ota_get_state() to follow it. Refuses to start if one is already running.
-esp_err_t ota_start(const char *url);
+//
+// `restart_when_done` decides what happens after a successful flash, and the
+// two callers want opposite things:
+//
+//   true  - manual install from the web UI. Someone pressed a button and is
+//           watching. Flashing and then sitting on the old firmware until they
+//           find a second button reads as "nothing happened" - which is
+//           precisely how it read the first time this was exercised on
+//           hardware, to the point of the update being installed twice.
+//   false - the automatic updater, which restarts on its own terms: it waits
+//           for schedule_light_is_on() to go false so an update never
+//           interrupts a bin-night display. Nobody is watching, so a few
+//           hours' delay costs nothing and a badly-timed reboot does.
+esp_err_t ota_start(const char *url, bool restart_when_done);
 
 ota_state_t ota_get_state(void);
 

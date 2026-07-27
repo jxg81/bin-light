@@ -68,8 +68,15 @@ physical access to.
 
 There is also an automatic safety net: a freshly-flashed image is marked
 valid only once it has booted, joined Wi-Fi and started serving. An update
-that breaks any of that gets rolled back by the bootloader on the next
-restart, without anyone touching the device.
+that **crashes** therefore reboots, and the bootloader reverts it with nobody
+touching the device. Verified on hardware — see SPEC.md §3.5.1.
+
+> **⚠️ It does not cover an image that hangs.** Rollback is decided at boot, so
+> it needs a reset to happen. A release that boots but never reaches
+> `ota_mark_valid()` — say it can't rejoin Wi-Fi, so it waits in AutoAP — never
+> reboots, so nothing ever triggers the revert. It will sit there until someone
+> power-cycles it. SPEC.md §3.5.1 proposes a watchdog to close this; until that
+> exists, **a release that breaks the network path is still a house call.**
 
 ## Security note
 

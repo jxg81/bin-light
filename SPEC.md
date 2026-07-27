@@ -728,6 +728,66 @@ for the council APIs may also be load-bearing for OTA.
 and the first flash of this build is also the first test of the new partition
 table.
 
+#### 3.5.1 Rollback: verified for crashes, and a gap that is not fixed
+
+**Verified 2026-07-27** by installing a build that `abort()`s early in
+`app_main()`, before `ota_mark_valid()`. Reading the evidence out of the serial
+log, because the interesting parts are easy to miss:
+
+- `esp_https_ota: Writing to <ota_0> partition at offset 0x20000` — the broken
+  image went into slot **ota_0**.
+- After the restart: `rst:0xc (SW_CPU)`, `Saved PC: software_reset_cpu` — a
+  **software** reset, i.e. the panic rebooting the device. Not a power-on.
+- `boot: Loaded app from partition at offset 0x210000` → **ota_1**, and
+  `App version: 1.0.3`.
+
+Different slot, previous version, after a software reset: that is the
+bootloader reverting a still-`PENDING_VERIFY` image. The panic output itself is
+absent from the capture only because the USB monitor was reconnecting at the
+time.
+
+**The gap.** Bootloader rollback is evaluated *at boot*, so it needs a reset to
+happen at all. That splits bad releases in two:
+
+| Bad image | Reboots itself? | Recovers? |
+|---|---|---|
+| Crashes / panics (tested above) | yes | ✅ automatic |
+| Boots, but never reaches `ota_mark_valid()` — e.g. can't join Wi-Fi, so `wifi_manager_start()` blocks in AutoAP forever | **no** | ❌ **sits there indefinitely** |
+
+The second is the *more likely* real-world break — a change that damages the
+network path rather than crashing outright — and it is the one that costs a
+house call. [firmware/README.md](firmware/README.md) previously claimed such an
+update "gets rolled back by the bootloader on the next restart, without anyone
+touching the device"; that is only true if a next restart ever comes.
+
+**Proposed fix, not yet built: a pending-verify watchdog.** At boot, if
+`esp_ota_get_state_partition()` reports `ESP_OTA_IMG_PENDING_VERIFY`, arm a
+one-shot timer (~10 min). If `ota_mark_valid()` hasn't run by the time it
+fires, call `esp_restart()` — which supplies the reset the bootloader needs and
+turns the hang case into the crash case proven above. Small, self-contained,
+and it is the difference between "rollback works if the image crashes" and
+"rollback works".
+
+#### 3.5.2 Manual installs restart themselves (implemented, not yet flashed)
+
+The rollback test surfaced a UX fault worth recording because the symptom
+misleads. A manual install flashed the image and then **waited for a second
+button press**, while the page said "Update installed. Restart to run it."
+Nothing visibly happened, so the update was **installed twice** in the captured
+log before the device was power-cycled.
+
+`ota_start()` now takes `restart_when_done`, because the two callers genuinely
+want opposite things:
+
+- **Manual install → `true`.** Someone pressed a button and is watching. The
+  task reboots itself 4 seconds after the write completes — long enough for the
+  3-second page refresh to render "restarting now" once, so the user sees a
+  result rather than a dead connection. The Restart button stays as a fallback.
+- **Automatic updater → `false`.** It keeps its own restart, which waits for
+  `schedule_light_is_on()` to go false so an update never interrupts a
+  bin-night display. Nobody is watching, so delay is free and a badly-timed
+  reboot is not.
+
 ### 3.6 Alternating multi-week manual / fallback schedule (implemented)
 
 **Requirement**: the bin night (the evening bins go out — not the collection day
@@ -2306,7 +2366,9 @@ three different things that are easy to conflate.
 | §3.5 OTA — image download + install | ✅ | ✅ | ✅ **verified 2026-07-27** — 1.0.2 → 1.0.3 unattended: GitHub's signed redirect followed, ~1.3 MB pulled over TLS into the spare slot, flashed, rebooted, healthy. **No cable.** |
 | §3.5 OTA — automatic update (on by default) | ✅ | ✅ | ✅ **verified 2026-07-27** — the 1.0.3 install was the daily checker, not a button |
 | §3.5 `GET /update` (§6 bug 24) | ✅ | ✅ | ✅ **verified 2026-07-27** — 200, was 405 |
-| §3.5 OTA — rollback safety net | ✅ | ✅ | ❌ **not tested** — see the rollback plan in "▶ Agreed next step" |
+| §3.5 OTA — rollback safety net (**crashing** image) | ✅ | ✅ | ✅ **verified 2026-07-27** — installed a deliberately-aborting build, device reverted itself to 1.0.3. Evidence below. |
+| §3.5 OTA — rollback safety net (**hanging** image) | ✅ | ✅ | ⚠️ **cannot work as written** — no reset means no rollback. See §3.5.1. |
+| §3.5 manual install restarts itself | ✅ | ❌ **not flashed** | ❌ — behaviour changed after the rollback test |
 
 **Everything is written, flashed and — with the exceptions below — verified on
 hardware** (owner's reports, 2026-07-26 and 2026-07-27).

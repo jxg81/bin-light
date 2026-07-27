@@ -848,7 +848,7 @@ static esp_err_t update_post_handler(httpd_req_t *req)
         char url[256] = "";
         if (httpd_query_key_value(body, "url", url, sizeof(url)) == ESP_OK) {
             url_decode_inplace(url);
-            ota_start(url);
+            ota_start(url, true); // manual install: the user is here, restart when done
         }
     }
     bool show_progress = installing || (strcmp(action, "status") == 0) ||
@@ -879,9 +879,13 @@ static esp_err_t update_post_handler(httpd_req_t *req)
                 "the download.</p>", ota_get_message());
         } else if (state == OTA_STATE_SUCCESS) {
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "<p><b>Update installed.</b></p>"
-                "<p>Restart to run it. If the new firmware can't get back onto Wi-Fi, the "
-                "light automatically rolls back to this version on the reboot after that.</p>"
+                "<meta http-equiv='refresh' content='15'>"
+                "<p><b>Update installed &mdash; the light is restarting now.</b></p>"
+                "<p class='note'>It will be back in a few seconds. If the new firmware "
+                "can't get onto Wi-Fi, the light rolls itself back to the current version "
+                "on the reboot after that.</p>"
+                "<p class='note'>Nothing happening? Use the button &mdash; the restart is "
+                "automatic, but this is here in case it doesn't take.</p>"
                 "<form method='POST' action='/reboot'>"
                 "<button type='submit'>Restart now</button></form>");
         } else {

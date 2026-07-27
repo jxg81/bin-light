@@ -28,6 +28,9 @@ static SemaphoreHandle_t s_mutex;
 static ota_state_t s_state = OTA_STATE_IDLE;
 static char s_message[96] = "";
 static char s_pending_url[256];
+// Whether the flashing task reboots itself once the image is written. Set per
+// call by ota_start(); see the two callers' opposite needs in ota.h.
+static bool s_restart_when_done;
 
 static void set_state(ota_state_t state, const char *fmt, ...)
 {
@@ -248,11 +251,24 @@ static void ota_task_fn(void *arg)
     }
 
     ESP_LOGW(TAG, "OTA complete - the new image boots on next restart");
+
+    if (s_restart_when_done) {
+        // Someone is watching this happen, so finish the job rather than
+        // leaving them to find a second button. The delay is for the browser,
+        // not the flash: the page polls every 3s, and rebooting the instant
+        // the write finishes means the "installed" state is never once
+        // rendered and the user sees only a dead connection.
+        set_state(OTA_STATE_SUCCESS, "installed - restarting now");
+        ESP_LOGW(TAG, "restarting into the new firmware");
+        vTaskDelay(pdMS_TO_TICKS(4000));
+        esp_restart();
+    }
+
     set_state(OTA_STATE_SUCCESS, "installed - restart to run it");
     vTaskDelete(NULL);
 }
 
-esp_err_t ota_start(const char *url)
+esp_err_t ota_start(const char *url, bool restart_when_done)
 {
     if (s_mutex == NULL) {
         s_mutex = xSemaphoreCreateMutex();
@@ -268,6 +284,7 @@ esp_err_t ota_start(const char *url)
     }
 
     snprintf(s_pending_url, sizeof(s_pending_url), "%s", url);
+    s_restart_when_done = restart_when_done;
     set_state(OTA_STATE_RUNNING, "starting");
 
     // Generous stack: TLS plus the OTA machinery on one task.
@@ -347,7 +364,9 @@ static void auto_task_fn(void *arg)
             ota_manifest_t m;
             if (ota_check(&m) == ESP_OK && m.available) {
                 ESP_LOGW(TAG, "auto-update: installing %s", m.version);
-                if (ota_start(m.url) == ESP_OK) {
+                // false: this path does its own restart below, once the
+                // light is off, so it must not be pre-empted here.
+                if (ota_start(m.url, false) == ESP_OK) {
                     while (ota_get_state() == OTA_STATE_RUNNING) {
                         vTaskDelay(pdMS_TO_TICKS(2000));
                     }
