@@ -193,6 +193,23 @@ if [ "$1" = "render" ]; then
     done
 
     echo
+    echo "== provisioning page budget =="
+    # The AutoAP page is still not rendered by this harness (it needs wifi/
+    # netif/event stubs the cc-only build does not have), so assert the
+    # invariant that keeps it safe instead: the scanned-network list is capped
+    # well below the buffer, leaving room for the form and the Connect button
+    # that MUST always render. A device whose setup page truncates cannot be
+    # provisioned at all, silently.
+    prov_buf=$(sed -n 's/^#define PROV_HTML_BUF  *\([0-9]*\).*/\1/p' $MAIN/wifi_manager.c)
+    prov_reserve=$(sed -n 's/^#define PROV_SCAN_BUDGET (PROV_HTML_BUF - \([0-9]*\)).*/\1/p' $MAIN/wifi_manager.c)
+    if [ -n "$prov_buf" ] && [ -n "$prov_reserve" ] && [ "$prov_reserve" -ge 1536 ]; then
+        echo "PASS scan list capped at $((prov_buf - prov_reserve))B of ${prov_buf}B, ${prov_reserve}B reserved for the form"
+    else
+        echo "FAIL provisioning page reserve is ${prov_reserve:-unset}B - too little for the form and Connect button"
+        status=1
+    fi
+
+    echo
     echo "== cross-origin guard coverage =="
     # render_page --origin-check proves the guard WORKS on the handlers it
     # drives. This proves it is still PRESENT on all of them. The guard is a

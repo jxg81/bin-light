@@ -38,6 +38,10 @@ static const char *TAG = "wifi_manager";
 #define SCAN_MAX_RECORDS 20
 #define SCAN_MAX_SHOWN   15
 #define PROV_HTML_BUF    6144
+// How much of PROV_HTML_BUF the scanned-network list may consume. The rest is
+// reserved for the form, the instructions and the closing markup, which must
+// always render - see the note in prov_root_get_handler().
+#define PROV_SCAN_BUDGET (PROV_HTML_BUF - 2048)
 #define PROV_BODY_MAX    256
 
 // Persisted Wi-Fi credentials (SPEC.md 3.4). Kconfig's compiled-in pair is
@@ -255,6 +259,8 @@ static int prov_page_head(char *buf, size_t size, int off)
         ".note{color:#888;}"
         "input[type=text],input[type=password],select{width:100%%;max-width:20em;}"
         "p.field label{display:block;margin-bottom:.2em;}"
+        "button{font:inherit;padding:.6em 1em;}"
+        "ol{padding-left:1.3em;}"
         "</style></head><body><h1>Bin Light Setup</h1>");
 }
 
@@ -279,13 +285,31 @@ static esp_err_t prov_root_get_handler(httpd_req_t *req)
 
     int off = prov_page_head(html, PROV_HTML_BUF, 0);
     off = prov_append(html, PROV_HTML_BUF, off,
-        "<p>Connect this bin light to your home Wi-Fi. Pick your network, enter "
-        "its password, and press Connect.</p>"
+        "<p class='note'>Step 1 of 3</p>"
+        "<p>Let&rsquo;s get the light onto your Wi-Fi. Pick your network below and enter "
+        "its password.</p>"
+        "<p class='note'>Then you&rsquo;ll tell it which council you&rsquo;re in, and which "
+        "colour means which bin.</p>"
         "<form method='POST' action='/provision'>"
         "<p class='field'><label for='ssid'>Network</label><select name='ssid' id='ssid'>");
 
     // Dedupe by SSID, strongest first, skipping hidden (empty) SSIDs.
+    //
+    // Bounded by BYTES, not just by count, and that distinction is load-bearing.
+    // An SSID is 32 bytes of arbitrary data and prov_escape() expands '"' to
+    // &quot; - 6 bytes out per byte in - so one <option> can cost
+    // 2 * 192 + 26 = 410 bytes. Fifteen of those is 6150 bytes, which exceeds
+    // this whole buffer before any of the page's own ~1KB of form markup.
+    // prov_append() clamps silently, so the page would truncate mid-<option>
+    // and lose the password field and the Connect button: a device that cannot
+    // be provisioned at all, with no error and no console to find out why.
+    //
+    // Ordinary SSIDs cost ~40 bytes and nothing like this has been seen in the
+    // wild, but the failure is silent, unrecoverable and lands on the very
+    // first thing a new owner does. So stop at a byte budget that leaves the
+    // rest of the page room, and say so if anything was left out.
     int shown = 0;
+    int dropped = 0;
     for (int i = 0; i < n_records && shown < SCAN_MAX_SHOWN; i++) {
         const char *ssid = (const char *)records[i].ssid;
         if (ssid[0] == '\0') {
@@ -303,10 +327,18 @@ static esp_err_t prov_root_get_handler(httpd_req_t *req)
         }
         char esc[33 * 6];
         prov_escape(ssid, esc, sizeof(esc));
+        if (off + (int)(2 * strlen(esc)) + 32 > PROV_SCAN_BUDGET) {
+            dropped++;
+            continue;
+        }
         off = prov_append(html, PROV_HTML_BUF, off, "<option value='%s'>%s</option>", esc, esc);
         shown++;
     }
     free(records);
+    if (dropped > 0) {
+        ESP_LOGW(TAG, "scan list truncated: %d network(s) left out to stay inside the page buffer",
+                 dropped);
+    }
 
     off = prov_append(html, PROV_HTML_BUF, off,
         "<option value=''>Other (type below)&hellip;</option></select></p>"
@@ -317,8 +349,9 @@ static esp_err_t prov_root_get_handler(httpd_req_t *req)
         "<p class='note'>Leave the password empty only if your network has none.</p>"
         "<p><button type='submit'>Connect</button></p>"
         "</form>"
-        "<p class='note'>Networks found: %d. Reload this page to scan again.</p>"
-        "</body></html>", shown);
+        "<p class='note'>Can&rsquo;t see your network? Reload this page to look again.</p>"
+        "</body></html>");
+    (void)shown;
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, off);
@@ -397,12 +430,33 @@ static esp_err_t prov_provision_post_handler(httpd_req_t *req)
         save_creds(&creds);
         s_creds = creds;
         s_have_creds = true;
+        // The riskiest moment in the whole product. run_autoap() tears the AP
+        // down AUTOAP_LINGER_MS after this renders, so this page is the last
+        // thing the device can say before it is unreachable - and what happens
+        // next depends entirely on the user understanding, unprompted, that
+        // their PHONE has to move back to their own network. Nothing on screen
+        // can help them once the AP is gone. Hence a numbered step with a
+        // recovery path, rather than a paragraph.
+        //
+        // No IP fallback is offered because there isn't an honest one: the
+        // device does not know its address on the home network at render time.
         off = prov_append(html, PROV_HTML_BUF, off,
-            "<p><b>Connected to %s.</b></p>"
-            "<p>This setup network will now disappear and the light will carry on "
-            "with its normal job. Reconnect your phone to your own Wi-Fi, then find "
-            "the light at <b>http://binlight.local</b> to set up its schedule.</p>"
-            "</body></html>", esc_ssid);
+            "<p class='note'>Step 2 of 3</p>"
+            "<p><b>Connected to %s.</b> The light is on your Wi-Fi now.</p>"
+            "<p><b>Now switch your phone back.</b></p>"
+            "<p>In a few seconds this setup network will disappear. When it does:</p>"
+            "<ol>"
+            "<li>Open your phone&rsquo;s Wi-Fi settings.</li>"
+            "<li>Join <b>%s</b> again &mdash; the network you just chose.</li>"
+            "<li>Come back and open <b>http://binlight.local</b></li>"
+            "</ol>"
+            "<p class='note'>Some phones do step 2 by themselves. Check anyway &mdash; if your "
+            "phone stays on the setup network or drops to mobile data, the address "
+            "won&rsquo;t open.</p>"
+            "<p class='note'>If <b>binlight.local</b> doesn&rsquo;t open, the light is still "
+            "fine. Look for it in your router&rsquo;s list of connected devices, or turn it "
+            "off and on and watch for the white breathing to stop.</p>"
+            "</body></html>", esc_ssid, esc_ssid);
         httpd_resp_set_type(req, "text/html");
         httpd_resp_send(req, html, off);
         free(html);
