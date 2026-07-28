@@ -15,13 +15,33 @@
 static schedule_t s_sched;
 static waste_api_config_t s_api;
 static char s_tz[64] = "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+// Status-card state. Defaults to a known collection with the clock synced -
+// the ordinary case - so each render mode only overrides what it is testing.
+bool stub_clock_ok = true;
+bool stub_light_on = false;
+schedule_next_t stub_next;
 
 schedule_t schedule_get(void) { return s_sched; }
 esp_err_t schedule_set(const schedule_t *n) { s_sched = *n; return ESP_OK; }
 void schedule_task_force_check(void) {}
 void schedule_test_trigger(void) {}
+bool schedule_light_is_on(void) { return stub_light_on; }
+schedule_next_t schedule_get_next_collection(void) { return stub_next; }
+bool time_sync_is_valid(void) { return stub_clock_ok; }
 const char *settings_get_tz(void) { return s_tz; }
 esp_err_t settings_set_tz(const char *tz) { snprintf(s_tz, sizeof(s_tz), "%s", tz); return ESP_OK; }
+// Mirrors settings.c's table. Stubbed rather than linked because settings.c
+// also owns the NVS-backed get/set stubbed above, and linking it would collide.
+// The mapping itself is covered by test_settings_tz.c.
+const char *settings_tz_for_state(const char *state)
+{
+    if (state == NULL) return NULL;
+    if (strcmp(state, "QLD") == 0) return "AEST-10";
+    if (strcmp(state, "WA") == 0) return "AWST-8";
+    if (strcmp(state, "NT") == 0) return "ACST-9:30";
+    if (strcmp(state, "SA") == 0) return "ACST-9:30ACDT,M10.1.0/2,M4.1.0/3";
+    return "AEST-10AEDT,M10.1.0/2,M4.1.0/3";
+}
 waste_api_config_t waste_api_get_config(void) { return s_api; }
 esp_err_t waste_api_set_config(const waste_api_config_t *c) { s_api = *c; return ESP_OK; }
 int waste_api_fetch_localities(const char *s, waste_api_locality_t *o, int m) { (void)s;(void)o;(void)m; return -1; }
@@ -287,6 +307,14 @@ int main(int argc, char **argv)
         if (strcmp(argv[1], "--update-available") == 0) stub_ota_update_available = true;
         if (strcmp(argv[1], "--update-progress") == 0)  stub_ota_state = OTA_STATE_RUNNING;
     }
+    stub_next.known = true;
+    stub_next.year = 2026; stub_next.month = 8; stub_next.day = 4;
+    stub_next.primary = preset_by_label("Yellow");
+    stub_next.secondary = preset_by_label("Green");
+
+    bool settings_page = (argc > 1 && strcmp(argv[1], "--settings") == 0);
+    if (argc > 1 && strcmp(argv[1], "--no-clock") == 0) stub_clock_ok = false;
+    if (argc > 1 && strcmp(argv[1], "--no-data") == 0) stub_next.known = false;
     bool reset_confirm = (argc > 1 && strcmp(argv[1], "--reset-confirm") == 0);
     bool api_test_page = false;
     if (argc > 1 && strncmp(argv[1], "--api-test", 10) == 0) {
@@ -329,6 +357,8 @@ int main(int argc, char **argv)
     } else if (reset_confirm) {
         req.content_len = 0;         // first POST: no confirm field
         factory_reset_post_handler(&req);
+    } else if (settings_page) {
+        settings_get_handler(&req);
     } else if (setup_page) {
         api_setup_get_handler(&req);
     } else if (api_test_page) {

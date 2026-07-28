@@ -132,6 +132,16 @@ echo
 "$OUT/test_captive_dns" 2>/dev/null || status=1
 
 echo
+echo "building test_settings_tz..."
+# settings.c is NVS-bound, so the function under test is compiled from a
+# carve-out rather than the whole module. See the note in the test.
+{ echo '#include <stddef.h>'; echo '#include <string.h>';
+  sed -n '/^const char \*settings_tz_for_state/,/^}/p' $MAIN/settings.c; } > "$OUT/tz_carveout.c"
+cc -o "$OUT/test_settings_tz" test_settings_tz.c "$OUT/tz_carveout.c" $MAIN/councils.c $CFLAGS
+echo
+"$OUT/test_settings_tz" 2>/dev/null || status=1
+
+echo
 echo "building test_backends..."
 # Compiles the real waste_api.c against captured council payloads (fixtures/).
 # cJSON comes straight from the managed component - same code as the device.
@@ -147,6 +157,11 @@ if [ "$1" = "render" ]; then
     cc -o "$OUT/render_page" render_page.c $MAIN/councils.c $CFLAGS
     "$OUT/render_page" ""        "$OUT/home-configured.html"
     "$OUT/render_page" --empty   "$OUT/home-unconfigured.html"
+    "$OUT/render_page" --no-clock "$OUT/home-no-clock.html"
+    "$OUT/render_page" --no-data  "$OUT/home-no-data.html"
+    "$OUT/render_page" --settings "$OUT/settings.html"
+    "$OUT/render_page" --api-test "$OUT/api-test.html"
+    "$OUT/render_page" --api-test-escaped "$OUT/api-test-worst-case-escaped.html"
     "$OUT/render_page" --max     "$OUT/home-worst-case.html"
     "$OUT/render_page" --max-escaped "$OUT/home-worst-case-escaped.html"
     "$OUT/render_page" --setup   "$OUT/api-setup.html"
@@ -169,12 +184,31 @@ if [ "$1" = "render" ]; then
     # are read from the source so they cannot drift from what ships.
     html_buf=$(sed -n 's/^#define HTML_BUF_SIZE  *\([0-9]*\).*/\1/p' $MAIN/web_server.c)
     setup_buf=$(sed -n 's/^#define SETUP_HTML_BUF_SIZE  *\([0-9]*\).*/\1/p' $MAIN/web_server.c)
-    for f in "$OUT"/home-*.html "$OUT"/update-*.html "$OUT"/factory-reset-*.html; do
+    for f in "$OUT"/home-*.html "$OUT"/settings.html "$OUT"/api-test*.html \
+             "$OUT"/update-*.html "$OUT"/factory-reset-*.html; do
         check_page "$f" "$html_buf" HTML_BUF_SIZE
     done
     for f in "$OUT"/api-setup*.html; do
         check_page "$f" "$setup_buf" SETUP_HTML_BUF_SIZE
     done
+
+    echo
+    echo "== cross-origin guard coverage =="
+    # render_page --origin-check proves the guard WORKS on the handlers it
+    # drives. This proves it is still PRESENT on all of them. The guard is a
+    # three-line prologue that a UI refactor deletes by accident, and deleting
+    # it produces no test failure and no log line - so count the call sites
+    # against the POST routes actually registered.
+    guards=$(grep -c 'if (reject_cross_origin(req))' $MAIN/web_server.c)
+    posts=$(grep -c '\.method = HTTP_POST,' $MAIN/web_server.c)
+    if [ "$guards" -eq "$posts" ]; then
+        echo "PASS $guards reject_cross_origin() call sites for $posts POST routes"
+    else
+        echo "FAIL $guards reject_cross_origin() call sites but $posts POST routes registered"
+        echo "     Every state-changing handler needs the guard as its first statement."
+        echo "     GET handlers must NOT have one - see SECURITY-REMEDIATION.md B2."
+        status=1
+    fi
 
     echo
     echo "== cross-origin gate =="

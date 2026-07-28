@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_http_server.h"
@@ -16,36 +17,37 @@
 #include "ota.h"
 #include "schedule.h"
 #include "settings.h"
+#include "time_sync.h"
 #include "waste_api.h"
 #include "wifi_manager.h"
 
 static const char *TAG = "web_server";
 
-// Sized against the home page, the largest of the three. Measured by
-// compiling root_get_handler() on the host against stubs and dumping the
-// bytes it emits:
+// Sized against the largest page this buffer serves. Measured by compiling the
+// handlers on the host against stubs and dumping the bytes they emit
+// (./test/host/run.sh render, which asserts these rather than printing them):
 //
-//   factory-fresh, nothing configured    8378
-//   realistic setup (3 event types)      9909
-//   worst case (8 event types, i.e.
-//     WASTE_API_MAX_TYPE_RULES, with
-//     long type names and address)      12092
-//   worst case with every escapable
-//     field full of "'" (5:1 expansion) 14592
+//   /settings, everything expanded        6639   <- the sizing case
+//   /api-test, 8 type rules + 12 events
+//     with every escapable field full
+//     of "'" (5:1 expansion)              5312
+//   /api-test, realistic                  3784
+//   /, worst case escaped                 1403
+//   /update, /factory-reset              <1400
 //
-// 16384 leaves ~1.8KB over that last figure - raised from 14336, which the
-// escaped worst case overflowed by 256 bytes once the strings printed into
-// this page started going through html_escape_attr(). Ordinary content does
-// not expand at all (addresses and type names contain nothing escapable), so
-// the realistic figures above are unchanged; the ceiling is what moved. Note
-// the fresh-device page alone is 8378 bytes: the original 7200 would have
-// truncated on any real configuration. `./test/host/run.sh render` reprints
-// and now asserts these figures, so re-check them after touching this page.
+// 10240 leaves ~3.6KB over the sizing case. Lowered from 16384: the home page
+// used to carry the colour-mapping table and the whole settings form, and its
+// escaped worst case was 14592 bytes on its own. Splitting /settings out and
+// moving the mapping to /api-test - the page it is actually about - took the
+// largest consumer down by well over half, and the stylesheet moving to
+// /s.css took another ~400 bytes off every page. That is 6KB of heap returned
+// at every render.
+//
 // Each handler also logs an error if it ever hits the ceiling, because
 // safe_append() truncates *silently* and a truncated page drops form fields -
 // which then read back as "absent"/unchecked on the next save, quietly
 // destroying config.
-#define HTML_BUF_SIZE   16384
+#define HTML_BUF_SIZE   10240
 #define SAVE_BODY_MAX   1024
 #define FIELD_BUF_SIZE  16
 #define API_TEST_LOOKAHEAD_DAYS 28
@@ -112,11 +114,11 @@ static const color_preset_t COLOR_PRESETS[] = {
 // Every page this module serves opens the same way. Kept as one literal with a
 // %s for the title so the boilerplate is stored once rather than seven times,
 // and so the stylesheet link can never drift between pages.
-#define PAGE_HEAD \
+#define PAGE_HEAD(title) \
     "<!DOCTYPE html><html><head><meta charset=utf-8>" \
     "<meta name=viewport content='width=device-width,initial-scale=1'>" \
     "<link rel=icon href=/favicon.ico type=image/svg+xml>" \
-    "<link rel=stylesheet href=/s.css><title>%s</title></head><body>"
+    "<link rel=stylesheet href=/s.css><title>" title "</title></head><body>"
 
 // The one stylesheet, served from its own URI (UI-SPEC.md 6.1) rather than
 // inlined into every page.
@@ -368,28 +370,17 @@ static schedule_color_t nearest_preset_color(schedule_color_t c)
 // entry, i.e. a yellow rule would appear to be set to Red. Nearest-match keeps
 // the UI truthful across palette changes, and re-saving snaps the stored value
 // onto the current palette.
-// form_id: NULL for the enclosing form (the usual case), or the id of a
-// different form this control belongs to (see append_type_mapping_rows).
-static int append_color_select_for(char *buf, size_t buf_size, int off, const char *field_name,
-                                    schedule_color_t current, const char *form_id)
+static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name,
+                                schedule_color_t current)
 {
     size_t selected_idx = nearest_preset_index(current);
-    if (form_id != NULL) {
-        off = safe_append(buf, buf_size, off, "<select form='%s' name='%s'>", form_id, field_name);
-    } else {
-        off = safe_append(buf, buf_size, off, "<select name='%s'>", field_name);
-    }
+    off = safe_append(buf, buf_size, off, "<select name='%s'>", field_name);
     for (size_t c = 0; c < COLOR_PRESET_COUNT; c++) {
         const color_preset_t *cp = &COLOR_PRESETS[c];
         off = safe_append(buf, buf_size, off, "<option value='#%02x%02x%02x' %s>%s</option>",
             cp->r, cp->g, cp->b, (c == selected_idx) ? "selected" : "", cp->label);
     }
     return safe_append(buf, buf_size, off, "</select>");
-}
-
-static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name, schedule_color_t current)
-{
-    return append_color_select_for(buf, buf_size, off, field_name, current, NULL);
 }
 
 // A colour swatch, named. Prints the *display* value of whichever preset is
@@ -446,12 +437,7 @@ static bool default_color_for_type(const char *event_type, schedule_color_t *out
     return false;
 }
 
-// Renders the already-saved type_rules as an editable form (posts to
-// POST /api-test, which handles saving for both this page and /api-test's own
-// discovery form). redirect_to controls where that POST sends the browser
-// back to, so editing from the home page stays on the home page. Renders
-// nothing if there's no mapping saved yet (e.g. API never configured, or the
-// auto-fetch at setup time found nothing).
+// Counts the type rules that are actually populated.
 static int count_type_rules(const waste_api_config_t *cfg)
 {
     int n = 0;
@@ -461,70 +447,6 @@ static int count_type_rules(const waste_api_config_t *cfg)
         }
     }
     return n;
-}
-
-// The colour-mapping controls posted to /api-test, rendered *inside* the home
-// page's /save form's DOM but belonging to a different form.
-//
-// HTML forms can't nest, and since 3.11 the mapping table lives inside the
-// collapsible "Bin collection API" block, which is itself inside the /save
-// form. The way out is HTML5's `form=` attribute: an empty
-// <form id='mapform' action='/api-test'> is emitted *before* the /save form
-// opens (see append_type_mapping_anchor), carrying the two hidden fields, and
-// every control below claims membership of it by id. No nesting, no
-// JavaScript, and the browser submits exactly the same body /api-test already
-// parses.
-static int append_type_mapping_anchor(char *buf, size_t buf_size, int off,
-                                       const waste_api_config_t *cfg, const char *redirect_to)
-{
-    int type_count = count_type_rules(cfg);
-    if (type_count == 0) {
-        return off;
-    }
-    return safe_append(buf, buf_size, off,
-        "<form id='mapform' method='POST' action='/api-test'>"
-        "<input type='hidden' name='type_count' value='%d'>"
-        "<input type='hidden' name='redirect_to' value='%s'>"
-        "</form>", type_count, redirect_to);
-}
-
-static int append_type_mapping_rows(char *buf, size_t buf_size, int off, const waste_api_config_t *cfg)
-{
-    if (count_type_rules(cfg) == 0) {
-        return off;
-    }
-
-    off = safe_append(buf, buf_size, off,
-        "<h3>Colour mapping</h3>"
-        "<table><tr><th>Type</th><th>Ignore</th><th>Colour</th></tr>");
-
-    int idx = 0;
-    for (int i = 0; i < WASTE_API_MAX_TYPE_RULES; i++) {
-        if (cfg->type_rules[i].event_type[0] == '\0') {
-            continue;
-        }
-        const waste_api_type_rule_t *r = &cfg->type_rules[i];
-        char name_field[16], ignored_field[16], color_field[16];
-        snprintf(name_field, sizeof(name_field), "type%d_name", idx);
-        snprintf(ignored_field, sizeof(ignored_field), "type%d_ignored", idx);
-        snprintf(color_field, sizeof(color_field), "type%d_color", idx);
-
-        // Third-party data (the council API names the types). Escaped once,
-        // used as both cell text and attribute value; the browser decodes the
-        // entities before submitting, so the stored value round-trips intact.
-        char esc_type[sizeof(r->event_type) * 6 + 1];
-        html_escape_attr(r->event_type, esc_type, sizeof(esc_type));
-
-        off = safe_append(buf, buf_size, off,
-            "<tr><td>%s<input type='hidden' form='mapform' name='%s' value='%s'></td>"
-            "<td><input type='checkbox' form='mapform' name='%s' %s></td><td>",
-            esc_type, name_field, esc_type, ignored_field, r->ignored ? "checked" : "");
-        off = append_color_select_for(buf, buf_size, off, color_field, r->color, "mapform");
-        off = safe_append(buf, buf_size, off, "</td></tr>");
-        idx++;
-    }
-    return safe_append(buf, buf_size, off,
-        "</table><p><button type='submit' form='mapform'>Save mapping</button></p>");
 }
 
 // The configured council's display name, whatever the backend. Bespoke
@@ -582,9 +504,186 @@ static const tz_preset_t *find_tz_preset(const char *tz)
     return NULL;
 }
 
+// Weekday of a calendar date, via the same noon-normalised mktime() round-trip
+// schedule.c uses for its own date arithmetic. Noon, so a DST shift in either
+// direction cannot tip the answer onto the neighbouring day.
+static int weekday_of(uint16_t y, uint8_t m, uint8_t d)
+{
+    struct tm t = {0};
+    t.tm_year = (int)y - 1900;
+    t.tm_mon = (int)m - 1;
+    t.tm_mday = (int)d;
+    t.tm_hour = 12;
+    t.tm_isdst = -1;
+    time_t tt = mktime(&t);
+    if (tt == (time_t)-1) {
+        return -1;
+    }
+    struct tm out;
+    localtime_r(&tt, &out);
+    return out.tm_wday;
+}
+
+// Whole days from today to a calendar date; negative if it has passed.
+// INT_MIN if the clock has not synced, since every answer needs today.
+#define DAYS_UNKNOWN (-100000)
+static int days_from_today(uint16_t y, uint8_t m, uint8_t d)
+{
+    time_t now = time(NULL);
+    struct tm tm_now;
+    localtime_r(&now, &tm_now);
+    struct tm a = {0}, b = {0};
+    a.tm_year = tm_now.tm_year; a.tm_mon = tm_now.tm_mon; a.tm_mday = tm_now.tm_mday;
+    a.tm_hour = 12; a.tm_isdst = -1;
+    b.tm_year = (int)y - 1900; b.tm_mon = (int)m - 1; b.tm_mday = (int)d;
+    b.tm_hour = 12; b.tm_isdst = -1;
+    time_t ta = mktime(&a), tb = mktime(&b);
+    if (ta == (time_t)-1 || tb == (time_t)-1) {
+        return DAYS_UNKNOWN;
+    }
+    return (int)((tb - ta) / 86400);
+}
+
+static const char *MONTH_NAME[12] = {"January", "February", "March", "April", "May", "June",
+                                      "July", "August", "September", "October", "November", "December"};
+
+// The status card: the one thing on the home page that answers the question
+// the user actually came with. Every branch here is read-only - it reports
+// state the schedule task already resolved, and performs no fetch.
+static int append_status_card(char *buf, size_t buf_size, int off,
+                               const waste_api_config_t *api_cfg, const schedule_t *s)
+{
+    bool configured = waste_api_config_complete(api_cfg) || s->enabled;
+
+    if (!configured) {
+        return safe_append(buf, buf_size, off,
+            "<div class='card'><p class='big'>Let&rsquo;s set your bins up</p>"
+            "<p>It takes about a minute. You&rsquo;ll need to know which council you&rsquo;re in.</p>"
+            "</div><p><a class='pri' href='/api-setup'>Set up my bins</a></p>");
+    }
+
+    // The clock has to be right before any date means anything. This state was
+    // previously invisible in the UI, and it is one of the two things that
+    // leave a freshly-reset light showing nothing at all (SPEC.md 4).
+    if (!time_sync_is_valid()) {
+        return safe_append(buf, buf_size, off,
+            "<div class='card'><p class='big'>Just getting started</p>"
+            "<p>The light is checking today&rsquo;s date. Give it a minute, then reload "
+            "this page.</p></div>");
+    }
+
+    schedule_next_t next = schedule_get_next_collection();
+    if (!next.known) {
+        char esc[WASTE_API_SUBDOMAIN_MAX_LEN * 6 + 1];
+        html_escape_attr(api_council_name(api_cfg), esc, sizeof(esc));
+        off = safe_append(buf, buf_size, off,
+            "<div class='card'><p class='big'>Nothing from %s yet</p>"
+            "<p>The light has asked %s for your collection days and hasn&rsquo;t heard back. "
+            "It keeps trying.</p></div>"
+            "<p><a class='pri' href='/api-test'>Check my bin days</a></p>"
+            "<p class='note'>Not working? You can "
+            "<a href='/settings#byhand'>set your bin days by hand</a> instead.</p>",
+            esc, esc);
+        return off;
+    }
+
+    int days = days_from_today(next.year, next.month, next.day);
+    const char *when = "Next collection";
+    if (days == 0) {
+        when = "Bins go out tonight";
+    } else if (days == 1) {
+        when = "Bins go out tomorrow night";
+    }
+
+    off = safe_append(buf, buf_size, off, "<div class='card'>");
+    if (schedule_light_is_on()) {
+        off = safe_append(buf, buf_size, off, "<p class='note'>The light is on now</p>");
+    }
+    int wd = weekday_of(next.year, next.month, next.day);
+    off = safe_append(buf, buf_size, off, "<p class='big'>%s</p><p class='note'>%s %u %s</p><p>",
+        when,
+        (wd >= 0 && wd < 7) ? WEEKDAY_LABEL[wd] : "",
+        (unsigned)next.day,
+        (next.month >= 1 && next.month <= 12) ? MONTH_NAME[next.month - 1] : "");
+    off = append_swatch(buf, buf_size, off, next.primary);
+    // Only name the second colour when it is genuinely a different one.
+    if (s->light_mode == LIGHT_MODE_DUAL_COLOUR &&
+        nearest_preset_index(next.secondary) != nearest_preset_index(next.primary)) {
+        off = safe_append(buf, buf_size, off, " ");
+        off = append_swatch(buf, buf_size, off, next.secondary);
+    }
+    off = safe_append(buf, buf_size, off, "</p>");
+
+    if (next.waste_only) {
+        off = safe_append(buf, buf_size, off,
+            "<p class='note'>General rubbish only &mdash; the light stays off for these "
+            "unless you&rsquo;ve asked for two colours.</p>");
+    }
+    char start_str[HHMM_BUF_SIZE];
+    minutes_to_hhmm(s->start_minute, start_str);
+    off = safe_append(buf, buf_size, off,
+        "<p class='note'>The light comes on the night before, from %s.</p></div>"
+        "<form method='POST' action='/test'>"
+        "<button type='submit' class='pri'>Show me the next colour</button></form>",
+        start_str);
+    return off;
+}
+
+// The home page. It answers one question - which bin goes out - and otherwise
+// gets out of the way. Everything that used to live here is now behind
+// /settings, which is what lets this page stay small enough to read at a bin
+// in the dark.
 static esp_err_t root_get_handler(httpd_req_t *req)
 {
     schedule_t s = schedule_get();
+    waste_api_config_t api_cfg = waste_api_get_config();
+
+    char *html = malloc(HTML_BUF_SIZE);
+    if (html == NULL) {
+        return ESP_ERR_NO_MEM;
+    }
+
+    int off = safe_append(html, HTML_BUF_SIZE, 0, PAGE_HEAD("Bin Light") "<h1>Bin Light</h1>");
+    off = append_status_card(html, HTML_BUF_SIZE, off, &api_cfg, &s);
+
+    off = safe_append(html, HTML_BUF_SIZE, off, "<nav class='nav'>");
+    if (waste_api_config_complete(&api_cfg)) {
+        off = safe_append(html, HTML_BUF_SIZE, off, "<a href='/api-test'>My bins</a>");
+    }
+    off = safe_append(html, HTML_BUF_SIZE, off, "<a href='/settings'>Settings</a></nav>");
+
+    if (waste_api_config_complete(&api_cfg)) {
+        char esc_council[WASTE_API_SUBDOMAIN_MAX_LEN * 6 + 1];
+        char esc_label[WASTE_API_LABEL_MAX_LEN * 6 + 1];
+        html_escape_attr(api_council_name(&api_cfg), esc_council, sizeof(esc_council));
+        html_escape_attr(api_cfg.property_label, esc_label, sizeof(esc_label));
+        off = safe_append(html, HTML_BUF_SIZE, off,
+            "<p class='note'>%s &middot; %s</p>", esc_council, esc_label);
+    }
+
+    off = safe_append(html, HTML_BUF_SIZE, off, "</body></html>");
+
+    if (off >= HTML_BUF_SIZE) {
+        ESP_LOGE(TAG, "home page truncated at %d bytes - raise HTML_BUF_SIZE", HTML_BUF_SIZE);
+    }
+
+    httpd_resp_set_type(req, "text/html");
+    httpd_resp_send(req, html, off);
+    free(html);
+    return ESP_OK;
+}
+
+// Settings: everything you rarely touch, grouped by what the user is trying
+// to achieve rather than by which module implements it.
+//
+// The whole schedule_t stays in ONE form, deliberately. save_post_handler()
+// rebuilds the struct from a single body and writes it wholesale, so any
+// field not present in the submitted form reads back as absent and is zeroed.
+// Splitting these controls across two pages would silently destroy config.
+static esp_err_t settings_get_handler(httpd_req_t *req)
+{
+    schedule_t s = schedule_get();
+    waste_api_config_t api_cfg = waste_api_get_config();
 
     char *html = malloc(HTML_BUF_SIZE);
     if (html == NULL) {
@@ -594,141 +693,74 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     char start_str[HHMM_BUF_SIZE];
     minutes_to_hhmm(s.start_minute, start_str);
 
-    waste_api_config_t api_cfg = waste_api_get_config();
-
-    int off = 0;
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Bin Light</title>"
-        "<style>"
-        "body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
-        "table{width:100%%;border-collapse:collapse;}"
-        "td,th{padding:.4em;text-align:left;border-bottom:1px solid #ccc;}"
-        "input[type=time],input[type=date]{width:9em;}"
-        "input[type=range]{width:8em;}"
-        "input[type=number]{width:4em;}"
-        ".note{color:#888;}"
-        // Progressive disclosure without JavaScript (SPEC.md 3.11): the
-        // section's own enable checkbox reveals its detail block via the
-        // sibling combinator. The .sect wrapper is load-bearing - a bare
-        // "input:checked ~ .details" would match *every* later .details on the
-        // page, so ticking the API box would also expand the manual schedule.
-        ".sect{margin:1.5em 0;}"
-        ".details{display:none;}"
-        ".sect input:checked ~ .details{display:block;}"
-        "</style></head><body>"
-        "<h1>Bin Light</h1>"
-        "<form method='POST' action='/test' style='margin:0 0 1em 0'>"
-        "<button type='submit'>Display Next Collection (30 seconds)</button></form>");
-
-    // Emitted before the /save form opens, because forms can't nest - see the
-    // comment on append_type_mapping_anchor().
-    off = append_type_mapping_anchor(html, HTML_BUF_SIZE, off, &api_cfg, "/");
-
-    off = safe_append(html, HTML_BUF_SIZE, off, "<form method='POST' action='/save'>");
-
-    // ---- Preferences: settings that apply whichever schedule is driving the
-    // light, so they sit above (and outside) both schedule sections.
     const char *current_tz = settings_get_tz();
     const tz_preset_t *current_preset = find_tz_preset(current_tz);
     char escaped_tz[SETTINGS_TZ_MAX_LEN * 6 + 1];
     html_escape_attr(current_tz, escaped_tz, sizeof(escaped_tz));
 
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<h2>Preferences</h2>"
-        "<table>"
-        "<tr><td>Brightness</td><td><input type='range' name='brightness' min='10' max='255' value='%u'></td></tr>"
-        "<tr><td>On from</td><td><input type='time' name='start' value='%s'></td></tr>"
-        "<tr><td>Turn off after</td><td><input type='number' name='duration_hours' min='1' max='23' value='%u'> hours</td></tr>"
-        "<tr><td colspan='2' class='note'>The light turns on at the chosen time on the night "
-        "before a collection, and stays on for the given number of hours (carrying past "
-        "midnight if needed).</td></tr>",
+    int off = safe_append(html, HTML_BUF_SIZE, 0,
+        PAGE_HEAD("Settings")
+        "<h1>Settings</h1>"
+        "<form method='POST' action='/save'>"
+        "<h2>When the light comes on</h2>"
+        "<p class='f'><label for='br'>Brightness</label>"
+        "<input type='range' id='br' name='brightness' min='10' max='255' value='%u'></p>"
+        "<p class='f'><label for='st'>Comes on at</label>"
+        "<input type='time' id='st' name='start' value='%s'></p>"
+        "<p class='f'><label for='du'>Stays on for</label>"
+        "<input type='number' id='du' name='duration_hours' min='1' max='23' value='%u'> hours</p>"
+        "<p class='note'>On the night before a collection. It can run past midnight.</p>",
         (unsigned)s.brightness, start_str, (unsigned)s.duration_hours);
 
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<tr><td>Light mode</td><td><select name='light_mode'>"
-        "<option value='%d' %s>Single colour (both LEDs match)</option>"
-        "<option value='%d' %s>Dual colour (second LED shows its own colour)</option>"
-        "</select></td></tr>",
+        "<h2>How the light shows colours</h2>"
+        "<p class='f'><label for='lm'>Colours</label><select id='lm' name='light_mode'>"
+        "<option value='%d' %s>Show one colour</option>"
+        "<option value='%d' %s>Show two colours</option></select></p>"
+        "<p class='f'><label for='sd'>Second light, ordinary week</label>",
         LIGHT_MODE_SINGLE_COLOUR, (s.light_mode == LIGHT_MODE_SINGLE_COLOUR) ? "selected" : "",
         LIGHT_MODE_DUAL_COLOUR, (s.light_mode == LIGHT_MODE_DUAL_COLOUR) ? "selected" : "");
-
-    off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Second LED default colour</td><td>");
     off = append_color_select(html, HTML_BUF_SIZE, off, "secondary_default_color", s.secondary_default_color);
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "</td></tr>"
-        "<tr><td colspan='2' class='note'>In dual colour mode, the second LED shows this "
-        "colour (general waste, by default red) unless the schedule finds two distinct bin "
-        "types due the same night, in which case it shows the second one instead.</td></tr>");
+        "</p><p class='note'>With two colours, the second light shows general rubbish "
+        "unless two different bins are due the same night.</p>");
 
-    off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Timezone</td><td><select name='tz'>");
-    for (size_t i = 0; i < TZ_PRESET_COUNT; i++) {
-        off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%s' %s>%s</option>",
-            TZ_PRESETS[i].tz, (&TZ_PRESETS[i] == current_preset) ? "selected" : "", TZ_PRESETS[i].label);
-    }
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<option value='custom' %s>Custom&hellip;</option></select></td></tr>"
-        "<tr><td>Custom TZ</td><td><input type='text' name='tz_custom' size='24' value='%s'></td></tr>"
-        "<tr><td colspan='2' class='note'>The custom POSIX TZ string is used only when "
-        "\"Custom&hellip;\" is selected above.</td></tr>"
-        "</table>",
-        current_preset == NULL ? "selected" : "", escaped_tz);
-
-    // ---- Bin collection API (collapsed until enabled)
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<div class='sect'><h2>Bin collection API</h2>"
-        "<input type='checkbox' id='api_en' name='api_enabled' %s>"
-        "<label for='api_en'> Use automatic bin collection API</label>"
-        "<div class='details'>"
-        "<p class='note'>When enabled and reachable, the API is authoritative: it overrides "
-        "the manual / fallback schedule entirely, including turning the light off on weeks "
-        "it reports nothing due.</p>",
-        api_cfg.enabled ? "checked" : "");
-
+    // ---- Your bin days
+    off = safe_append(html, HTML_BUF_SIZE, off, "<h2>Your bin days</h2><div class='sect'>");
     if (waste_api_config_complete(&api_cfg)) {
-        // Both strings are attacker-influenceable: the label arrives via the
-        // setup wizard's ?label= query parameter, and the council name falls
-        // back to the raw typed subdomain for unlisted councils.
         char esc_council[WASTE_API_SUBDOMAIN_MAX_LEN * 6 + 1];
         char esc_label[WASTE_API_LABEL_MAX_LEN * 6 + 1];
         html_escape_attr(api_council_name(&api_cfg), esc_council, sizeof(esc_council));
         html_escape_attr(api_cfg.property_label, esc_label, sizeof(esc_label));
-        off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>Configured: <b>%s</b><br>%s</p>", esc_council, esc_label);
+        off = safe_append(html, HTML_BUF_SIZE, off, "<p><b>%s</b><br>%s</p>", esc_council, esc_label);
     } else {
-        off = safe_append(html, HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
+        off = safe_append(html, HTML_BUF_SIZE, off,
+            "<p>Not set up yet. <a href='/api-setup'>Set up my bins</a></p>");
     }
-
-    // Rendered from the saved config directly, no live fetch, so the home page
-    // stays fast. /api-setup auto-populates this at setup time; /api-test can
-    // (re)discover new types via a live fetch.
-    off = append_type_mapping_rows(html, HTML_BUF_SIZE, off, &api_cfg);
-
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<p><a href='/api-setup'>Change council / address</a>"
-        " &middot; <a href='/api-test'>Test API (show upcoming weeks)</a></p>"
-        "</div></div>");
+        "<p><label><input type='checkbox' id='ae' name='api_enabled' %s> "
+        "Get bin days from my council</label></p>"
+        "<p><a href='/api-setup'>Change council or address</a> &middot; "
+        "<a href='/api-test'>My bins</a></p></div>",
+        api_cfg.enabled ? "checked" : "");
 
-    // ---- Manual / fallback schedule (collapsed until enabled)
+    // ---- Set bin days by hand. The id is what makes /settings#byhand reveal
+    // this section on arrival (see .sect:target in the stylesheet).
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<div class='sect'><h2>Manual / Fallback Schedule</h2>"
-        "<input type='checkbox' id='man_en' name='enabled' %s>"
-        "<label for='man_en'> Use manual / fallback schedule</label>"
+        "<h2>Set bin days by hand</h2>"
+        "<div class='sect' id='byhand'>"
+        "<p class='note'>A backup for when your council&rsquo;s days aren&rsquo;t available. "
+        "While your council&rsquo;s days are working, nothing here is used.</p>"
+        "<p><label><input type='checkbox' id='me' name='enabled' %s> "
+        "Set bin days by hand</label></p>"
         "<div class='details'>"
-        "<p class='note'>Optional. This is only used when the API above is switched off or "
-        "not configured, or when it can't be reached and the last collection date it gave "
-        "us has already passed. If the API is working, nothing here has any effect.</p>"
-        "<table>",
+        "<p class='f'><label for='bn'>Bin night</label><select id='bn' name='bin_night_weekday'>",
         s.enabled ? "checked" : "");
-
-    off = safe_append(html, HTML_BUF_SIZE, off, "<tr><td>Bin night</td><td><select name='bin_night_weekday'>");
     for (int i = 0; i < 7; i++) {
         off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%d' %s>%s</option>",
             i, (i == s.bin_night_weekday) ? "selected" : "", WEEKDAY_LABEL[i]);
     }
-    off = safe_append(html, HTML_BUF_SIZE, off, "</select></td></tr>");
+    off = safe_append(html, HTML_BUF_SIZE, off, "</select></p>");
 
     for (int i = 0; i < SCHEDULE_MAX_COLOR_RULES; i++) {
         const schedule_color_rule_t *r = &s.rules[i];
@@ -737,97 +769,72 @@ static esp_err_t root_get_handler(httpd_req_t *req)
         snprintf(color_field, sizeof(color_field), "%s_color", prefix);
 
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "<tr><td colspan='2'><b>Colour %d</b></td></tr>"
-            "<tr><td>Enabled</td><td><input type='checkbox' name='%s_enabled' %s></td></tr>"
-            "<tr><td>Colour</td><td>",
+            "<h3>Colour %d</h3>"
+            "<p class='f'><label><input type='checkbox' name='%s_enabled' %s> Use this colour</label></p>"
+            "<p class='f'><label>Colour</label>",
             i + 1, prefix, r->enabled ? "checked" : "");
         off = append_color_select(html, HTML_BUF_SIZE, off, color_field, r->color);
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "</td></tr>"
-            "<tr><td>First collection</td><td><input type='date' name='%s_first_date' value='%04u-%02u-%02u'></td></tr>"
-            "<tr><td>Every</td><td><select name='%s_frequency'>",
+            "</p><p class='f'><label>First collection</label>"
+            "<input type='date' name='%s_first_date' value='%04u-%02u-%02u'></p>"
+            "<p class='f'><label>Repeats every</label><select name='%s_frequency'>",
             prefix, (unsigned)r->first_year, (unsigned)r->first_month, (unsigned)r->first_day, prefix);
         for (int f = 1; f <= 4; f++) {
             off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%d' %s>%d week%s</option>",
                 f, (f == r->frequency_weeks) ? "selected" : "", f, f == 1 ? "" : "s");
         }
-        off = safe_append(html, HTML_BUF_SIZE, off, "</select></td></tr>");
+        off = safe_append(html, HTML_BUF_SIZE, off, "</select></p>");
     }
 
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "</table>"
-        "<h3>How the colour rules work</h3>"
-        "<p>Each colour has its own independent cycle: its first collection date "
-        "and how often it repeats (every 1-4 weeks) &mdash; these don't need to "
-        "match between colours. If more than one colour is due the same week, "
-        "Colour 1 takes priority, then Colour 2, then Colour 3.</p>"
-        "<p class='note'>Example: Yellow first collected 6 Jul 2026, every "
-        "2 weeks. Green first collected 13 Jul 2026, every 3 weeks:</p>"
-        "<ul class='note'>"
-        "<li>Week of 6 Jul &rarr; <b>Yellow</b> (Yellow's first week)</li>"
-        "<li>Week of 13 Jul &rarr; <b>Green</b> (Green's first week)</li>"
-        "<li>Week of 20 Jul &rarr; <b>Yellow</b> (2 weeks after its first)</li>"
-        "<li>Week of 27 Jul &rarr; nothing due</li>"
-        "<li>Week of 3 Aug &rarr; <b>Yellow</b>, and Green is also due this week "
-        "&mdash; Yellow wins since it's Colour 1</li>"
-        "</ul>"
-        "<p class='note'>To disable a colour entirely, leave its \"Enabled\" "
-        "box unchecked.</p>"
+        "<details><summary class='note'>How the colour rules work</summary>"
+        "<p class='note'>Each colour has its own cycle: when it was last collected and how "
+        "often it repeats. If two are due the same week, Colour 1 wins, then Colour 2, "
+        "then Colour 3. Leave a colour unticked to skip it.</p></details>"
         "</div></div>");
 
+    // ---- Date and time
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<p style='margin-top:1em'><button type='submit'>Save</button></p>"
-        "</form>");
+        "<h2>Date and time</h2>"
+        "<p class='f'><label for='tz'>Timezone</label><select id='tz' name='tz'>");
+    for (size_t i = 0; i < TZ_PRESET_COUNT; i++) {
+        off = safe_append(html, HTML_BUF_SIZE, off, "<option value='%s' %s>%s</option>",
+            TZ_PRESETS[i].tz, (&TZ_PRESETS[i] == current_preset) ? "selected" : "", TZ_PRESETS[i].label);
+    }
+    off = safe_append(html, HTML_BUF_SIZE, off,
+        "<option value='custom' %s>Somewhere else&hellip;</option></select></p>"
+        "<details><summary class='note'>Somewhere else</summary>"
+        "<p class='f'><label for='tzc'>Timezone code</label>"
+        "<input type='text' id='tzc' name='tz_custom' value='%s'></p>"
+        "<p class='note'>Only used when the list above is set to "
+        "&ldquo;Somewhere else&hellip;&rdquo;.</p></details>"
+        "<p><button type='submit' class='pri'>Save</button></p></form>",
+        current_preset == NULL ? "selected" : "", escaped_tz);
 
-    // Outside the /save form (these post elsewhere), last on the page because
-    // they're the destructive actions. The two are deliberately separate and
-    // described by what they *keep*: the difference between them is the whole
-    // reason to have both.
-    //
-    // The SSID is escaped: it is at most 32 bytes but its content is whatever
-    // the joined network calls itself.
+    // ---- The light itself. Outside the /save form: these post elsewhere, and
+    // forms cannot nest.
     char esc_ssid[33 * 6 + 1];
     html_escape_attr(wifi_manager_current_ssid(), esc_ssid, sizeof(esc_ssid));
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<div class='sect'><h2>Wi-Fi</h2>"
-        "<p>Connected to <b>%s</b>.</p>"
+        "<h2>The light itself</h2>"
+        "<p>Connected to <b>%s</b>. Version <b>%s</b>.</p>"
+        "<nav class='nav'><a href='/update'>Check for an update</a></nav>"
+        "<p class='note'>Automatic updates are <b>%s</b>. Your settings are kept either way.</p>"
+        "<form method='POST' action='/reboot'><p><button type='submit'>Restart the light</button></p></form>"
+        "<p class='note'>Nothing is lost. Same as holding the button for 3 seconds.</p>"
         "<form method='POST' action='/wifi-forget'>"
-        "<button type='submit'>Forget this network and restart setup</button></form>"
-        "<p class='note'>Moves the light to a different Wi-Fi network. It restarts into "
-        "setup mode. <b>Everything else is kept</b> &mdash; schedule, council and colours.</p>"
-        "</div>",
-        esc_ssid);
-
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<div class='sect'><h2>Firmware</h2>"
-        "<p>Version <b>%s</b>.</p>"
-        "<form method='POST' action='/update'>"
-        "<button type='submit'>Check for updates</button></form>"
-        "<p class='note'>Automatic updates are <b>%s</b>. Your settings are kept across an "
-        "update either way.</p>"
-        "</div>", ota_running_version(), ota_auto_update_enabled() ? "on" : "off");
-
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<div class='sect'><h2>Restart</h2>"
-        "<form method='POST' action='/reboot'>"
-        "<button type='submit'>Restart the light</button></form>"
-        "<p class='note'><b>Nothing is lost</b> &mdash; the light just reboots. Same as "
-        "holding the reset button for 3 seconds.</p>"
-        "</div>");
-
-    off = safe_append(html, HTML_BUF_SIZE, off,
-        "<div class='sect'><h2>Factory reset</h2>"
+        "<p><button type='submit'>Move to a different Wi-Fi</button></p></form>"
+        "<p class='note'>Restarts into setup mode. <b>Everything else is kept</b> &mdash; "
+        "your bin days, council and colours.</p>"
         "<form method='POST' action='/factory-reset'>"
-        "<button type='submit'>Factory reset&hellip;</button></form>"
-        "<p class='note'>Erases <b>everything</b>, including the Wi-Fi network, and "
-        "returns the light to how it left the workbench. You'll be asked to confirm "
-        "first. Same as holding the reset button for 10 seconds.</p>"
-        "</div>");
-
-    off = safe_append(html, HTML_BUF_SIZE, off, "</body></html>");
+        "<p><button type='submit' class='dgr'>Factory reset&hellip;</button></p></form>"
+        "<p class='note'>Erases <b>everything</b>, including the Wi-Fi network. You&rsquo;ll be "
+        "asked to confirm. Same as holding the button for 10 seconds.</p>"
+        "<a class='bk' href='/'>&larr; Back</a></body></html>",
+        esc_ssid, ota_running_version(), ota_auto_update_enabled() ? "on" : "off");
 
     if (off >= HTML_BUF_SIZE) {
-        ESP_LOGE(TAG, "home page truncated at %d bytes - raise HTML_BUF_SIZE", HTML_BUF_SIZE);
+        ESP_LOGE(TAG, "settings page truncated at %d bytes - raise HTML_BUF_SIZE", HTML_BUF_SIZE);
     }
 
     httpd_resp_set_type(req, "text/html");
@@ -958,7 +965,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     }
 
     httpd_resp_set_status(req, "303 See Other");
-    httpd_resp_set_hdr(req, "Location", "/");
+    httpd_resp_set_hdr(req, "Location", "/settings");
     httpd_resp_send(req, NULL, 0);
     return ESP_OK;
 }
@@ -984,11 +991,8 @@ static esp_err_t wifi_forget_post_handler(httpd_req_t *req)
     }
 
     static const char PAGE[] =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Wi-Fi Reset</title>"
-        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}</style>"
-        "</head><body><h1>Wi-Fi reset</h1>"
+        PAGE_HEAD("Wi-Fi Reset")
+        "<h1>Wi-Fi reset</h1>"
         "<p>The saved network has been forgotten and the light is restarting.</p>"
         "<p>In a few seconds both LEDs will start breathing white, and a Wi-Fi network "
         "named <b>binlight-XXXX</b> will appear. Join it, then open "
@@ -1062,13 +1066,8 @@ static esp_err_t update_post_handler(httpd_req_t *req)
                          ota_get_state() == OTA_STATE_RUNNING;
 
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Firmware Update</title>"
-        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
-        ".note{color:#888;}code{background:#eee;padding:.1em .3em;}</style>"
-        "</head><body><h1>Firmware update</h1>"
+        PAGE_HEAD("Software update")
+        "<h1>Software update</h1>"
         "<p>Running version: <b>%s</b></p>", ota_running_version());
 
     if (show_progress) {
@@ -1168,13 +1167,14 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
         return ESP_FAIL;
     }
     static const char PAGE[] =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+        "<!DOCTYPE html><html><head><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<link rel=icon href=/favicon.ico type=image/svg+xml>"
+        "<link rel=stylesheet href=/s.css>"
+        // The only page that reloads itself: it is showing a device that is
+        // going away and coming back, so it has to fetch / again by itself.
         "<meta http-equiv='refresh' content='12; url=/'>"
-        "<title>Restarting</title>"
-        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
-        ".note{color:#888;}</style></head><body>"
+        "<title>Restarting</title></head><body>"
         "<h1>Restarting</h1>"
         "<p>The light is restarting. Nothing has been changed &mdash; your Wi-Fi, "
         "council setup and schedule are all still there.</p>"
@@ -1223,13 +1223,7 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req)
     }
 
     static const char HEAD[] =
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Factory Reset</title>"
-        "<style>body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
-        ".warn{border:2px solid #a00;padding:.8em 1em;border-radius:4px;}"
-        ".note{color:#888;}</style></head><body>";
+        PAGE_HEAD("Factory reset");
 
     if (!confirmed) {
         static const char CONFIRM_PAGE[] =
@@ -1464,6 +1458,16 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         // the next 12h interval.
         waste_api_set_config(&cfg);
 
+        // See the note on the bespoke path below. Resolved from the subdomain
+        // here, since this branch carries no council_t of its own.
+        const council_t *saved = council_find_impact_apps(subdomain);
+        if (saved != NULL) {
+            const char *tz = settings_tz_for_state(saved->state);
+            if (tz != NULL) {
+                settings_set_tz(tz);
+            }
+        }
+
         httpd_resp_set_status(req, "303 See Other");
         httpd_resp_set_hdr(req, "Location", "/");
         httpd_resp_send(req, NULL, 0);
@@ -1481,6 +1485,21 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         auto_map_type_rules(&cfg);
         waste_api_set_config(&cfg);
 
+        // The council implies the timezone, so set it here rather than leaving
+        // it as a separate step the user has no reason to go looking for. An
+        // unset timezone leaves the light showing nothing at all (SPEC.md 4).
+        //
+        // Always overwrites. There is no "did the user choose this
+        // deliberately" flag and adding one would be an NVS schema change; a
+        // correct zone derived from the council beats preserving a rare manual
+        // override, and the override is one tap away in Settings. The finish
+        // step says what it set, so it is never a silent overwrite.
+        const char *tz = settings_tz_for_state(council->state);
+        if (tz != NULL) {
+            settings_set_tz(tz);
+        }
+
+
         httpd_resp_set_status(req, "303 See Other");
         httpd_resp_set_hdr(req, "Location", "/");
         httpd_resp_send(req, NULL, 0);
@@ -1497,18 +1516,9 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
 
     int off = 0;
     off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Bin Collection API Setup</title>"
-        "<style>"
-        "body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
-        "a.item{display:block;padding:.35em 0;border-bottom:1px solid #eee;text-decoration:none;}"
-        ".note{color:#888;}"
-        "select{max-width:100%%;}"
-        "</style></head><body>"
-        "<h1>Bin Collection API Setup</h1>"
-        "<p><a href='/'>&larr; Back to schedule</a></p>");
+        PAGE_HEAD("Where do you live?")
+        "<h1>Where do you live?</h1>"
+        "<a class='bk' href='/'>&larr; Back</a>");
 
     char enc_subdomain[WASTE_API_SUBDOMAIN_MAX_LEN * 3 + 1];
     url_encode_component(subdomain, enc_subdomain, sizeof(enc_subdomain));
@@ -1564,8 +1574,10 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
                     : -1;
         if (n < 0) {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Couldn't search %s's address lookup just now &mdash; check the "
-                "device's connection and try again.</p>", council->name);
+                "<p><b>Couldn&rsquo;t reach %s just now.</b></p>"
+                "<p>Check the light is on your Wi-Fi, then try again. Or "
+                "<a href='/settings#byhand'>set your bin days by hand</a> "
+                "&mdash; you can switch to your council later.</p>", council->name);
         } else if (n == 0) {
             html_escape_attr(query, esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
@@ -1592,7 +1604,8 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         int n = (props != NULL) ? waste_api_fetch_properties(subdomain, street_id, props, SETUP_LOOKUP_MAX) : -1;
         if (n < 0) {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Couldn't fetch properties &mdash; check the council subdomain and try again.</p>");
+                "<p><b>Couldn&rsquo;t reach that council just now.</b></p>"
+                "<p>Check the light is on your Wi-Fi, then try again.</p>");
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your address</h2>");
             for (int i = 0; i < n; i++) {
@@ -1613,7 +1626,8 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         int n = (streets != NULL) ? waste_api_fetch_streets(subdomain, locality_id, streets, SETUP_LOOKUP_MAX) : -1;
         if (n < 0) {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Couldn't fetch streets &mdash; check the council subdomain and try again.</p>");
+                "<p><b>Couldn&rsquo;t reach that council just now.</b></p>"
+                "<p>Check the light is on your Wi-Fi, then try again.</p>");
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your street</h2>");
             for (int i = 0; i < n; i++) {
@@ -1632,8 +1646,10 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         if (n < 0) {
             html_escape_attr(subdomain, esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Couldn't reach \"%s.waste-info.com.au\" &mdash; check the council subdomain and try again.</p>",
-                esc);
+                "<p><b>Couldn&rsquo;t reach that council just now.</b></p>"
+                "<p>Check the light is on your Wi-Fi, then try again. Or "
+                "<a href='/settings#byhand'>set your bin days by hand</a>.</p>");
+            (void)esc;
         } else {
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Select your suburb</h2>");
             for (int i = 0; i < n; i++) {
@@ -1660,11 +1676,12 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
             // via the wizard's query string).
             html_escape_attr(api_council_name(&cfg), esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
-                "<p>Currently configured: <b>%s</b><br>", esc);
+                "<p>Set up for <b>%s</b><br>", esc);
             html_escape_attr(cfg.property_label, esc, PAGE_ESC_BUF_SIZE);
             off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "%s</p>", esc);
         } else {
-            off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<p>No council/address configured yet.</p>");
+            off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
+                "<p>The light doesn&rsquo;t know where you live yet.</p>");
         }
 
         // Which state's councils to list. Explicit ?state= wins; otherwise the
@@ -1684,7 +1701,7 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
             snprintf(state, sizeof(state), "%s", COUNCIL_DEFAULT_STATE);
         }
 
-        off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Set up a new council / address</h2>");
+        off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "<h2>Find your address</h2>");
 
         // Two separate forms rather than one with two buttons: changing state
         // is a page reload that re-renders the council list (no JavaScript, so
@@ -1724,22 +1741,19 @@ static esp_err_t api_setup_get_handler(httpd_req_t *req)
         off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
             "</select></label> <button type='submit'>Find my address</button></form>");
 
-        // The escape hatch that keeps SPEC.md 3.3's deliberate flexibility:
-        // any council on this platform works without a firmware change, listed
-        // or not. Demoted below the dropdown rather than removed.
-        html_escape_attr(subdomain[0] != '\0' ? subdomain : cfg.council_subdomain,
-                         esc, PAGE_ESC_BUF_SIZE);
+        // The free-text subdomain field that used to live here is gone: it
+        // asked a non-technical user to find their council's bin-day page and
+        // extract a subdomain from its URL, which is not something the people
+        // these are given to can do. Unlisted councils on the shared platform
+        // are now handled by adding them to COUNCILS[] and pushing an update -
+        // the same shape of fix SPEC.md 1.1 already assumes for council
+        // breakage. The step=locality branch above is still reachable by
+        // typing a URL, for the owner's own debugging.
         off = safe_append(html, SETUP_HTML_BUF_SIZE, off,
             "<h3>Council not listed?</h3>"
-            "<p class='note'>Any council running the same \"waste-info.com.au\" platform will "
-            "work &mdash; enter their subdomain (the part before \".waste-info.com.au\" in "
-            "their bin-day lookup URL).</p>"
-            "<form method='GET' action='/api-setup'>"
-            "<input type='hidden' name='step' value='locality'>"
-            "<label>Subdomain: <input type='text' name='subdomain' value='%s'></label> "
-            "<button type='submit'>Find my suburb</button>"
-            "</form>",
-            esc);
+            "<p>Your council isn&rsquo;t one the light knows about yet. You can still use it "
+            "&mdash; set your bin days by hand instead.</p>"
+            "<p><a href='/settings#byhand'>Set my bin days by hand &rarr;</a></p>");
     }
 
     off = safe_append(html, SETUP_HTML_BUF_SIZE, off, "</body></html>");
@@ -1769,19 +1783,9 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
 
     int off = 0;
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
-        "<link rel='icon' href='/favicon.ico' type='image/svg+xml'>"
-        "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Bin Collection API Test</title>"
-        "<style>"
-        "body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
-        "table{width:100%%;border-collapse:collapse;}"
-        "td,th{padding:.4em;text-align:left;border-bottom:1px solid #ccc;}"
-        ".swatch{display:inline-block;width:1em;height:1em;border:1px solid #999;"
-        "vertical-align:middle;margin-right:.4em;}"
-        "</style></head><body>"
-        "<h1>Bin Collection API Test</h1>"
-        "<p><a href='/'>&larr; Back to schedule</a></p>");
+        PAGE_HEAD("Your bins")
+        "<h1>Your bins</h1>"
+        "<a class='bk' href='/'>&larr; Back</a>");
 
     if (!waste_api_config_complete(&cfg)) {
         off = safe_append(html, HTML_BUF_SIZE, off,
@@ -2002,7 +2006,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 16; // 13 in use, small headroom for future additions
+    config.max_uri_handlers = 16; // 14 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -2039,6 +2043,11 @@ esp_err_t web_server_start(void)
         .uri = "/api-test",
         .method = HTTP_POST,
         .handler = api_test_post_handler,
+    };
+    static const httpd_uri_t settings_uri = {
+        .uri = "/settings",
+        .method = HTTP_GET,
+        .handler = settings_get_handler,
     };
     static const httpd_uri_t stylesheet_uri = {
         .uri = "/s.css",
@@ -2092,6 +2101,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &api_setup_uri);
     httpd_register_uri_handler(server, &api_test_get_uri);
     httpd_register_uri_handler(server, &api_test_post_uri);
+    httpd_register_uri_handler(server, &settings_uri);
     httpd_register_uri_handler(server, &stylesheet_uri);
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &test_uri);

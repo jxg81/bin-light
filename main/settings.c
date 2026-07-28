@@ -84,3 +84,30 @@ esp_err_t settings_set_tz(const char *tz)
     ESP_LOGI(TAG, "TZ updated to: %s", s_tz);
     return ESP_OK;
 }
+
+// Only two distinct zones cover every state the council table currently
+// supports (STATE_ORDER is {VIC, NSW, QLD, TAS}). The other three are listed
+// so that adding South Australia (SPEC.md 3.13.2) or a WA/NT council needs no
+// change here.
+const char *settings_tz_for_state(const char *state)
+{
+    static const struct { const char *state; const char *tz; } STATE_TZ[] = {
+        {"VIC", "AEST-10AEDT,M10.1.0/2,M4.1.0/3"},
+        {"NSW", "AEST-10AEDT,M10.1.0/2,M4.1.0/3"},
+        {"ACT", "AEST-10AEDT,M10.1.0/2,M4.1.0/3"},
+        {"TAS", "AEST-10AEDT,M10.1.0/2,M4.1.0/3"},
+        {"QLD", "AEST-10"},
+        {"SA",  "ACST-9:30ACDT,M10.1.0/2,M4.1.0/3"},
+        {"NT",  "ACST-9:30"},
+        {"WA",  "AWST-8"},
+    };
+    if (state == NULL) {
+        return NULL;
+    }
+    for (size_t i = 0; i < sizeof(STATE_TZ) / sizeof(STATE_TZ[0]); i++) {
+        if (strcmp(STATE_TZ[i].state, state) == 0) {
+            return STATE_TZ[i].tz;
+        }
+    }
+    return NULL;
+}
