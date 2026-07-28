@@ -1068,7 +1068,7 @@ static esp_err_t update_post_handler(httpd_req_t *req)
     off = safe_append(html, HTML_BUF_SIZE, off,
         PAGE_HEAD("Software update")
         "<h1>Software update</h1>"
-        "<p>Running version: <b>%s</b></p>", ota_running_version());
+        "<p>Version <b>%s</b></p>", ota_running_version());
 
     if (show_progress) {
         ota_state_t state = ota_get_state();
@@ -1107,14 +1107,13 @@ static esp_err_t update_post_handler(httpd_req_t *req)
         char esc_version[sizeof(m.version) * 6 + 1];
         if (ota_check(&m) != ESP_OK) {
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "<p><b>Couldn't check for updates.</b></p>"
-                "<p class='note'>The light couldn't reach the update manifest. Check its "
-                "internet connection and try again.</p>");
+                "<p><b>Couldn&rsquo;t check for an update.</b></p>"
+                "<p class='note'>The light needs an internet connection for this. "
+                "Everything else keeps working.</p>");
         } else if (!m.available) {
             html_escape_attr(m.version, esc_version, sizeof(esc_version));
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "<p><b>Up to date.</b> The published version is <b>%s</b>, which is what "
-                "this light is running.</p>", esc_version);
+                "<p><b>Up to date.</b> Version <b>%s</b> is the latest.</p>", esc_version);
         } else {
             char esc_url[sizeof(m.url) * 6 + 1];
             char esc_notes[sizeof(m.notes) * 6 + 1];
@@ -1130,9 +1129,9 @@ static esp_err_t update_post_handler(httpd_req_t *req)
                 "<form method='POST' action='/update'>"
                 "<input type='hidden' name='action' value='install'>"
                 "<input type='hidden' name='url' value='%s'>"
-                "<button type='submit'>Download and install</button></form>"
+                "<button type='submit' class='pri'>Install it</button></form>"
                 "<p class='note'>Takes a couple of minutes. Your settings are kept &mdash; "
-                "an update replaces the firmware, not the configuration.</p>", esc_url);
+                "an update replaces the light&rsquo;s software, not your settings.</p>", esc_url);
         }
     }
 
@@ -1149,7 +1148,7 @@ static esp_err_t update_post_handler(httpd_req_t *req)
         ota_auto_update_enabled() ? "checked" : "");
 
     off = safe_append(html, HTML_BUF_SIZE, off,
-        "<p style='margin-top:1em'><a href='/'>&larr; Back to schedule</a></p></body></html>");
+        "<a class='bk' href='/settings'>&larr; Back to settings</a></body></html>");
 
     httpd_resp_set_type(req, "text/html");
     httpd_resp_send(req, html, off);
@@ -1178,7 +1177,7 @@ static esp_err_t reboot_post_handler(httpd_req_t *req)
         "<h1>Restarting</h1>"
         "<p>The light is restarting. Nothing has been changed &mdash; your Wi-Fi, "
         "council setup and schedule are all still there.</p>"
-        "<p class='note'>You'll see the LEDs run their startup colour test. This page "
+        "<p class='note'>You&rsquo;ll see the lights run through their colours. This page "
         "will try to come back on its own in a few seconds; if it doesn't, browse to "
         "<b>http://binlight.local</b> again.</p>"
         "</body></html>";
@@ -1233,11 +1232,11 @@ static esp_err_t factory_reset_post_handler(httpd_req_t *req)
             "<p>All configuration will be lost, including:</p>"
             "<ul>"
             "<li>the Wi-Fi network and password</li>"
-            "<li>the council and address setup, and the bin colour mapping</li>"
-            "<li>the manual / fallback schedule and its colour rules</li>"
-            "<li>brightness, on-time, light mode and timezone</li>"
+            "<li>your council, your address and your bin colours</li>"
+            "<li>any bin days you set by hand</li>"
+            "<li>brightness, when the light comes on, and your timezone</li>"
             "</ul>"
-            "<p>The light will restart into setup mode with both LEDs breathing white, "
+            "<p>The light will restart into setup mode with both lights breathing white, "
             "and will need to be set up again from scratch &mdash; starting with joining "
             "it to your Wi-Fi.</p>"
             "<p><b>This cannot be undone.</b></p>"

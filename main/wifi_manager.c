@@ -253,7 +253,7 @@ static int prov_page_head(char *buf, size_t size, int off)
     return prov_append(buf, size, off,
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'>"
-        "<title>Bin Light Setup</title>"
+        "<title>Set up your bin light</title>"
         "<style>"
         "body{font-family:sans-serif;max-width:480px;margin:2em auto;padding:0 1em;}"
         ".note{color:#888;}"
@@ -261,7 +261,7 @@ static int prov_page_head(char *buf, size_t size, int off)
         "p.field label{display:block;margin-bottom:.2em;}"
         "button{font:inherit;padding:.6em 1em;}"
         "ol{padding-left:1.3em;}"
-        "</style></head><body><h1>Bin Light Setup</h1>");
+        "</style></head><body><h1>Set up your bin light</h1>");
 }
 
 static esp_err_t prov_root_get_handler(httpd_req_t *req)
