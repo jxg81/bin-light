@@ -1,5 +1,5 @@
 {
-  "version": "1.0.7",
-  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.7/bin-light.bin",
-  "notes": "OTA images must now come from this repo's releases; web UI hardened."
+  "version": "1.0.8",
+  "url": "https://github.com/jxg81/bin-light/releases/download/v1.0.8/bin-light.bin",
+  "notes": "Closes the OTA version floor at 1.0.7. Shared stylesheet for the web pages."
 }
