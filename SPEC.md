@@ -933,16 +933,29 @@ containing `..` or a backslash are refused as well.
 **2. The image's own version must be ≥ `CONFIG_BINLIGHT_OTA_MIN_VERSION`**,
 read from `esp_app_desc_t` in the header already being downloaded.
 
-- **⚠️ It currently ships at `1.0.6`, not 1.0.7 — this check is not yet fully
-  live.** 1.0.7 deliberately allows a one-release rollback so the bench device
-  can be walked backwards during testing. While the floor is below 1.0.7 the
-  URL allowlist above is **fully bypassable**: anyone reaching `POST /update`
-  can install genuine release `v1.0.6` — which passes the prefix and clears the
-  floor — and 1.0.6 predates both checks, so from there anything installs.
-  Accepted knowingly while no device is deployed. **`1.0.8` must set the floor
-  to `1.0.7`, and it must not be given away before then**; see the ship gate in
-  §4. `./test/host/run.sh` prints a warning every run until it is done, and
-  goes quiet by itself afterwards.
+- **⚠️ Closed in the source tree, still open in the field.** The two states
+  differ and the distinction is the whole point:
+
+  | | Floor | Status |
+  |---|---|---|
+  | Source tree (1.0.8) | **1.0.7** | closed — `Kconfig.projbuild` *and* `sdkconfig`, per the §4 trap |
+  | Published manifest / bench device (1.0.7) | **1.0.6** | **still bypassable** |
+
+  1.0.7 deliberately shipped a floor of 1.0.6 so the bench device could be
+  walked back one release during testing. The cost is that anyone reaching
+  `POST /update` on a 1.0.7 device can install genuine release `v1.0.6` — it
+  passes the prefix and clears the floor — and 1.0.6 predates both checks, so
+  from there anything installs. Two steps out of the boundary.
+
+  **1.0.8 closes it but has not been published**: `firmware/latest.json` still
+  names 1.0.7 and no `v1.0.8` release exists, so nothing has fetched it. The
+  gap therefore remains live on the only device that exists until 1.0.8 is
+  released and installed.
+
+  **Ship gate: no device leaves the house until it is running ≥ 1.0.8.**
+  `./test/host/run.sh` no longer warns — it went quiet when the source floor
+  reached 1.0.7 — so from here the gate is this document's job, not the
+  harness's.
 - **The floor is pinned at 1.0.7 permanently.** It is not a version number and
   does not move with releases: 1.0.7 is simply the first release enforcing
   these checks, and holding it there is all the constraint needed. Pinning is
@@ -2701,7 +2714,7 @@ three different things that are easy to conflate.
 | §3.5 OTA — rollback safety net (**hanging** image) | ✅ watchdog | ✅ | ✅ **verified 2026-07-27** — a build that hangs in AutoAP rather than crashing was rolled back after 10 min, unattended. See §3.5.1. |
 | §3.5 manual install restarts itself | ✅ | ✅ | ✅ **verified 2026-07-27** — an install performed *from* 1.0.4, per §3.5.0's one-release-late rule (owner report; the captured log covers the watchdog lines) |
 | §3.5.3 OTA URL prefix allowlist | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet on a device** — refusal path covered by 23 host assertions against the real `ota.c` |
-| §3.5.3 OTA version floor (1.0.6 in this release; 1.0.7 from 1.0.8 on) | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet on a device**, and per §3.5.0 the *accept* path cannot be proven by the install that introduces it — needs a USB-flashed bench device plus a further release |
+| §3.5.3 OTA version floor | ✅ raised to **1.0.7 in 1.0.8** (source done) | ⚠️ **1.0.8 built, NOT published** — manifest still names 1.0.7, so the device still runs a 1.0.6 floor | ⏳ **not yet on a device**, and per §3.5.0 the *accept* path cannot be proven by the install that introduces it — needs a USB-flashed bench device plus a further release |
 | §3.15 cross-origin POST rejection | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet in a real browser** — 8 host assertions pass; still to check by name *and* by IP |
 | §3.15 HTML escaping + `HTML_BUF_SIZE` 16384 | ✅ 1.0.7 | ✅ built + published v1.0.7 | ⏳ **not yet on a device** — page sizes asserted against adversarial fixtures; pages not yet eyeballed |
 
@@ -2933,15 +2946,20 @@ OTA — both work, and OTA is safe to leave on by default now that rollback is
 proven in both directions. What remains is mostly physical: enclosure,
 assembly, and the colour calibration that depends on both.
 
-> **⚠️ One firmware gate remains: `CONFIG_BINLIGHT_OTA_MIN_VERSION` must be at
-> least 1.0.7 before any device is given away.** It currently sits at **1.0.6**
-> so that the current round of OTA testing can still roll back to the previous
-> release. While it is below 1.0.7 a device can be walked back onto firmware
-> that predates the §3.5.3 checks, which makes the URL allowlist bypassable —
-> acceptable on the bench, not acceptable in someone else's house. Raise it to
-> 1.0.7 when 1.0.8 is cut, then leave it there permanently (§3.5.3).
-> `./test/host/run.sh` prints a loud warning on every run until this is done,
-> and goes quiet by itself once it is.
+> **⚠️ One firmware gate remains, and it is now a *release* gate rather than a
+> code change: no device leaves the house until it is running ≥ 1.0.8.**
+>
+> `CONFIG_BINLIGHT_OTA_MIN_VERSION` was raised 1.0.6 → **1.0.7 in 1.0.8**, in
+> both `Kconfig.projbuild` and `sdkconfig` — the source side is done, and it
+> stays at 1.0.7 permanently (§3.5.3). But **1.0.8 has not been published**:
+> `firmware/latest.json` still names 1.0.7 and no `v1.0.8` release exists, so
+> the bench device is still running a 1.0.6 floor and can still be walked back
+> onto firmware that predates the §3.5.3 checks. Acceptable on the bench, not
+> in someone else's house.
+>
+> `./test/host/run.sh` has gone quiet — it compares against the *source* floor,
+> which is now correct. **From here the gate is this document's job, not the
+> harness's**, which is exactly when a gate is easiest to forget.
 
 ### Open questions not yet resolved
 
