@@ -78,22 +78,109 @@ static const tz_preset_t TZ_PRESETS[] = {
 typedef struct {
     const char *label;
     uint8_t r, g, b;
+    // What a swatch shows on screen. Deliberately NOT the triple above - see
+    // the comment on COLOR_PRESETS and UI-SPEC.md 6.2.
+    const char *display;
 } color_preset_t;
 
-// The set of colours requested for the cycle test, with the RGB byte-order
-// correction already applied at the driver level (led_state.c) - these are
-// plain RGB triples, no further adjustment needed here.
+// Two different things live in each row here, and conflating them is the
+// mistake this comment exists to prevent.
+//
+//   r,g,b    what the LED emits. Empirical hardware calibration, tuned by eye
+//            against the real printed enclosure - see SPEC.md 2. Green is far
+//            more luminous than red on a WS2812 at equal duty, so a naive
+//            (255,255,0) reads distinctly green through the PLA. DO NOT
+//            "correct" these toward mathematically pure values.
+//
+//   display  what the *screen* shows for that bin. A UI-only value that never
+//            reaches NVS, never reaches the LED, and never appears in an
+//            <option value>. It exists because (255,150,0) renders as orange
+//            on a phone: that orange is green-channel compensation for the
+//            enclosure, i.e. an implementation detail, and the user should
+//            meet the idea ("your yellow bin") rather than the workaround.
+//
+// The two are independent on purpose. Re-tuning the enclosure calibration must
+// not drag the UI with it, and vice versa.
 static const color_preset_t COLOR_PRESETS[] = {
-    {"Red",    255, 0,   0},
-    {"Green",  0,   255, 0},
-    // Green is far more luminous than red on a WS2812 at equal duty, so a
-    // naive (255,255,0) reads distinctly green - especially diffused through
-    // the PLA enclosure. Pulling green down balances it perceptually. Tuned
-    // by eye against the real enclosure; see SPEC.md 2.
-    {"Yellow", 255, 150, 0},
-    {"Purple", 128, 0,   128},
+    {"Red",    255, 0,   0,   "#d93025"},
+    {"Green",  0,   255, 0,   "#1e8e3e"},
+    {"Yellow", 255, 150, 0,   "#f9c22e"},
+    {"Purple", 128, 0,   128, "#8e44ad"},
 };
 #define COLOR_PRESET_COUNT (sizeof(COLOR_PRESETS) / sizeof(COLOR_PRESETS[0]))
+
+// Every page this module serves opens the same way. Kept as one literal with a
+// %s for the title so the boilerplate is stored once rather than seven times,
+// and so the stylesheet link can never drift between pages.
+#define PAGE_HEAD \
+    "<!DOCTYPE html><html><head><meta charset=utf-8>" \
+    "<meta name=viewport content='width=device-width,initial-scale=1'>" \
+    "<link rel=icon href=/favicon.ico type=image/svg+xml>" \
+    "<link rel=stylesheet href=/s.css><title>%s</title></head><body>"
+
+// The one stylesheet, served from its own URI (UI-SPEC.md 6.1) rather than
+// inlined into every page.
+//
+// Two reasons, and the second is the load-bearing one:
+//   - it is stored in flash once instead of once per page, and
+//   - its bytes stop counting against HTML_BUF_SIZE at every render. Inlining
+//     ~400 bytes of CSS into a page buffer is 400 bytes of headroom spent on
+//     something that never changes.
+//
+// Sent with httpd_resp_send(), not safe_append(), so '%' is a literal here and
+// needs no doubling - unlike every format string in this file.
+//
+// The provisioning server in wifi_manager.c deliberately does NOT link this;
+// it keeps its own inline copy. See UI-SPEC.md D6.
+static const char STYLESHEET[] =
+    ":root{--bg:#fff;--fg:#1b1b1b;--mut:#666;--line:#dcdcdc;--card:#f5f5f4;--acc:#2c5d8a;--warn:#9b2c2c}"
+    "@media(prefers-color-scheme:dark){:root{--bg:#141414;--fg:#ededed;--mut:#9b9b9b;"
+    "--line:#333;--card:#1e1e1e;--acc:#7fb3e0;--warn:#d08a8a}}"
+    "*{box-sizing:border-box}"
+    "body{font:16px/1.45 system-ui,sans-serif;color:var(--fg);background:var(--bg);"
+    "max-width:30rem;margin:0 auto;padding:1rem 1rem 3rem}"
+    "h1{font-size:1.3rem;margin:.2rem 0 1rem}"
+    "h2{font-size:1.05rem;margin:1.7rem 0 .5rem}"
+    "h3{font-size:.95rem;margin:1.2rem 0 .4rem}"
+    "p{margin:.55rem 0}"
+    "a{color:var(--acc)}"
+    ".note{color:var(--mut);font-size:.87rem}"
+    ".card{background:var(--card);border:1px solid var(--line);border-radius:.6rem;"
+    "padding:.9rem 1rem;margin:1rem 0}"
+    ".big{font-size:1.5rem;font-weight:600;margin:.15rem 0}"
+    ".f{margin:.9rem 0}"
+    ".f label{display:block;font-size:.87rem;color:var(--mut);margin-bottom:.25rem}"
+    ".f input,.f select{width:100%;font:inherit;padding:.5rem;border:1px solid var(--line);"
+    "border-radius:.35rem;background:var(--bg);color:var(--fg)}"
+    ".f input[type=checkbox]{width:auto;margin-right:.4rem}"
+    ".f input[type=range]{padding:0}"
+    "button{font:inherit;padding:.6rem 1rem;border:1px solid var(--line);border-radius:.4rem;"
+    "background:var(--card);color:var(--fg)}"
+    ".pri{background:var(--acc);border-color:var(--acc);color:#fff;font-weight:600;width:100%;"
+    "padding:.8rem;display:block;text-align:center;text-decoration:none}"
+    ".dgr{border-color:var(--warn);color:var(--warn);background:transparent}"
+    ".warn{border:2px solid var(--warn);border-radius:.5rem;padding:.8rem 1rem}"
+    ".sw{display:inline-block;width:1.1em;height:1.1em;border-radius:.25em;"
+    "border:1px solid var(--line);vertical-align:-.18em;margin-right:.4em}"
+    ".tw{overflow-x:auto}"
+    "table{width:100%;border-collapse:collapse;font-size:.92rem}"
+    "td,th{padding:.5rem .3rem;text-align:left;border-bottom:1px solid var(--line)}"
+    ".sect{margin:1.6rem 0}"
+    ".details{display:none}"
+    // The .sect wrapper is load-bearing: a bare "input:checked ~ .details"
+    // would match every later .details on the page, so ticking one section
+    // would expand all the following ones.
+    ".sect input:checked~.details{display:block}"
+    // So a link to /settings#byhand actually reveals the section it lands on,
+    // without JavaScript. Additive - it composes with the checkbox rule above
+    // rather than replacing it, and the checkbox stays the real enable control.
+    ".sect:target .details{display:block}"
+    ".nav a{display:block;padding:.8rem .2rem;border-bottom:1px solid var(--line);"
+    "text-decoration:none;color:var(--fg)}"
+    ".nav a:after{content:'\\203A';float:right;color:var(--mut)}"
+    ".item{display:block;padding:.8rem .2rem;border-bottom:1px solid var(--line);"
+    "text-decoration:none;color:var(--fg)}"
+    ".bk{display:inline-block;margin:1.5rem 0 0;font-size:.9rem}";
 
 // A small wheelie-bin icon, served as-is for /favicon.ico. SVG rather than a
 // bitmap ICO format - every browser that requests /favicon.ico honours the
@@ -171,6 +258,18 @@ static esp_err_t favicon_get_handler(httpd_req_t *req)
     httpd_resp_set_type(req, "image/svg+xml");
     httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=604800");
     return httpd_resp_send(req, FAVICON_SVG, HTTPD_RESP_USE_STRLEN);
+}
+
+// The shared stylesheet. Cached for a week, exactly like the favicon above.
+//
+// No reject_cross_origin() here, deliberately and correctly: it is a GET, and
+// the guard belongs only on the state-changing POST handlers. See the note
+// above web_server_start().
+static esp_err_t stylesheet_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "text/css");
+    httpd_resp_set_hdr(req, "Cache-Control", "public, max-age=604800");
+    return httpd_resp_send(req, STYLESHEET, HTTPD_RESP_USE_STRLEN);
 }
 
 // Decodes a application/x-www-form-urlencoded value in place: "%XX" -> byte,
@@ -291,6 +390,24 @@ static int append_color_select_for(char *buf, size_t buf_size, int off, const ch
 static int append_color_select(char *buf, size_t buf_size, int off, const char *field_name, schedule_color_t current)
 {
     return append_color_select_for(buf, buf_size, off, field_name, current, NULL);
+}
+
+// A colour swatch, named. Prints the *display* value of whichever preset is
+// nearest - never the stored triple, which is enclosure calibration and reads
+// as the wrong colour on a screen (see COLOR_PRESETS above, UI-SPEC.md 6.2).
+//
+// Nearest-match rather than exact, for the same reason the colour <select>
+// uses it: stored rules hold literal RGB, so a palette change would otherwise
+// leave old rules matching nothing.
+//
+// The name is printed alongside the square on purpose. Colour alone fails for
+// colour-blind users and in a dark hallway, which is exactly where this UI is
+// read.
+static int append_swatch(char *buf, size_t buf_size, int off, schedule_color_t c)
+{
+    const color_preset_t *p = &COLOR_PRESETS[nearest_preset_index(c)];
+    return safe_append(buf, buf_size, off,
+        "<span class='sw' style='background:%s'></span>%s", p->display, p->label);
 }
 
 static schedule_color_t preset_by_label(const char *label)
@@ -1688,17 +1805,17 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
             off = safe_append(html, HTML_BUF_SIZE, off, "<p>Nothing scheduled in that window.</p>");
         } else {
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "<table><tr><th>Date</th><th>Type</th><th>API's colour</th></tr>");
+                "<div class='tw'><table><tr><th>Date</th><th>Bin</th><th>Your light shows</th></tr>");
             for (int i = 0; i < n; i++) {
                 const waste_api_event_t *e = &events[i];
                 html_escape_attr(e->event_type, esc, PAGE_ESC_BUF_SIZE);
                 off = safe_append(html, HTML_BUF_SIZE, off,
-                    "<tr><td>%04u-%02u-%02u</td><td>%s</td>"
-                    "<td><span class='swatch' style='background:#%02x%02x%02x'></span>#%02x%02x%02x</td></tr>",
-                    (unsigned)e->year, (unsigned)e->month, (unsigned)e->day, esc,
-                    e->color.r, e->color.g, e->color.b, e->color.r, e->color.g, e->color.b);
+                    "<tr><td>%04u-%02u-%02u</td><td>%s</td><td>",
+                    (unsigned)e->year, (unsigned)e->month, (unsigned)e->day, esc);
+                off = append_swatch(html, HTML_BUF_SIZE, off, e->color);
+                off = safe_append(html, HTML_BUF_SIZE, off, "</td></tr>");
             }
-            off = safe_append(html, HTML_BUF_SIZE, off, "</table>");
+            off = safe_append(html, HTML_BUF_SIZE, off, "</table></div>");
         }
 
         // Build the distinct set of event_types to map: every type seen just
@@ -1885,7 +2002,7 @@ esp_err_t web_server_start(void)
 {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.max_open_sockets = 4;
-    config.max_uri_handlers = 14; // 12 in use, small headroom for future additions
+    config.max_uri_handlers = 16; // 13 in use, small headroom for future additions
     // /api-setup performs blocking HTTPS/TLS calls (via waste_api_fetch_*) on
     // this same task - TLS handshakes are stack-hungry, matching the 8192-byte
     // stack already given to the dedicated waste_api polling task.
@@ -1922,6 +2039,11 @@ esp_err_t web_server_start(void)
         .uri = "/api-test",
         .method = HTTP_POST,
         .handler = api_test_post_handler,
+    };
+    static const httpd_uri_t stylesheet_uri = {
+        .uri = "/s.css",
+        .method = HTTP_GET,
+        .handler = stylesheet_get_handler,
     };
     static const httpd_uri_t favicon_uri = {
         .uri = "/favicon.ico",
@@ -1970,6 +2092,7 @@ esp_err_t web_server_start(void)
     httpd_register_uri_handler(server, &api_setup_uri);
     httpd_register_uri_handler(server, &api_test_get_uri);
     httpd_register_uri_handler(server, &api_test_post_uri);
+    httpd_register_uri_handler(server, &stylesheet_uri);
     httpd_register_uri_handler(server, &favicon_uri);
     httpd_register_uri_handler(server, &test_uri);
     httpd_register_uri_handler(server, &wifi_forget_uri);

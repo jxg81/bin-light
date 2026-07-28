@@ -27,7 +27,34 @@ esp_err_t waste_api_set_config(const waste_api_config_t *c) { s_api = *c; return
 int waste_api_fetch_localities(const char *s, waste_api_locality_t *o, int m) { (void)s;(void)o;(void)m; return -1; }
 int waste_api_fetch_streets(const char *s, uint32_t l, waste_api_street_t *o, int m) { (void)s;(void)l;(void)o;(void)m; return -1; }
 int waste_api_fetch_properties(const char *s, uint32_t st, waste_api_property_t *o, int m) { (void)s;(void)st;(void)o;(void)m; return -1; }
-int waste_api_fetch_upcoming(const waste_api_config_t *c, int d, waste_api_event_t *o, int m) { (void)c;(void)d;(void)o;(void)m; return -1; }
+// Normally fails (no network on the host), which is also the state /api-setup
+// and /api-test render on a fresh device. --api-test* plants a full window of
+// events instead, so the upcoming table and the mapping form can be measured.
+int stub_upcoming_count = -1;
+bool stub_upcoming_hostile = false;
+int waste_api_fetch_upcoming(const waste_api_config_t *c, int d, waste_api_event_t *o, int m)
+{
+    (void)c; (void)d;
+    if (stub_upcoming_count < 0) {
+        return -1;
+    }
+    int n = stub_upcoming_count < m ? stub_upcoming_count : m;
+    static const char *TYPES[] = {"recycle", "organic", "waste", "glass"};
+    for (int i = 0; i < n; i++) {
+        memset(&o[i], 0, sizeof(o[i]));
+        o[i].year = 2026;
+        o[i].month = (uint8_t)(8 + i / 28);
+        o[i].day = (uint8_t)(1 + (i * 7) % 28);
+        if (stub_upcoming_hostile) {
+            memset(o[i].event_type, '\'', sizeof(o[i].event_type) - 1);
+            o[i].event_type[sizeof(o[i].event_type) - 1] = '\0';
+        } else {
+            snprintf(o[i].event_type, sizeof(o[i].event_type), "%s", TYPES[i % 4]);
+        }
+        o[i].color = (schedule_color_t){(uint8_t)(i * 20), 200, 60};
+    }
+    return n;
+}
 // Address search normally fails (no network on the host). --setup-escaped
 // plants a full page of worst-case matches instead: the longest id the
 // bespoke backends produce (Merri-bek's packed ids) and a label made
@@ -193,7 +220,7 @@ int main(int argc, char **argv)
     s_sched.version = 5;
     s_sched.enabled = true;
     s_sched.bin_night_weekday = 4;        // Thursday
-    s_sched.start_minute = 18 * 60;       // 18:00
+    s_sched.start_minute = 15 * 60;       // 3:00pm - matches schedule.c's shipped default
     s_sched.duration_hours = 20;
     s_sched.brightness = 128;
     s_sched.light_mode = LIGHT_MODE_DUAL_COLOUR;
@@ -261,6 +288,17 @@ int main(int argc, char **argv)
         if (strcmp(argv[1], "--update-progress") == 0)  stub_ota_state = OTA_STATE_RUNNING;
     }
     bool reset_confirm = (argc > 1 && strcmp(argv[1], "--reset-confirm") == 0);
+    bool api_test_page = false;
+    if (argc > 1 && strncmp(argv[1], "--api-test", 10) == 0) {
+        api_test_page = true;
+        // A full window of events AND every type-rule slot filled is what
+        // /api-test's mapping form has to survive now that it is the only
+        // place the mapping lives.
+        stub_upcoming_count = API_TEST_MAX_EVENTS;
+        if (strcmp(argv[1], "--api-test-escaped") == 0) {
+            stub_upcoming_hostile = true;
+        }
+    }
     bool setup_page = (argc > 1 && strcmp(argv[1], "--setup") == 0);
     if (argc > 1 && strcmp(argv[1], "--merribek") == 0) {
         setup_page = true;
@@ -293,6 +331,8 @@ int main(int argc, char **argv)
         factory_reset_post_handler(&req);
     } else if (setup_page) {
         api_setup_get_handler(&req);
+    } else if (api_test_page) {
+        api_test_get_handler(&req);
     } else {
         root_get_handler(&req);
     }
