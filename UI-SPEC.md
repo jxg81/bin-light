@@ -627,8 +627,32 @@ from both:
   subdomain field (§7.3).
 - **"I'd like a backup for when the council's site is down"** — from the finish
   step on `/api-test`, offered and **explicitly optional** (§7.4).
+- **"My council isn't answering"** — owner's direction, 2026-07-28. From
+  **every state where the council cannot be reached**, which is one class with
+  four members: the home page's S3 card, the `/api-test` fetch failure, and
+  both `/api-setup` lookup failures. A user blocked by a council outage is
+  exactly the user who needs the manual path, and it is the same answer in all
+  four places.
 
-Both link to `/settings#byhand`. To make an anchor link actually reveal the
+All of them link to `/settings#byhand`.
+
+**Prominence:** in every case this is a **quiet text link, never a `.pri`
+button.** Where a primary action already exists — "Check my bin days" on S3,
+"Search" on `/api-setup` — the automatic path stays the primary one, because
+a council outage is usually temporary and the automatic path is the one that
+keeps working by itself afterwards. Manual is the escape hatch, offered
+without being urged.
+
+**Deliberately *not* offered on S1** (nothing set up at all). Forking the very
+first decision between "find my council" and "type it in myself" asks a new
+owner to choose before they know anything. Automatic is the right default;
+manual appears once automatic has actually failed them.
+
+**Copy must not over-promise.** Per `SPEC.md` §3.3 the API cache is *sticky* —
+a cached future date still outranks the manual schedule until that date
+passes. So the honest phrasing is *"used when your council's days aren't
+available"*, not *"used when the council is down"*. The two differ by up to a
+collection cycle. To make an anchor link actually reveal the
 section without JavaScript, add one rule to `/s.css`:
 
 ```css
@@ -728,7 +752,7 @@ table is the specification for §7's markup.
 |---|---|---|---|
 | S1 | `!waste_api_config_complete(&cfg) && !s.enabled` | **Let's set your bins up** | It takes about a minute. You'll need to know which council you're in. → **Set up my bins** |
 | S2 | clock not synced (`!time_sync_is_valid()`) | **Just getting started** | The light is checking today's date. Give it a minute, then reload this page. |
-| S3 | configured, but `!next.known` | **Nothing from *Knox* yet** | The light has asked *Knox* for your collection days and hasn't heard back. It keeps trying. → **Check my bin days** |
+| S3 | configured, but `!next.known` | **Nothing from *Knox* yet** | The light has asked *Knox* for your collection days and hasn't heard back. It keeps trying. → **Check my bin days**, and a quiet link: *Not working? You can set your bin days by hand instead.* |
 | S4 | `next.known`, collection is tonight | **Bins go out tonight** | *Tuesday 29 July* + swatches |
 | S5 | `next.known`, collection is tomorrow night | **Bins go out tomorrow night** | *Wednesday 30 July* + swatches |
 | S6 | `next.known`, further away | **Next collection** | *Tuesday 4 August* + swatches |
@@ -743,10 +767,10 @@ freshly-reset light showing nothing.
 
 | Where | Today | Instead |
 |---|---|---|
-| `/api-setup` council lookup failed | `Couldn't reach "x.waste-info.com.au" — check the council subdomain and try again.` | **Couldn't reach *Maribyrnong* just now.** Check the light is on your Wi-Fi, then try again. |
-| `/api-setup` address search failed | `Couldn't search Knox's address lookup just now — check the device's connection and try again.` | **Couldn't reach *Knox* just now.** Check the light is on your Wi-Fi, then try again. |
+| `/api-setup` council lookup failed | `Couldn't reach "x.waste-info.com.au" — check the council subdomain and try again.` | **Couldn't reach *Maribyrnong* just now.** Check the light is on your Wi-Fi, then try again. *Or set your bin days by hand.* |
+| `/api-setup` address search failed | `Couldn't search Knox's address lookup just now — check the device's connection and try again.` | **Couldn't reach *Knox* just now.** Check the light is on your Wi-Fi, then try again. *Or set your bin days by hand.* |
 | `/api-setup` no matches | `No matches for "x". Try just the house number and street name.` | *(keep — it is already plain and actionable)* |
-| `/api-test` fetch failed | `Couldn't reach the API just now — check the device's Wi-Fi connection and the council subdomain, then try again.` | **Couldn't reach *Knox* just now.** Your saved bin days are still being used. |
+| `/api-test` fetch failed | `Couldn't reach the API just now — check the device's Wi-Fi connection and the council subdomain, then try again.` | **Couldn't reach *Knox* just now.** Your saved bin days are still being used. *If Knox stays unavailable, you can set your bin days by hand.* |
 | `/api-test` nothing due | `Nothing scheduled in that window.` | ***Knox* isn't showing any collections in the next 4 weeks.** That can happen around public holidays. |
 | `/api-test` not configured | `No council/address configured yet — set one up first.` | **You haven't told the light where you live yet.** → **Set up my bins** |
 | `/update` check failed | `Couldn't check for updates. The light couldn't reach the update manifest…` | **Couldn't check for an update.** The light needs an internet connection for this. Everything else keeps working. |
