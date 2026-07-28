@@ -1788,39 +1788,17 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
 
     if (!waste_api_config_complete(&cfg)) {
         off = safe_append(html, HTML_BUF_SIZE, off,
-            "<p>No council/address configured yet &mdash; <a href='/api-setup'>set one up first</a>.</p>");
+            "<div class='card'><p class='big'>You haven&rsquo;t told the light where you "
+            "live yet.</p></div>"
+            "<p><a class='pri' href='/api-setup'>Set up my bins</a></p>");
     } else {
         // Split so both values can share the one escape scratch.
-        html_escape_attr(api_council_name(&cfg), esc, PAGE_ESC_BUF_SIZE);
-        off = safe_append(html, HTML_BUF_SIZE, off, "<p>Testing <b>%s</b>, ", esc);
         html_escape_attr(cfg.property_label, esc, PAGE_ESC_BUF_SIZE);
-        off = safe_append(html, HTML_BUF_SIZE, off,
-            "%s &mdash; raw data for the next %d days "
-            "(nothing filtered out yet):</p>", esc, API_TEST_LOOKAHEAD_DAYS);
+        off = safe_append(html, HTML_BUF_SIZE, off, "<p class='note'>%s</p>", esc);
 
         waste_api_event_t events[API_TEST_MAX_EVENTS];
         int n = waste_api_fetch_upcoming(&cfg, API_TEST_LOOKAHEAD_DAYS, events, API_TEST_MAX_EVENTS);
-        if (n < 0) {
-            off = safe_append(html, HTML_BUF_SIZE, off,
-                "<p style='color:#a00'>Couldn't reach the API just now &mdash; check the device's Wi-Fi "
-                "connection and the council subdomain, then try again.</p>");
-        } else if (n == 0) {
-            off = safe_append(html, HTML_BUF_SIZE, off, "<p>Nothing scheduled in that window.</p>");
-        } else {
-            off = safe_append(html, HTML_BUF_SIZE, off,
-                "<div class='tw'><table><tr><th>Date</th><th>Bin</th><th>Your light shows</th></tr>");
-            for (int i = 0; i < n; i++) {
-                const waste_api_event_t *e = &events[i];
-                html_escape_attr(e->event_type, esc, PAGE_ESC_BUF_SIZE);
-                off = safe_append(html, HTML_BUF_SIZE, off,
-                    "<tr><td>%04u-%02u-%02u</td><td>%s</td><td>",
-                    (unsigned)e->year, (unsigned)e->month, (unsigned)e->day, esc);
-                off = append_swatch(html, HTML_BUF_SIZE, off, e->color);
-                off = safe_append(html, HTML_BUF_SIZE, off, "</td></tr>");
-            }
-            off = safe_append(html, HTML_BUF_SIZE, off, "</table></div>");
-        }
-
+        // (the upcoming table is emitted below the mapping - see UPCOMING_TABLE)
         // Build the distinct set of event_types to map: every type seen just
         // now, unioned with any type already configured (even if it didn't
         // happen to appear in this particular window) so a saved mapping
@@ -1867,15 +1845,14 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
 
         if (type_count > 0) {
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "<h2>Colour mapping</h2>"
-                "<p>Choose which of these event types should light the bin light, and which of "
-                "the 4 supported colours each one uses. \"waste\" (general rubbish, collected "
-                "every week) defaults to ignored until you say otherwise; every other type "
-                "defaults to shown until you tick \"Ignore\".</p>"
+                "<h2>Which colour is which bin</h2>"
+                "<p>Pick a colour for each bin, and tick anything you don&rsquo;t want reminding "
+                "about. General rubbish goes out every week, so it starts off ticked.</p>"
                 "<form method='POST' action='/api-test'>"
                 "<input type='hidden' name='type_count' value='%d'>"
                 "<input type='hidden' name='redirect_to' value='/api-test'>"
-                "<table><tr><th>Type</th><th>Ignore</th><th>Colour</th></tr>", type_count);
+                "<div class='tw'><table>"
+                "<tr><th>Bin</th><th>Don&rsquo;t remind me</th><th>Colour</th></tr>", type_count);
 
             for (int i = 0; i < type_count; i++) {
                 bool ignored_default = summaries[i].has_rule
@@ -1900,7 +1877,40 @@ static esp_err_t api_test_get_handler(httpd_req_t *req)
                 off = safe_append(html, HTML_BUF_SIZE, off, "</td></tr>");
             }
             off = safe_append(html, HTML_BUF_SIZE, off,
-                "</table><p><button type='submit'>Save mapping</button></p></form>");
+                "</table></div><p><button type='submit' class='pri'>Save</button></p></form>"
+                "<p class='note'>Optional: want a backup for when your council&rsquo;s website is "
+                "down? <a href='/settings#byhand'>Set bin days by hand</a> &mdash; you "
+                "don&rsquo;t have to.</p>");
+        }
+
+        // UPCOMING_TABLE. Below the mapping deliberately: during setup the
+        // mapping is the task and this is the evidence for it.
+        html_escape_attr(api_council_name(&cfg), esc, PAGE_ESC_BUF_SIZE);
+        off = safe_append(html, HTML_BUF_SIZE, off,
+            "<h2>What %s says is coming up</h2>", esc);
+        if (n < 0) {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<div class='card'><p><b>Couldn&rsquo;t reach your council just now.</b></p>"
+                "<p>Your saved bin days are still being used.</p>"
+                "<p class='note'>If it stays unavailable, you can "
+                "<a href='/settings#byhand'>set your bin days by hand</a>.</p></div>");
+        } else if (n == 0) {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<p>No collections showing in the next %d days. That can happen around "
+                "public holidays.</p>", API_TEST_LOOKAHEAD_DAYS);
+        } else {
+            off = safe_append(html, HTML_BUF_SIZE, off,
+                "<div class='tw'><table><tr><th>Date</th><th>Bin</th><th>Your light shows</th></tr>");
+            for (int i = 0; i < n; i++) {
+                const waste_api_event_t *e = &events[i];
+                html_escape_attr(e->event_type, esc, PAGE_ESC_BUF_SIZE);
+                off = safe_append(html, HTML_BUF_SIZE, off,
+                    "<tr><td>%04u-%02u-%02u</td><td>%s</td><td>",
+                    (unsigned)e->year, (unsigned)e->month, (unsigned)e->day, esc);
+                off = append_swatch(html, HTML_BUF_SIZE, off, e->color);
+                off = safe_append(html, HTML_BUF_SIZE, off, "</td></tr>");
+            }
+            off = safe_append(html, HTML_BUF_SIZE, off, "</table></div>");
         }
     }
 

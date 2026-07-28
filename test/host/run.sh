@@ -193,6 +193,32 @@ if [ "$1" = "render" ]; then
     done
 
     echo
+    echo "== plain English =="
+    # UI-SPEC.md 5: a user must never meet an implementation word. This is a
+    # regression net, not a style opinion - the pages were rewritten once and
+    # three of them silently kept their old vocabulary because the check for
+    # it was an ad-hoc grep with too short a list.
+    #
+    # Anything added here must be a word no recipient could act on. Words that
+    # earn their place (Wi-Fi, password, 2.4GHz, binlight.local, timezone,
+    # factory reset) are deliberately absent.
+    jargon="Bin Collection API|Manual / Fallback|Running version|manifest|POSIX|NVS|AutoAP|rotation rule|event type|subdomain|Colour mapping|raw data|nothing filtered|API test|the API|Save mapping|backend"
+    jfound=0
+    for f in "$OUT"/home-*.html "$OUT"/settings.html "$OUT"/api-test*.html \
+             "$OUT"/api-setup*.html "$OUT"/update-*.html "$OUT"/factory-reset-*.html; do
+        hits=$(grep -oiE "$jargon" "$f" 2>/dev/null | sort -u | tr '\n' ' ')
+        if [ -n "$hits" ]; then
+            echo "FAIL $(basename "$f") still says: $hits"
+            jfound=1
+        fi
+    done
+    if [ "$jfound" -eq 0 ]; then
+        echo "PASS no implementation vocabulary in any rendered page"
+    else
+        status=1
+    fi
+
+    echo
     echo "== provisioning page budget =="
     # The AutoAP page is still not rendered by this harness (it needs wifi/
     # netif/event stubs the cc-only build does not have), so assert the

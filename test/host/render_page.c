@@ -125,7 +125,10 @@ esp_err_t ota_check(ota_manifest_t *out)
     snprintf(out->version, sizeof(out->version), "%s", stub_ota_update_available ? "1.1.0" : "1.0.0");
     snprintf(out->url, sizeof(out->url),
              "https://github.com/jxg81/bin-light/releases/download/v1.1.0/bin-light.bin");
-    snprintf(out->notes, sizeof(out->notes), "Adds Knox & Whitehorse backends.");
+    // Release notes are shown verbatim on /update, so they are user-facing
+    // copy and the plain-English check covers them. The fixture models a
+    // well-written note rather than a changelog line.
+    snprintf(out->notes, sizeof(out->notes), "Adds two more councils.");
     out->available = stub_ota_update_available;
     return ESP_OK;
 }
