@@ -933,6 +933,16 @@ containing `..` or a backslash are refused as well.
 **2. The image's own version must be ≥ `CONFIG_BINLIGHT_OTA_MIN_VERSION`**,
 read from `esp_app_desc_t` in the header already being downloaded.
 
+- **⚠️ It currently ships at `1.0.6`, not 1.0.7 — this check is not yet fully
+  live.** 1.0.7 deliberately allows a one-release rollback so the bench device
+  can be walked backwards during testing. While the floor is below 1.0.7 the
+  URL allowlist above is **fully bypassable**: anyone reaching `POST /update`
+  can install genuine release `v1.0.6` — which passes the prefix and clears the
+  floor — and 1.0.6 predates both checks, so from there anything installs.
+  Accepted knowingly while no device is deployed. **`1.0.8` must set the floor
+  to `1.0.7`, and it must not be given away before then**; see the ship gate in
+  §4. `./test/host/run.sh` prints a warning every run until it is done, and
+  goes quiet by itself afterwards.
 - **The floor is pinned at 1.0.7 permanently.** It is not a version number and
   does not move with releases: 1.0.7 is simply the first release enforcing
   these checks, and holding it there is all the constraint needed. Pinning is
@@ -963,6 +973,22 @@ from `ota_start()`; `auto_task_fn()` skips that cycle and retries in 24 hours,
 and the device carries on working as a light. Nothing crashes and nothing
 reboot-loops. If the manifest and the prefix ever disagree, fixing
 `latest.json` recovers every device unattended within a day — no cable.
+
+> **⚠️ Where the URL check sits in `ota_start()` is load-bearing, and it looks
+> like untidiness.** It runs **after** the `OTA_STATE_RUNNING` guard, not before
+> it with the other argument validation, where it would naturally belong.
+>
+> The reason is that `set_state()` is global. A refused URL arriving while a
+> legitimate install is already running would stamp `OTA_STATE_FAILED` over that
+> install's state — and `auto_task_fn()` polls exactly that state to decide when
+> to reboot into the new firmware. The result would be a completed, healthy,
+> fully-downloaded image left unbooted until the next daily cycle, with no error
+> anywhere to explain it.
+>
+> Moving the check one guard later costs nothing: a refusal is still reported
+> synchronously to the caller, which is all the control requires. **Do not
+> "tidy" the guards into argument-validation-first order.** The security
+> remediation plan specified the tidy order; it was wrong, and this is why.
 
 **The one operational tie:** `CONFIG_BINLIGHT_OTA_URL_PREFIX` and the `url`
 field in `firmware/latest.json` must stay in agreement. Per the prefix design
@@ -1001,6 +1027,18 @@ cannot be meaningfully tested by the install that introduces it — the *previou
 release does that install, and it has no such checks. Proving the accept path
 needs a bench device flashed with 1.0.7 over USB and a *further* release
 published after it.
+
+> **⚠️ Those 23 assertions are not in the repo and do not run.** They were
+> written and passed in a scratch directory, because `ota.c` needs about five
+> stub headers the `cc`-only harness does not have (`esp_https_ota.h`,
+> `esp_app_desc.h`, `esp_ota_ops.h`, an extended `esp_http_client.h`, and NVS
+> `u8` accessors). So `./test/host/run.sh` does **not** cover either OTA gate,
+> and a refactor that broke one would pass a green suite.
+>
+> Read "host-tested" above as *was tested once, by hand*, not *is tested*.
+> Promoting them into `test/host/` is the single highest-value piece of test
+> debt in the project: these two checks are the only thing standing between a
+> reachable `POST /update` and arbitrary firmware.
 
 ### 3.6 Alternating multi-week manual / fallback schedule (implemented)
 
@@ -2734,11 +2772,16 @@ guesses from the published pinout.
   The assistant can build (and has, all session). It cannot flash or observe
   hardware — every flash/verify step is the owner's.
 - **Host tests**: `./test/host/run.sh` — no ESP-IDF, no device, just `cc`.
-  Six suites, 155 assertions. `./test/host/run.sh render` additionally writes
-  every web page to `test/host/out/*.html` and prints their sizes, which is how
-  `HTML_BUF_SIZE` is checked. **Run this before committing**; it compiles the
-  real `schedule.c` / `waste_api.c` / `web_server.c` / `buttons.c` against thin
+  `./test/host/run.sh render` additionally writes every web page to
+  `test/host/out/*.html` and prints their sizes, which is how `HTML_BUF_SIZE`
+  is checked. **Run this before committing**; it compiles the real
+  `schedule.c` / `waste_api.c` / `web_server.c` / `buttons.c` against thin
   stubs, so it catches far more than its size suggests.
+  - **It also gates release policy, which surprises people.** It **fails** if
+    `CONFIG_BINLIGHT_OTA_MIN_VERSION` is above `version.txt` — a build that
+    would refuse to reinstall itself, which would strand every device that
+    took it — and **warns** while the floor is below 1.0.7 (§3.5.3). A red
+    run.sh is therefore not always a code failure; read what it says.
 - **`sdkconfig` is gitignored and caches Kconfig values.** A changed Kconfig
   *default* does NOT reach an existing build — the stored value wins. This has
   now bitten **three times**: the reset-button GPIO stayed at 9 after the
