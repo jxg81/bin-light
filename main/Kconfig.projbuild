@@ -91,7 +91,7 @@ menu "Bin Light Configuration"
 
     config BINLIGHT_OTA_MIN_VERSION
         string "Minimum firmware version accepted by OTA"
-        default "1.0.6"
+        default "1.0.7"
         help
             An OTA image is refused if its own version (from esp_app_desc_t) is
             lower than this. It exists because old releases are legitimate
