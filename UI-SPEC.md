@@ -525,27 +525,67 @@ plain-English terms. **Page titles and headings change; routes do not.**
 ### 4.4 The first-run path
 
 ```
-   ┌─ Step 0 ─────────────┐   join the light's own Wi-Fi network
+   ┌─ Step 1 of 3 ────────┐   join the light's own Wi-Fi network
    │  AutoAP setup page   │   pick your home network, enter password
    └──────────┬───────────┘
-              │ "Now open http://binlight.local"
+   ┌─ Step 2 of 3 ────────┐   ⚠ THE HANDOVER — see §4.4.1
+   │  AutoAP success page │   the setup network disappears; the user must
+   │  "switch back"       │   put their PHONE back on their own Wi-Fi
+   └──────────┬───────────┘   before binlight.local can resolve
+              │ user re-joins home Wi-Fi, opens http://binlight.local
    ┌──────────▼───────────┐
    │  /  (unconfigured)   │   one card, one button: "Set up my bins"
    └──────────┬───────────┘
-   ┌──────────▼───────────┐
-   │  /api-setup          │   Step 1 of 2 — Where do you live?
-   │  state → council →   │
-   │  address             │
+   ┌─ Step 3 of 3 ────────┐   Where do you live?
+   │  /api-setup          │   state → council → address
+   │                      │   ← timezone is set from the council here (§9.5)
    └──────────┬───────────┘
               │ (redirect target changes — see §9.1)
    ┌──────────▼───────────┐
-   │  /api-test           │   Step 2 of 2 — Which colour is which bin?
-   │  upcoming + mapping  │   "Finish setup" →
+   │  /api-test           │   Which colour is which bin?
+   │  mapping + upcoming  │   "Finish setup" →
    └──────────┬───────────┘
+              │            ┌───────────────────────────────────┐
+              ├───────────►│ optional: set bin days by hand    │
+              │            │ /settings#byhand — never required │
+              │            └───────────────────────────────────┘
    ┌──────────▼───────────┐
    │  /  (configured)     │   the status card, populated. Done.
    └──────────────────────┘
 ```
+
+#### 4.4.1 The handover between step 2 and step 3 is the riskiest moment in the product
+
+When provisioning succeeds, `run_autoap()` lingers `AUTOAP_LINGER_MS` (4
+seconds), then tears the AP down and drops to STA mode
+([wifi_manager.c:549](main/wifi_manager.c:549)). From the user's side: **the
+network they are joined to vanishes while they are reading the page.**
+
+Everything that follows depends on the user understanding, unprompted, that
+they must now put *their phone* back on *their own* Wi-Fi. Nothing on screen
+can help them once the AP is gone — the device is not reachable from wherever
+the phone landed.
+
+Failure modes, all of them silent:
+
+- The phone auto-rejoins a *different* remembered network, or falls back to
+  mobile data, and `binlight.local` does not resolve.
+- The phone keeps showing the dead `binlight-XXXX` network for a while.
+- The user is inside an OS captive-portal mini-browser, which may close by
+  itself when the AP dies, taking the instructions with it.
+- `binlight.local` needs mDNS, which some Android builds and some VPN/private-
+  DNS configurations do not do.
+
+**Therefore the success page must be a real, numbered step, not a paragraph.**
+It is the last thing the device can say before it is unreachable, so it must
+carry the whole handover: what is about to happen, what to do, and what to do
+when the name does not work. There is no IP fallback to offer here — the
+device's address on the home network is not known to it at render time and
+would be wrong anyway — so the recovery advice is the router's client list or
+simply power-cycling and watching for the light to stop breathing white.
+
+This is presentation, and it is the highest-value presentation change in the
+onboarding path.
 
 **The step chrome is conditional.** "Step 1 of 2" and the "Finish setup" button
 render only when `!waste_api_config_complete(&cfg)`. Someone returning later to
@@ -576,6 +616,34 @@ instead of the current paragraph about resolver precedence.
 
 `api_enabled` and `enabled` remain the disclosure checkboxes for their own
 sections (D1) and remain in the single `/save` form (D9).
+
+#### 4.5.1 "Set bin days by hand" becomes a real destination
+
+Owner's direction (2026-07-28). The manual schedule stops being a *fallback
+buried in settings* and becomes the answer to two questions, reachable by link
+from both:
+
+- **"My council isn't listed"** — from `/api-setup`, replacing the removed
+  subdomain field (§7.3).
+- **"I'd like a backup for when the council's site is down"** — from the finish
+  step on `/api-test`, offered and **explicitly optional** (§7.4).
+
+Both link to `/settings#byhand`. To make an anchor link actually reveal the
+section without JavaScript, add one rule to `/s.css`:
+
+```css
+.sect:target .details{display:block}
+```
+
+~34 bytes, additive, and it composes with the existing
+`.sect input:checked ~ .details` rather than replacing it (D1). Arriving via
+the link expands the section so the user can see what they are being offered;
+the checkbox remains the actual enable control and still has to be ticked,
+which is correct — the manual schedule genuinely is off until switched on.
+The section's copy therefore opens with an instruction to tick it.
+
+**Nothing about this makes the manual schedule mandatory**, and the automatic
+path never routes through it.
 
 ---
 
@@ -615,7 +683,7 @@ Implementation words the UI currently shows, and what to say instead:
 | manifest | *(never shown)* — "an update" |
 | NVS | your saved settings |
 | AutoAP / AutoAP mode | setup mode |
-| subdomain | the council's bin-day website address |
+| subdomain | *(control removed entirely — §9.7)* |
 | locality | suburb |
 | property / property label | your address |
 | event type / type | bin |
@@ -733,15 +801,46 @@ This is the single most important thing in this section.
 These are **empirical hardware calibration**, tuned by eye through the printed
 PLA enclosure (`SPEC.md` §2). They describe what the *light* does.
 
-The UI uses them in exactly one way: **colour swatches print the stored RGB
-verbatim** as an inline `style=background:#rrggbb`, so that what the screen
-shows and what the light shows are the same value. `/api-test` already does
-this ([web_server.c:1690](main/web_server.c:1690)) and it is correct.
+**Palette 1a — the display palette.** A second, UI-only set of hex values, one
+per preset, used for **every swatch on every page**:
 
-Yes, `(255,150,0)` looks orange on a screen, and `(0,255,0)` looks like a
-harsh lime. **That is the honest answer** — it is what the LED will emit. The
-alternative, prettier screen values, would mean the swatch and the light
-disagree, which defeats the swatch's only purpose. See §10.7.
+| Preset | Emit — what the LED does | Display — what the screen shows |
+|---|---|---|
+| Red | `(255,0,0)` `#ff0000` | `#d93025` |
+| Green | `(0,255,0)` `#00ff00` | `#1e8e3e` |
+| Yellow | `(255,150,0)` `#ff9600` | `#f9c22e` |
+| Purple | `(128,0,128)` `#800080` | `#8e44ad` |
+
+> **This reverses an earlier decision in this document, on the owner's
+> direction (2026-07-28), and the reversal is right.**
+>
+> The first draft printed the stored RGB verbatim, arguing that screen and
+> light must agree. That was wrong. `(255,150,0)` is **green-channel
+> compensation for a WS2812 seen through printed PLA** — it exists because
+> green is more luminous than red at equal duty (`SPEC.md` §2). It is a
+> hardware correction, and a hardware correction is an implementation detail.
+> Printing it as an orange square asks the user to look at the workaround
+> instead of the idea. The rule the brief sets — *a user should never meet an
+> implementation word* — applies just as much to implementation **values**.
+>
+> **The yellow bin is yellow. Show yellow.**
+
+Rules that keep this from drifting back into the LED path:
+
+- **The display value is never stored, never submitted and never emitted.**
+  `<option value=...>` still carries the **emit** hex, which is what
+  `parse_hex_color()` reads and what reaches NVS. Only `.sw`'s inline
+  `background` uses the display value. A save round-trip is byte-identical to
+  today's.
+- **Swatches resolve through `nearest_preset_index()`**, which already exists
+  ([web_server.c:228](main/web_server.c:228)) and already handles the case of a
+  stored triple that matches no preset exactly. Nearest preset → that preset's
+  display value.
+- **Adding the display value is a small struct addition, not a behaviour
+  change** — see §9.6. It must not become an excuse to touch the emit values.
+- **The council's own reported colours are not shown as swatches.** See §7.4:
+  a coloured square on these pages always means one of the four bins, with no
+  exceptions.
 
 **Palette 2 — the interface palette.** Backgrounds, text, borders, links,
 buttons. Shares **no values** with palette 1 and is defined only in `/s.css` as
@@ -806,6 +905,7 @@ td,th{padding:.5rem .3rem;text-align:left;border-bottom:1px solid var(--line)}
 .sect{margin:1.6rem 0}
 .details{display:none}
 .sect input:checked~.details{display:block}
+.sect:target .details{display:block}
 .nav a{display:block;padding:.8rem .2rem;border-bottom:1px solid var(--line);
 text-decoration:none;color:var(--fg)}
 .nav a:after{content:'\203A';float:right;color:var(--mut)}
@@ -878,7 +978,7 @@ only safe inside a quoted attribute.
   <p class=big>Tuesday 4 August</p>
   <p><span class=sw style=background:#ff9600></span>Yellow
      <span class=sw style=background:#00ff00></span>Green</p>
-  <p class=note>The light comes on the night before, from 6:00 pm.</p>
+  <p class=note>The light comes on the night before, from 3:00 pm.</p>
 </div>
 <form method=POST action=/test><button class=pri>Show me the next colour</button></form>
 <nav class=nav>
@@ -935,7 +1035,7 @@ separate POST forms for the device actions.
 <p class=f><label for=br>Brightness</label>
   <input type=range id=br name=brightness min=10 max=255 value=200></p>
 <p class=f><label for=st>Comes on at</label>
-  <input type=time id=st name=start value=18:00></p>
+  <input type=time id=st name=start value=15:00></p>
 <p class=f><label for=du>Stays on for</label>
   <input type=number id=du name=duration_hours min=1 max=23 value=20> hours</p>
 <p class=note>On the night before a collection. It can run past midnight.</p>
@@ -959,7 +1059,7 @@ unless two different bins are due the same night.</p>
 </div>
 
 <h2>Set bin days by hand</h2>
-<div class=sect>
+<div class=sect id=byhand>
   <p class=note>A backup for when your council's days aren't available.
      While your council's days are working, nothing here is used.</p>
   <p><label><input type=checkbox id=me name=enabled> Set bin days by hand</label></p>
@@ -1025,8 +1125,7 @@ only.
 | State picker button | `Show councils` | `Show councils` *(keep)* |
 | Council picker button | `Find my address` | `Find my address` *(keep — already good)* |
 | Escape hatch heading | `Council not listed?` | `Council not listed?` *(keep)* |
-| Escape-hatch body | `Any council running the same "waste-info.com.au" platform will work — enter their subdomain (the part before ".waste-info.com.au" in their bin-day lookup URL).` | `Some councils share a bin-day website. If yours does, find your council's bin-day lookup page and copy the first part of its web address — the bit before <b>.waste-info.com.au</b>.` |
-| Escape-hatch label | `Subdomain:` | `Website name:` |
+| **Escape-hatch form** | subdomain text field + `Find my suburb` button | **Removed from the UI.** Replaced by: `Your council isn't one the light knows about yet. You can still use it — set your bin days by hand instead.` → link to `/settings#byhand`. See §4.5.1. |
 | Lookup failures | see §5.3 | see §5.3 |
 | Address rows | `a.item{padding:.35em 0}` | `.item` — ~44 px tap target (D5) |
 | Merri-bek tip | *(keep verbatim)* | It is specific, correct, hard-won and cannot be shortened without losing the instruction. The format template (`3/85 EXAMPLE STREET BRUNSWICK 3056`) stays — `SPEC.md` §4 records why it is a template and not a real address. |
@@ -1294,7 +1393,105 @@ This belongs to whoever owns provisioning robustness, not to the UI pass, and
 from the security work — so it currently has no owner. **Flagging it to the
 owner rather than acting on it.**
 
-### 9.5 Not proposed, recorded so it is not re-proposed
+### 9.5 ⚠ Set the timezone automatically from the chosen council
+
+**Owner's direction (2026-07-28), and explicitly acknowledged as not strictly
+UI. This is a behaviour change and needs to land in `SPEC.md` §3.2.**
+
+`SPEC.md` §4 records an unset timezone as one of two things that leave a
+freshly-reset light showing nothing at all. Asking a recipient to find and set
+it is exactly the kind of step that strands a device. The council they just
+picked already implies it.
+
+**The mapping is small**, because `STATE_ORDER` is currently only
+`{VIC, NSW, QLD, TAS}` ([councils.c:81](main/councils.c:81)) — SA, WA and NT
+are not supported yet (`SPEC.md` §3.13.2). That is **two distinct TZ strings**:
+
+| State | POSIX TZ | Matches preset |
+|---|---|---|
+| VIC, NSW, TAS | `AEST-10AEDT,M10.1.0/2,M4.1.0/3` | Melbourne / Sydney / Canberra / Hobart |
+| QLD | `AEST-10` | Brisbane |
+| *(SA, when added)* | `ACST-9:30ACDT,M10.1.0/2,M4.1.0/3` | Adelaide |
+| *(NT, when added)* | `ACST-9:30` | Darwin |
+| *(WA, when added)* | `AWST-8` | Perth |
+
+**Where the table lives:** a `settings_tz_for_state(const char *state)` helper
+in `settings.c`, which already owns the TZ. **Not in `councils.c`** —
+`SECURITY-REMEDIATION.md` §8 fences that file off, and keying on the existing
+`council_t.state` string needs no change there at all.
+
+**Call site:** the `step=save` and `step=bsave` branches of
+`api_setup_get_handler()`, guarded on `council != NULL`.
+
+**Overwrite policy — recommend: always overwrite, and say so on screen.**
+There is no "was this ever set by the user" flag and adding one is an NVS
+schema change (§9.8 below). Always overwriting is right for this audience: a
+correct timezone derived from the council beats preserving a rare deliberate
+override, and the override is one tap away in Settings. To stop it being a
+*silent* overwrite, the finish step reports it:
+
+> Timezone set to **Melbourne / Sydney / Canberra / Hobart**. Change it in
+> Settings if that's wrong.
+
+**Two things this fixes for free:**
+
+1. **It resolves §11.1.** The timezone no longer needs to be a wizard step or
+   a nag on the finish screen — it disappears from onboarding entirely.
+2. **Removing the subdomain escape hatch (§7.3) makes it total.** That was the
+   one path that reached `step=save` with no `council_t`, and therefore no
+   state to derive a zone from. With it gone, every automatic setup has a
+   council, so every automatic setup gets a timezone.
+
+**Residual risk:** a user on a state border, or one who wants a genuinely
+custom POSIX string, gets clobbered if they later change address. Rare,
+visible (per the message above), and one tap to correct.
+
+### 9.6 A display value per colour preset (small struct addition)
+
+Required by §6.2, on the owner's direction. `color_preset_t` gains a
+`const char *display` field holding a UI-only hex string; `.sw` swatches print
+that instead of the stored RGB.
+
+**Classified as presentation, flagged anyway because it edits the same struct
+as the calibrated values.** It adds ~60 bytes of flash (4 pointers + 4 short
+strings) and changes no emitted colour, no `<option value>`, no parsed value
+and no NVS byte. A save round-trip is byte-identical to today's.
+
+**Interaction worth knowing:** `SPEC.md` §4 already plans to move
+`COLOR_PRESETS` + `nearest_preset_color()` out of `web_server.c` into a shared
+colour module, because §3.13 needs name→RGB mapping anyway. The display field
+should move with them rather than being added twice.
+
+### 9.7 Removing the `waste-info.com.au` subdomain escape hatch
+
+Owner's direction (2026-07-28). Recorded here rather than in §7 alone because
+it **withdraws a capability**, not just a control.
+
+`SPEC.md` §3.3 describes the free-text subdomain field as deliberate
+flexibility: any council on the Impact Apps platform works without a firmware
+change. Removing the form means a recipient can no longer configure an unlisted
+council on that platform.
+
+**Why it is nevertheless right:** the field asks a non-technical user to find
+their council's bin-day lookup page and extract a subdomain from its URL.
+That is the single most jargon-dense control in the product, and the audience
+(§1) cannot use it. It serves the owner, not the recipient.
+
+**Where the capability goes instead:** adding a council to `COUNCILS[]` and
+pushing an update. `SPEC.md` §1.1 already treats council breakage as
+"fix at leisure and push"; adding a council is the same shape of fix, and OTA
+is proven end to end. This trades a control nobody can use for a release
+nobody has to think about.
+
+**Recommendation on the handler:** *keep the `step=locality` branch*, just stop
+linking to it. It costs nothing to leave in place, remains reachable by typing
+a URL for the owner's own debugging, and deleting it is a larger change to
+wizard code that `SECURITY-REMEDIATION.md` §8 asks not to disturb.
+
+**Consequence to accept:** `SPEC.md` §3.3's flexibility claim becomes
+owner-only and should be reworded when this lands.
+
+### 9.8 Not proposed, recorded so it is not re-proposed
 
 - **A "has the timezone ever been set" flag.** `settings_get_tz()` returns the
   stored value or the default, indistinguishably. Detecting "never configured"
@@ -1344,7 +1541,7 @@ Recorded so they are not re-proposed. Grouped by what killed them.
 
 | # | Idea | Why it dies |
 |---|---|---|
-| 10.7 | **Adjust `COLOR_PRESETS` so swatches look better on screen** — a purer yellow, a softer green | **Hardware calibration, not taste** (`SPEC.md` §2, D8). `(255,150,0)` reads correctly through the printed PLA enclosure because WS2812 green is far more luminous than red at equal duty; a purer value reads green. Screen appearance is *not* a reason to touch these values, and the swatch's whole job is to agree with the light. The interface palette (§6.2) is separate and shares no values with them. **If this is ever re-proposed, the answer is still no.** |
+| 10.7 | **Adjust `COLOR_PRESETS`' emit values so swatches look better on screen** — a purer yellow, a softer green | **Hardware calibration, not taste** (`SPEC.md` §2, D8). `(255,150,0)` reads correctly through the printed PLA enclosure because WS2812 green is far more luminous than red at equal duty; a purer value reads green. Screen appearance is *not* a reason to touch these values. **This is still rejected** — but note the actual problem it was reaching for is solved properly by the separate **display palette** in §6.2: the screen shows `#f9c22e`, the LED emits `(255,150,0)`, and neither constrains the other. If someone proposes editing the emit values for screen reasons, they want §6.2 and have not read it. |
 | 10.8 | Convert the `/api-setup` `save`/`bsave` GET links to POSTs while restyling | `SECURITY-REMEDIATION.md` §8 explicitly rejects this: the query-string threading is fiddly and works, and these steps only change settings, which is cheap to correct. Not the UI pass's call to reopen. |
 | 10.9 | Put `reject_cross_origin()` on the new `/settings` and `/s.css` GET handlers "for consistency" | `SECURITY-REMEDIATION.md` §B2: *do not apply it to any GET handler*. See D7 for the reconciled rule. Getting this backwards in either direction is silent. |
 | 10.10 | Add `reject_cross_origin()` to the AutoAP provisioning handlers | `SECURITY-REMEDIATION.md` §B3 — leave the provisioning server alone. Different server, temporary AP, most fragile surface in the project. |
@@ -1361,17 +1558,13 @@ Recorded so they are not re-proposed. Grouped by what killed them.
 
 ## 11. Unresolved — needs the owner or hardware
 
-### 11.1 Where does the timezone belong in the first-run path?
+### 11.1 ~~Where does the timezone belong in the first-run path?~~ RESOLVED
 
-`SPEC.md` §4 lists setting the timezone as one of two things that must happen
-before a freshly-reset light shows anything — but it lives under Preferences,
-which a first-run user has no reason to open, and there is no way to detect
-"never set" without a new NVS key (§9.5).
-
-Current proposal is the cheap one: a single line on the finish step pointing at
-Settings. **Owner's call** whether that is enough, or whether the timezone
-should become an explicit Step 3 — which would mean the wizard writing a
-setting it does not currently write.
+**Resolved 2026-07-28 by the owner: set it automatically from the chosen
+council.** See §9.5. The timezone leaves the onboarding path entirely rather
+than becoming a step in it. What remains is not a UI question but the
+overwrite policy, for which §9.5 recommends "always overwrite, and say so on
+screen".
 
 ### 11.2 What are the two LEDs called, physically?
 
